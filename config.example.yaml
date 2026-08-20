@@ -1,6 +1,21 @@
 contact:
   email: "you@example.org"
 
+database:
+  mode: auto            # auto | remote | local
+  host: ""              # напр. "vps.example.com" або пусто (тільки локальна БД)
+  port: 5432
+  name: harvester
+  user: harvester
+  # dsn: postgresql://harvester:...@host:5432/harvester
+  connect_timeout_s: 5
+  retries: 3
+  retry_delay_s: 2
+  restore_probe_interval_s: 30
+  merge_on_restore: true
+  local_db_path: data/harvester.db
+# Пароль PostgreSQL — через env HARVESTER_PG_PASSWORD (не в цьому файлі!)
+
 paths:
   db_path: "data/harvester.db"
   tmp_dir: "data/tmp"

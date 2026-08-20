@@ -51,12 +51,12 @@ def start(
 @app.command()
 def status():
     """Показати поточний стан сервісу"""
-    from harvester.db.connection import Database
+    from harvester.db.failover import build_database
     from harvester.db.repositories import DocumentsRepository, SettingsRepository, TasksRepository
 
     async def _status():
         settings = get_settings()
-        db = Database(settings.db_path)
+        db = build_database(settings)
         await db.initialize()
 
         try:
@@ -82,10 +82,18 @@ def status():
             task_stats = await tasks_repo.count_by_status()
             task_by_type = await tasks_repo.count_by_type()
 
+            db_mode = "local (SQLite)"
+            if db.mode == "remote":
+                db_mode = "remote (PostgreSQL)"
+            pending_outbox = await db.pending_outbox_count()
+
             table = Table(title="Стан Harvester")
             table.add_column("Параметр", style="cyan")
             table.add_column("Значення", style="green")
 
+            table.add_row("База даних", db_mode)
+            if pending_outbox:
+                table.add_row("Outbox (очікує злиття)", str(pending_outbox))
             table.add_row("Heartbeat", heartbeat_info)
             table.add_row("Воркери (живі)", workers_alive)
             table.add_row("Документи (всього)", str(sum(doc_stats.values())))
@@ -114,12 +122,12 @@ def stats(
     json_output: bool = typer.Option(False, "--json", help="Вивід у форматі JSON"),
 ):
     """Показати статистику по каналах"""
-    from harvester.db.connection import Database
+    from harvester.db.failover import build_database
     from harvester.db.repositories import ChannelStatsRepository
 
     async def _stats():
         settings = get_settings()
-        db = Database(settings.db_path)
+        db = build_database(settings)
         await db.initialize()
 
         try:
@@ -169,11 +177,11 @@ def export(
     status_filter: str = typer.Option("verified", "--status", "-s", help="Фільтр за статусом"),
 ):
     """Експортувати верифіковані документи"""
-    from harvester.db.connection import Database
+    from harvester.db.failover import build_database
 
     async def _export():
         settings = get_settings()
-        db = Database(settings.db_path)
+        db = build_database(settings)
         await db.initialize()
 
         try:
@@ -208,31 +216,36 @@ def export(
 @app.command()
 def doctor():
     """Самодіагностика системи"""
-    from harvester.db.connection import Database
+    from harvester.db.failover import build_database
     from harvester.db.migrations import get_current_version
 
     async def _doctor():
         console.print("[cyan]Перевірка системи...[/cyan]")
 
         settings = get_settings()
+        db = build_database(settings)
+        await db.initialize()
 
-        if not settings.db_path.exists():
-            rprint("[yellow]База даних не знайдена — буде створена при першому запуску[/yellow]")
-        else:
-            db = Database(settings.db_path)
-            await db.initialize()
+        try:
+            version = await get_current_version(db)
+            if db.mode == "remote":
+                healthy = await db.remote_healthy()
+                rprint(
+                    f"[green]✓ База даних: PostgreSQL (remote), версія {version}, "
+                    f"доступна: {'так' if healthy else 'ні'}[/green]"
+                )
+            else:
+                rprint(f"[green]✓ База даних: SQLite (local), версія {version}[/green]")
+            pending = await db.pending_outbox_count()
+            if pending:
+                rprint(f"[yellow]⚠ Outbox: {pending} операцій очікують злиття у remote[/yellow]")
 
-            try:
-                version = await get_current_version(db)
-                rprint(f"[green]✓ База даних: версія {version}[/green]")
-
-                integrity = await db.fetchone("PRAGMA integrity_check")
+            if db.local is not None:
+                integrity = await db.local.fetchone("PRAGMA integrity_check")
                 if integrity and integrity[0] == "ok":
-                    rprint("[green]✓ Цілісність БД: OK[/green]")
-                else:
-                    rprint("[red]✗ Цілісність БД: ПОМИЛКА[/red]")
-            finally:
-                await db.close()
+                    rprint("[green]✓ Цілісність локальної БД: OK[/green]")
+        finally:
+            await db.close()
 
         if settings.contact.email == "you@example.org":
             rprint("[yellow]⚠ Контактний email не налаштований[/yellow]")
@@ -245,19 +258,162 @@ def doctor():
 
 
 @app.command()
+def db_status():
+    """Показати стан підключення до БД (remote/local, outbox)"""
+    from harvester.db.failover import build_database
+
+    async def _db_status():
+        settings = get_settings()
+        db = build_database(settings)
+        await db.initialize()
+
+        try:
+            table = Table(title="Стан бази даних")
+            table.add_column("Параметр", style="cyan")
+            table.add_column("Значення", style="green")
+
+            mode = "local (SQLite)"
+            if db.mode == "remote":
+                mode = "remote (PostgreSQL)"
+            table.add_row("Активна БД", mode)
+
+            cfg = settings.database
+            table.add_row("Remote налаштовано", "так" if cfg.remote_configured else "ні")
+            if cfg.remote_configured:
+                healthy = await db.remote_healthy()
+                table.add_row("Remote доступна", "так" if healthy else "ні")
+                table.add_row("Хост", f"{cfg.host}:{cfg.port}/{cfg.name}")
+            table.add_row("Локальна БД", str(db.db_path))
+
+            pending = await db.pending_outbox_count()
+            table.add_row("Outbox (очікує злиття)", str(pending))
+            table.add_row("Restore-інтервал", f"{cfg.restore_probe_interval_s} с")
+
+            console.print(table)
+        finally:
+            await db.close()
+
+    asyncio.run(_db_status())
+
+
+@app.command()
+def db_seed():
+    """Однократно перенести локальну БД у віддалену PostgreSQL"""
+    from harvester.db.failover import build_database
+    from harvester.db.postgres import PostgresDatabase
+
+    async def _seed():
+        settings = get_settings()
+        cfg = settings.database
+
+        if not cfg.remote_configured:
+            rprint("[red]✗ Віддалена БД не налаштована (database.host / database.dsn)[/red]")
+            raise typer.Exit(1)
+
+        db = build_database(settings)
+        await db.initialize()
+
+        if db.remote is None or not db._remote_ever_ok:
+            rprint("[red]✗ Не вдалося підключитись до віддаленої БД[/red]")
+            raise typer.Exit(1)
+
+        try:
+            total = await _seed_table(db.local, db.remote, "domains", "id")
+            rprint(f"[green]✓ domains: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "sources", "id")
+            rprint(f"[green]✓ sources: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "documents", "id")
+            rprint(f"[green]✓ documents: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "document_mirrors", "id")
+            rprint(f"[green]✓ document_mirrors: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "document_refs", "id")
+            rprint(f"[green]✓ document_refs: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "fetch_attempts", "id")
+            rprint(f"[green]✓ fetch_attempts: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "tasks", "id")
+            rprint(f"[green]✓ tasks: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "search_queries", "id")
+            rprint(f"[green]✓ search_queries: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "topics", "id")
+            rprint(f"[green]✓ topics: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "document_topics", None)
+            rprint(f"[green]✓ document_topics: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "blacklist", "id")
+            rprint(f"[green]✓ blacklist: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "channel_stats", "id")
+            rprint(f"[green]✓ channel_stats: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "system_events", "id")
+            rprint(f"[green]✓ system_events: {total}[/green]")
+            total = await _seed_table(db.local, db.remote, "settings", None)
+            rprint(f"[green]✓ settings: {total}[/green]")
+
+            await _fix_sequences(db.remote)
+            rprint("[green]✓ Секвенції оновлено[/green]")
+            rprint("[green]✓ Перенесення завершено[/green]")
+        finally:
+            await db.close()
+
+    asyncio.run(_seed())
+
+
+async def _seed_table(local_db, remote_db, table: str, seq_col: str | None) -> int:
+    """Копіює таблицю з локальної SQLite у remote PostgreSQL (з id)."""
+    cols_row = await local_db.fetchone(f"SELECT * FROM {table} LIMIT 1")
+    if cols_row is None:
+        return 0
+    cols = list(dict(cols_row).keys())
+    col_sql = ", ".join(f'"{c}"' for c in cols)
+    placeholders = ", ".join("?" for _ in cols)
+    insert_sql = f'INSERT INTO {table} ({col_sql}) VALUES ({placeholders})'
+
+    total = 0
+    offset = 0
+    batch_size = 500
+    while True:
+        rows = await local_db.fetchall(
+            f'SELECT * FROM {table} LIMIT {batch_size} OFFSET {offset}'
+        )
+        if not rows:
+            break
+        batch = []
+        for r in rows:
+            d = dict(r)
+            batch.append(tuple(d[c] for c in cols))
+        await remote_db.executemany(insert_sql, batch)
+        total += len(batch)
+        offset += len(batch)
+
+    if seq_col and total:
+        await remote_db.execute(
+            f"SELECT setval(pg_get_serial_sequence('{table}', '{seq_col}'), "
+            f"COALESCE((SELECT MAX({seq_col}) FROM {table}), 1))"
+        )
+    return total
+
+
+async def _fix_sequences(remote_db) -> None:
+    for table, col in (("documents", "id"), ("tasks", "id"), ("search_queries", "id")):
+        await remote_db.execute(
+            f"SELECT setval(pg_get_serial_sequence('{table}', '{col}'), "
+            f"COALESCE((SELECT MAX({col}) FROM {table}), 1))"
+        )
+
+
+@app.command()
 def init_db():
     """Ініціалізувати базу даних"""
-    from harvester.db.connection import Database
+    from harvester.db.failover import build_database
     from harvester.db.migrations import ensure_schema
 
     async def _init():
         settings = get_settings()
-        db = Database(settings.db_path)
+        db = build_database(settings)
         await db.initialize()
 
         try:
             await ensure_schema(db)
-            rprint("[green]✓ База даних ініціалізована[/green]")
+            mode = "remote" if db.mode == "remote" else "local"
+            rprint(f"[green]✓ База даних ініціалізована ({mode})[/green]")
         finally:
             await db.close()
 
@@ -270,12 +426,12 @@ def events(
     level: str = typer.Option(None, "--level", "-l", help="Фільтр: WARN, ERROR"),
 ):
     """Показати останні системні події (WARN/ERROR)"""
-    from harvester.db.connection import Database
+    from harvester.db.failover import build_database
     from harvester.db.repositories import SystemEventsRepository
 
     async def _events():
         settings = get_settings()
-        db = Database(settings.db_path)
+        db = build_database(settings)
         await db.initialize()
 
         try:
@@ -314,12 +470,12 @@ def queries(
     top: int = typer.Option(20, "--top", "-n", help="Кількість запитів"),
 ):
     """Показати ефективність пошукових запитів"""
-    from harvester.db.connection import Database
+    from harvester.db.failover import build_database
     from harvester.db.repositories import SearchQueriesRepository
 
     async def _queries():
         settings = get_settings()
-        db = Database(settings.db_path)
+        db = build_database(settings)
         await db.initialize()
 
         try:
@@ -352,16 +508,19 @@ def queries(
 @app.command()
 def vacuum():
     """Оптимізувати базу даних"""
-    from harvester.db.connection import Database
+    from harvester.db.failover import build_database
 
     async def _vacuum():
         settings = get_settings()
-        db = Database(settings.db_path)
+        db = build_database(settings)
         await db.initialize()
 
         try:
-            await db.execute("VACUUM")
-            rprint("[green]✓ База даних оптимізована[/green]")
+            if db.local is not None:
+                await db.local.execute("VACUUM")
+                rprint("[green]✓ Локальна база даних оптимізована[/green]")
+            else:
+                rprint("[red]✗ Локальна БД недоступна[/red]")
         finally:
             await db.close()
 

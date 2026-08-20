@@ -10,6 +10,7 @@ from harvester.core.events import EventLogger
 from harvester.core.scheduler import Scheduler
 from harvester.core.workers import ClassifyWorker, DiscoveryWorker, VerifyWorker
 from harvester.db.connection import Database
+from harvester.db.failover import build_database
 from harvester.db.migrations import ensure_schema
 from harvester.db.repositories import SettingsRepository
 
@@ -31,7 +32,7 @@ class Supervisor:
     async def start(self) -> None:
         logger.info("supervisor_starting")
 
-        self.db = Database(self.settings.db_path)
+        self.db = build_database(self.settings)
         await self.db.initialize()
         await ensure_schema(self.db)
 

@@ -1065,6 +1065,60 @@ CREATE TABLE settings (
 );
 ```
 
+### 12.3. Віддалена PostgreSQL із локальним failover (архітектура)
+
+Окремо від чисто-локального режиму (12.1–12.2) система підтримує **роботу із
+віддаленою PostgreSQL** через шар failover, щоб дані не втрачались при втраті
+доступу до сервера. Локальний SQLite при цьому виконує роль **аварійного
+дубля** (fallback), а не просто кешу.
+
+**Ролі:**
+
+| Компонент | Роль |
+|---|---|
+| `FailoverDatabase` (`db/failover.py`) | шлюз: спільний інтерфейс `Database` для всього коду; сам обирає, куди йдуть запити |
+| `PostgresDatabase` (`db/postgres.py`) | віддалений бекенд (asyncpg pool) |
+| `SqliteDatabase` (`db/connection.py`) | локальний бекенд (aiosqlite) — автокоміт, WAL |
+| `failover_outbox` (таблиця у локальній БД) | черга операцій, накопичених під час роботи на local |
+| `dialect` (`db/dialect.py`) | трансляція SQLite-діалекту → PostgreSQL (`?`→`$N`, `INSERT OR IGNORE`→`ON CONFLICT DO NOTHING`, `RETURNING id`) |
+
+**Режими (`database.mode`):**
+
+- `remote` — одразу працює на PostgreSQL; якщо недоступна при старті — падає зі зрозумілою помилкою.
+- `local` — завжди локальний SQLite (поведінка 12.1), навіть якщо remote налаштовано.
+- `auto` (дефолт) — при старті: `SELECT 1` до remote; OK → режим `remote`,
+  недоступна → режим `local` + фоновий restore-цикл.
+
+**Failover-поведінка (режим `auto`):**
+
+1. **Старт:** проба з'єднання (`try_connect`, таймаут `connect_timeout_s`).
+   Якщо remote недоступна — робота на local; запускається фоновий цикл, що
+   кожні `restore_probe_interval_s` (30 с) повторює пробу.
+2. **Під час роботи на remote:** будь-який збій запиту → повторні спроби
+   (`retries=3`, пауза `retry_delay_s`); якщо всі невдалі — перемикання на
+   local (`_downgrade`) і продовження роботи без простою.
+3. **Під час роботи на local:** усі DML-операції виконуються локально **і**
+   записуються в `failover_outbox`. Рядки, створені в цьому режимі, отримують
+   **зарезервовані id ≥ 2 000 000 000** (постійно зростають за MAX+1), щоб при
+   злитті вони гарантовано не конфліктували з id, випущеними remote раніше,
+   а зовнішні ключі (documents→refs/attempts) злились у правильному порядку.
+4. **Restore:** якщо remote знову доступна — спершу зливається outbox
+   (`_drain_outbox`) у порядку `rid`: ID-INSERTи виконуються з тими самими id
+   (дублікати за унікальним ключем пропускаються через `ON CONFLICT DO NOTHING`),
+   потім — фінальне перемикання на remote (`_try_finalize_switch`), лише коли
+   outbox порожній.
+5. **Idempotентність:** `INSERT OR IGNORE` → `ON CONFLICT DO NOTHING`, тож
+   повторне злиття (після рестарту process) не дублює рядки.
+
+**Однократне перенесення даних:** `harvester db-seed` копіює всі таблиці з
+локальної SQLite у remote PostgreSQL (батчами по 500, зі збереженням id) і
+вирівнює послідовності `setval(...)`. Виконується вручну один раз при
+підключенні віддаленої БД.
+
+**Схема remote:** `harvester/db/pg_schema.sql` (дзеркало `schema.sql` з
+`BIGSERIAL`-колонками id) + `harvester/db/pg_migrations/NNN_*.sql`, версія — у
+таблиці `schema_version`.
+
 ---
 
 ## 13. Надійність і режим 24/7
@@ -1126,6 +1180,7 @@ SIGTERM/SIGINT →
 |---|---|---|
 | `paths` | `db_path`, `tmp_dir`, `backup_dir`, `log_dir` | `data/…` |
 | `contact` | `email` (polite pool + User-Agent) | **обов'язковий** |
+| `database` | `mode` (auto/remote/local), `host`, `port`, `name`, `user`, `dsn`, `pool_min_size`, `pool_max_size`, `connect_timeout_s`, `retries`, `retry_delay_s`, `restore_probe_interval_s`, `merge_on_restore`, `local_db_path` | auto / 5432 / harvester / harvester / 1 / 20 / 5 / 3 / 2 / 30 / true / data/harvester.db |
 | `workers` | `verify`, `discovery`, `scanner`, `classify` | 6 / 3 / 1 / 1 |
 | `http` | `global_concurrency`, `per_host_delay_ms`, `max_pdf_bytes`, `max_redirects`, таймаути, `bandwidth_mbps` | 32 / 2000 / 200 МБ / 5 / 2 МБ/с |
 | `channels` | `enabled`, ліміти, ключі для кожного каналу | див. 5.5 |
@@ -1165,8 +1220,13 @@ real_sources_for_students/
 │   │   ├── events.py             # system_events, структуровані логи
 │   │   └── metrics.py            # channel_stats, агрегації для CLI
 │   ├── db/
-│   │   ├── connection.py         # writer-черга + reader-пул (aiosqlite), прагми
+│   │   ├── connection.py         # Database (інтерфейс) + SqliteDatabase (aiosqlite), прагми
+│   │   ├── postgres.py           # PostgresDatabase (asyncpg pool, probe, PG-схема)
+│   │   ├── failover.py           # FailoverDatabase: remote/local, outbox, restore-цикл
+│   │   ├── dialect.py            # трансляція SQLite→PostgreSQL, inject_id
 │   │   ├── schema.sql            # DDL (розділ 12)
+│   │   ├── pg_schema.sql         # дзеркальна DDL для PostgreSQL (BIGSERIAL)
+│   │   ├── pg_migrations/        # NNN_*.sql для PostgreSQL
 │   │   ├── migrations.py         # user_version, застосування міграцій
 │   │   ├── migrations/001_init.sql
 │   │   └── repositories.py       # DocumentsRepo, SourcesRepo, TasksRepo, ...
@@ -1309,6 +1369,8 @@ python3.12 -m venv .venv
 cp config.example.yaml config.yaml     # заповнити contact.email
 harvester doctor                       # самодіагностика
 harvester sources import-seeds         # сід-лист українських джерел
+harvester db-status                    # стан remote/local-БД та outbox
+harvester db-seed                      # однократний перенос локальної БД у PostgreSQL
 ```
 
 ### 20.2. systemd unit (`systemd/harvester.service`)
@@ -1347,6 +1409,34 @@ WantedBy=multi-user.target
 - **Бекапи:** автоматично щодоби (`VACUUM INTO`), 14 останніх; ручний `harvester backup`.
 - **Перенесення на іншу машину:** скопіювати `data/harvester.db` + `config.yaml` — уся станина у файлі БД.
 - **Апгрейд диска/чистка:** тимчасова тека чиститься автоматично; `harvester vacuum` — дефрагментація БД.
+
+### 20.4. Підключення віддаленої PostgreSQL (failover-режим)
+
+1. На VPS: `postgresql` + створення БД/користувача (див. `docs/VPS_SETUP.md`, англ.)
+   або інструкцію супроводжуючого агента.
+2. У `config.yaml` (блок `database:`):
+   ```yaml
+   database:
+     mode: auto            # auto | remote | local
+     host: "VPS_IP_OR_HOST"
+     port: 5432
+     name: "harvester"
+     user: "harvester"
+     # dsn: "postgresql://user:pass@host:port/db"  # альтернатива host+паролю
+     connect_timeout_s: 5
+     retries: 3
+     retry_delay_s: 2
+     restore_probe_interval_s: 30
+     local_db_path: "data/harvester.db"
+   ```
+   Пароль — **лише** env `HARVESTER_PG_PASSWORD` (у `.env`, не в гіт).
+3. Однократно: `harvester db-seed` — перенести локальну БД у PostgreSQL.
+4. Перевірка: `harvester db-status` (має показати `remote (PostgreSQL)`),
+   `harvester doctor`; рестарт process service.
+
+Після цього сервіс працює на PostgreSQL; при втраті з'єднання автоматично
+переходить на локальний SQLite, назбирані операції зливає в remote при
+відновленні (деталі — розділ 12.3).
 
 ---
 

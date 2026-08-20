@@ -2,23 +2,87 @@ import asyncio
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 import aiosqlite
 import structlog
 
-from harvester.config import get_settings
+from harvester.config import Settings
 
 logger = structlog.get_logger()
 
 
 class Database:
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
+    """Спільний інтерфейс роботи з БД (використовується репозиторіями).
+
+    Реалізації: `SqliteDatabase` (локальна), `PostgresDatabase` (віддалена),
+    `FailoverDatabase` (автоматичний вибір між ними).
+    """
+
+    backend_kind: str = "base"
+    db_path: Path | str | None = None
+
+    async def initialize(self) -> None:
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        raise NotImplementedError
+
+    async def execute(self, sql: str, params: tuple | None = None) -> Any:
+        raise NotImplementedError
+
+    async def executemany(self, sql: str, params: list[tuple]) -> None:
+        raise NotImplementedError
+
+    async def executescript(self, sql: str) -> None:
+        raise NotImplementedError
+
+    async def fetchone(self, sql: str, params: tuple | None = None):
+        raise NotImplementedError
+
+    async def fetchall(self, sql: str, params: tuple | None = None) -> list[Any]:
+        raise NotImplementedError
+
+    async def insert(self, sql: str, params: tuple | None = None) -> int | None:
+        raise NotImplementedError
+
+    async def update(self, sql: str, params: tuple | None = None) -> int:
+        raise NotImplementedError
+
+    async def delete(self, sql: str, params: tuple | None = None) -> int:
+        raise NotImplementedError
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[Any]:
+        raise NotImplementedError
+
+    @property
+    def _initialized(self) -> bool:
+        return getattr(self, "_is_initialized", False)
+
+    @_initialized.setter
+    def _initialized(self, value: bool) -> None:
+        self._is_initialized = value
+
+    async def get_version(self) -> int:
+        """Поточна версія схеми (для CLI doctor)."""
+        return await self._version()
+
+    async def _version(self) -> int:
+        raise NotImplementedError
+
+
+class SqliteDatabase(Database):
+    """Локальна SQLite-БД (aiosqlite, autocommit, WAL)."""
+
+    backend_kind = "sqlite"
+
+    def __init__(self, db_path: Path | str):
+        self.db_path = Path(db_path)
         self._writer: aiosqlite.Connection | None = None
         self._readers: list[aiosqlite.Connection] = []
         self._reader_lock = asyncio.Lock()
-        self._initialized = False
+        self._is_initialized = False
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -33,7 +97,7 @@ class Database:
         self._writer.row_factory = sqlite3.Row
         await self._apply_pragmas(self._writer)
 
-        self._initialized = True
+        self._is_initialized = True
         logger.info("database_initialized", path=str(self.db_path))
 
     async def _apply_pragmas(self, conn: aiosqlite.Connection) -> None:
@@ -97,13 +161,20 @@ class Database:
         return cursor.rowcount
 
     @asynccontextmanager
-    async def transaction(self):
+    async def transaction(self) -> AsyncIterator[sqlite3.Cursor]:
+        # isolation_level=None → autocommit: кожен вираз — окрема транзакція,
+        # тож COMMIT/ROLLBACK не потрібні (і викликали 6 помилку без активної транзакції).
         try:
             yield self._writer
-            await self._writer.execute("COMMIT")
         except Exception:
-            await self._writer.execute("ROLLBACK")
             raise
+
+    async def _version(self) -> int:
+        row = await self.fetchone("PRAGMA user_version")
+        return row[0] if row else 0
+
+    def probe(self) -> bool:
+        return self._writer is not None
 
     async def close(self) -> None:
         if self._writer:
@@ -120,5 +191,5 @@ class Database:
                 logger.warning("error_closing_reader", error=str(e))
         self._readers.clear()
 
-        self._initialized = False
+        self._is_initialized = False
         logger.info("database_closed")

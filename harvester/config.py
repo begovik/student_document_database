@@ -112,6 +112,29 @@ class LoggingConfig(BaseModel):
     file: str | None = "logs/harvester.log"
 
 
+class DatabaseConfig(BaseModel):
+    """Підключення до віддаленої PostgreSQL з локальним SQLite-failover."""
+
+    mode: str = Field(default="auto", pattern=r"^(auto|remote|local)$")
+    host: str = ""
+    port: int = Field(default=5432, ge=1, le=65535)
+    name: str = "harvester"
+    user: str = "harvester"
+    dsn: str | None = None
+    pool_min_size: int = Field(default=1, ge=1, le=50)
+    pool_max_size: int = Field(default=20, ge=1, le=200)
+    connect_timeout_s: float = Field(default=5.0, gt=0)
+    retries: int = Field(default=3, ge=1, le=10)
+    retry_delay_s: float = Field(default=2.0, gt=0)
+    restore_probe_interval_s: float = Field(default=30.0, gt=0)
+    merge_on_restore: bool = True
+    local_db_path: str = "data/harvester.db"
+
+    @property
+    def remote_configured(self) -> bool:
+        return bool(self.host) or bool(self.dsn)
+
+
 class LLMConfig(BaseModel):
     enabled: bool = True
     gemini_models: list[str] = Field(default=["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"])
@@ -137,6 +160,7 @@ class Settings(BaseSettings):
 
     contact: ContactConfig
     paths: PathsConfig = Field(default_factory=PathsConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     workers: WorkersConfig = Field(default_factory=WorkersConfig)
     http: HttpConfig = Field(default_factory=HttpConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
@@ -155,6 +179,7 @@ class Settings(BaseSettings):
     gemini_api_key_2: Annotated[str | None, Field(default=None, validation_alias="GEMINI_API_KEY_2")] = None
     gemini_api_key_3: Annotated[str | None, Field(default=None, validation_alias="GEMINI_API_KEY_3")] = None
     open_router_api_key: Annotated[str | None, Field(default=None, validation_alias="OPEN_ROUTER_API_KEY")] = None
+    pg_password: Annotated[str | None, Field(default=None, validation_alias="HARVESTER_PG_PASSWORD")] = None
 
     @property
     def gemini_keys(self) -> list[str]:

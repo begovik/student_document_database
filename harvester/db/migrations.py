@@ -10,18 +10,19 @@ MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 
 async def get_current_version(db: Database) -> int:
-    try:
-        row = await db.fetchone("PRAGMA user_version")
-        return row[0] if row else 0
-    except Exception:
-        return 0
+    """Поточна версія схеми (специфічно для бекенду)."""
+    return await db.get_version()
 
 
-async def set_version(db: Database, version: int) -> None:
+async def set_version(db, version: int) -> None:
     await db.execute(f"PRAGMA user_version = {version}")
 
 
 async def apply_migrations(db: Database) -> None:
+    """SQLite-трек міграцій (PRAGMA user_version + schema.sql + db/migrations/*.sql)."""
+    if db.backend_kind != "sqlite":
+        return
+
     current_version = await get_current_version(db)
     logger.info("checking_migrations", current_version=current_version)
 
@@ -59,4 +60,16 @@ async def apply_migrations(db: Database) -> None:
 
 
 async def ensure_schema(db: Database) -> None:
+    """Застосувати схему/міграції для будь-якого бекенду.
+
+    - failover: схеми обох БД вже застосовані в `FailoverDatabase.initialize()`;
+    - postgres: схема застосовується в `PostgresDatabase.initialize()`;
+    - sqlite: класичний трек міграцій вище.
+    """
+    kind = getattr(db, "backend_kind", "sqlite")
+    if kind == "failover":
+        return
+    if kind == "postgres":
+        await db.apply_schema()
+        return
     await apply_migrations(db)
