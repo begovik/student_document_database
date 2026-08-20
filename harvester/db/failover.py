@@ -92,7 +92,13 @@ class FailoverDatabase(Database):
         self.db_path = self.cfg.local_db_path
 
     # ------------------------------------------------------------------ setup
-    async def initialize(self) -> None:
+    async def initialize(self, sync_mirror: bool = True) -> None:
+        """Ініціалізує БД та, за замовчуванням, синхронізує дзеркало.
+
+        Робочий процес Harvester використовує `sync_mirror=True`. Сервісні
+        read-only команди CLI можуть передати `False`, щоб не запускати
+        тривалий resync паралельно з уже працюючим процесом.
+        """
         if self._initialized:
             return
 
@@ -123,24 +129,25 @@ class FailoverDatabase(Database):
         self._remote_ever_ok = remote_ok
 
         if remote_ok:
-            # Якщо попередній запуск завершився під час аварії — спершу злити outbox.
-            try:
-                drained = await self._drain_outbox()
-                if drained:
-                    logger.info("db_startup_outbox_drained", ops=drained)
-                self._mode = "remote"
-                logger.info("db_mode_remote", host=self.cfg.host or "")
-                # Синхронізація при старті: локальне дзеркало повністю
-                # перебудовується з remote (outbox уже порожній), щоб дані
-                # завжди були свіжими.
+            self._mode = "remote"
+            logger.info("db_mode_remote", host=self.cfg.host or "")
+            if sync_mirror:
+                # Якщо попередній запуск завершився під час аварії — спершу злити outbox.
                 try:
-                    await self._ensure_local_mirror(force=True)
+                    drained = await self._drain_outbox()
+                    if drained:
+                        logger.info("db_startup_outbox_drained", ops=drained)
+                    # Синхронізація при старті: локальне дзеркало повністю
+                    # перебудовується з remote (outbox уже порожній), щоб дані
+                    # завжди були свіжими.
+                    try:
+                        await self._ensure_local_mirror(force=True)
+                    except Exception as e:
+                        logger.error("db_startup_mirror_check_failed", error=str(e))
+                    self._start_mirror_loop()
                 except Exception as e:
-                    logger.error("db_startup_mirror_check_failed", error=str(e))
-                self._start_mirror_loop()
-            except Exception as e:
-                logger.error("db_startup_merge_failed", error=str(e))
-                self._mode = "local"
+                    logger.error("db_startup_merge_failed", error=str(e))
+                    self._mode = "local"
         else:
             self._mode = "local"
             logger.warning(
@@ -674,6 +681,13 @@ class FailoverDatabase(Database):
         return 0
 
     async def close(self) -> None:
+        if self._mirror_task is not None:
+            self._mirror_task.cancel()
+            try:
+                await self._mirror_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._mirror_task = None
         if self._restore_task is not None:
             self._restore_task.cancel()
             try:

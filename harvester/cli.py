@@ -57,7 +57,7 @@ def status():
     async def _status():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize()
+        await db.initialize(sync_mirror=False)
 
         try:
             settings_repo = SettingsRepository(db)
@@ -128,7 +128,7 @@ def stats(
     async def _stats():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize()
+        await db.initialize(sync_mirror=False)
 
         try:
             stats_repo = ChannelStatsRepository(db)
@@ -182,7 +182,7 @@ def export(
     async def _export():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize()
+        await db.initialize(sync_mirror=False)
 
         try:
             query = "SELECT * FROM documents WHERE status = ?"
@@ -224,7 +224,7 @@ def doctor():
 
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize()
+        await db.initialize(sync_mirror=False)
 
         try:
             version = await get_current_version(db)
@@ -278,7 +278,7 @@ def db_status():
     async def _db_status():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize()
+        await db.initialize(sync_mirror=False)
 
         try:
             table = Table(title="Стан бази даних")
@@ -331,14 +331,14 @@ def db_resync():
     async def _resync():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize()
+        await db.initialize(sync_mirror=False)
 
         try:
             if db.mode != "remote":
                 rprint("[red]✗ Дзеркало актуальне лише у remote-режимі "
                        "(зараз: local)[/red]")
                 raise typer.Exit(1)
-            ok = await db._ensure_local_mirror()
+            ok = await db._ensure_local_mirror(force=True)
             status = await db.mirror_status()
             if ok and status == "synced":
                 rprint("[green]✓ Локальне дзеркало синхронізовано[/green]")
@@ -365,7 +365,7 @@ def db_seed():
             raise typer.Exit(1)
 
         db = build_database(settings)
-        await db.initialize()
+        await db.initialize(sync_mirror=False)
 
         if db.remote is None or not db._remote_ever_ok:
             rprint("[red]✗ Не вдалося підключитись до віддаленої БД[/red]")
@@ -464,7 +464,7 @@ def init_db():
     async def _init():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize()
+        await db.initialize(sync_mirror=False)
 
         try:
             await ensure_schema(db)
@@ -488,7 +488,7 @@ def events(
     async def _events():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize()
+        await db.initialize(sync_mirror=False)
 
         try:
             repo = SystemEventsRepository(db)
@@ -532,7 +532,7 @@ def queries(
     async def _queries():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize()
+        await db.initialize(sync_mirror=False)
 
         try:
             repo = SearchQueriesRepository(db)
@@ -569,7 +569,7 @@ def vacuum():
     async def _vacuum():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize()
+        await db.initialize(sync_mirror=False)
 
         try:
             if db.local is not None:

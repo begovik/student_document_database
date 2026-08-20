@@ -155,7 +155,7 @@ sudo -u harvester bash -c '
   .venv/bin/harvester init-db --config config.yaml
 
   # 2) Статус: має бути "Активна БД: віддалена (PostgreSQL)", дзеркало — синхронно:
-  .venv/bin/harvester db-status --config config.yaml
+  .venv/bin/harvester db-status
 '
 ```
 
@@ -232,9 +232,9 @@ sudo -u harvester bash -c 'cd /opt/harvester && .venv/bin/harvester <коман�
 | Команда | Призначення |
 |---|---|
 | `status` | стан додатка і сервісів |
-| `db-status` | активна БД, кількість у outbox, стан дзеркала |
+| `db-status` | активна БД, кількість у outbox, стан дзеркала; read-only, без resync |
 | `doctor` | самодіагностика (БД, мережа, дзеркало) |
-| `db-resync` | примусове відновлення локального дзеркала з PostgreSQL (ручна команда; системно воно відновлюється само) |
+| `db-resync` | примусове відновлення локального дзеркала з PostgreSQL; перед запуском зупинити сервіс |
 | `db-seed` | однократне перенесення локальної SQLite у PostgreSQL (лише при першому підключенні, remote має бути порожнім) |
 | `init-db` | створення схеми таблиць (безпечно повторювати) |
 | `statistics` | лічильники/статистика збору |
@@ -262,7 +262,7 @@ sudo -u harvester bash -c 'cd /opt/harvester && .venv/bin/harvester <коман�
 |---|---|---|
 | `db_mode_local` у логах | PostgreSQL недоступна при старті | перевірити мережу/файрвол/сервіс; додаток працює на local і зіллється сам |
 | `db_startup_merge_failed` | збій злиття outbox при старті | глянути `journalctl`; повторити старт (злиття ідемпотентне: дублікати пропускаються) |
-| `doctor` показує червоний стан дзеркала | дзеркало розійшлося з PostgreSQL | спершу `harvester db-resync`; якщо не допомогло — `harvester db-status` і логи |
+| `doctor` показує червоний стан дзеркала | дзеркало розійшлося з PostgreSQL | зупинити сервіс, виконати `harvester db-resync`, потім запустити сервіс; `db-status` можна виконувати без зупинки |
 | додаток не стартує, помилка зʼєднання | невірний пароль/хост у `config.yaml`/`/etc/harvester.env` | перевірити значення, обидва файли чутливі до пароля |
 | `init-db` виконує міграції повторно | так задумано | команда ідемпотентна, версія у `schema_version` |
 
