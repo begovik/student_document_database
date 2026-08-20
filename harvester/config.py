@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -179,7 +179,8 @@ class Settings(BaseSettings):
     gemini_api_key_2: Annotated[str | None, Field(default=None, validation_alias="GEMINI_API_KEY_2")] = None
     gemini_api_key_3: Annotated[str | None, Field(default=None, validation_alias="GEMINI_API_KEY_3")] = None
     open_router_api_key: Annotated[str | None, Field(default=None, validation_alias="OPEN_ROUTER_API_KEY")] = None
-    pg_password: Annotated[str | None, Field(default=None, validation_alias="HARVESTER_PG_PASSWORD")] = None
+    pg_user: Annotated[str | None, Field(default=None, validation_alias=AliasChoices("HARVESTER_PG_USER", "PG_USER"))] = None
+    pg_password: Annotated[str | None, Field(default=None, validation_alias=AliasChoices("HARVESTER_PG_PASSWORD", "PG_PASS"))] = None
 
     @property
     def gemini_keys(self) -> list[str]:

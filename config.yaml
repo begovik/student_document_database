@@ -1,6 +1,18 @@
 contact:
   email: "you@example.org"
 
+database:
+  mode: "auto"
+  host: "89.167.68.48"
+  port: 5432
+  name: "harvester"
+  user: "harvester"
+  connect_timeout_s: 5
+  retries: 3
+  retry_delay_s: 2
+  restore_probe_interval_s: 30
+  local_db_path: "data/harvester.db"
+
 paths:
   db_path: "data/harvester.db"
   tmp_dir: "data/tmp"

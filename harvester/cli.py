@@ -364,7 +364,9 @@ async def _seed_table(local_db, remote_db, table: str, seq_col: str | None) -> i
     cols = list(dict(cols_row).keys())
     col_sql = ", ".join(f'"{c}"' for c in cols)
     placeholders = ", ".join("?" for _ in cols)
-    insert_sql = f'INSERT INTO {table} ({col_sql}) VALUES ({placeholders})'
+    insert_sql = (
+        f'INSERT INTO {table} ({col_sql}) VALUES ({placeholders}) ON CONFLICT DO NOTHING'
+    )
 
     total = 0
     offset = 0

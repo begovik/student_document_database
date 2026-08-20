@@ -66,10 +66,24 @@ class PostgresDatabase(Database):
                 "asyncpg не встановлено. Виконайте: pip install 'asyncpg>=0.29.0'"
             )
 
+    @staticmethod
+    def _sanitize_param(v: Any) -> Any:
+        """PostgreSQL (UTF-8) не приймає NUL-байти, а SQLite — приймає.
+        Замінюємо на пустий рядок, щоб seed/outbox-реплікація не падали."""
+        if isinstance(v, str):
+            return v.replace("\x00", "")
+        return v
+
+    @classmethod
+    def _sanitize_params(cls, params: list | tuple | None) -> list | None:
+        if not params:
+            return list(params) if params is not None else None
+        return [cls._sanitize_param(p) for p in params]
+
     def _dsn(self) -> str:
         if self.cfg.dsn:
             return self.cfg.dsn
-        user = self.cfg.user or "postgres"
+        user = self.cfg.user or get_settings().pg_user or "postgres"
         host = self.cfg.host
         port = self.cfg.port
         name = self.cfg.name
@@ -165,7 +179,7 @@ class PostgresDatabase(Database):
         if self._pool is None:
             raise RuntimeError("PostgresDatabase не ініціалізовано")
         pg_sql, mode = prepare(sql)
-        params = list(params) if params else []
+        params = self._sanitize_params(params) or []
         target = self._conn_or_pool()
 
         if mode == "rows":
@@ -178,7 +192,7 @@ class PostgresDatabase(Database):
         if self._pool is None:
             raise RuntimeError("PostgresDatabase не ініціалізовано")
         pg_sql = prepare_many(sql)
-        await self._pool.executemany(pg_sql, [list(p) for p in params])
+        await self._pool.executemany(pg_sql, [self._sanitize_params(p) for p in params])
 
     async def executescript(self, sql: str) -> None:
         if self._pool is None:
@@ -191,7 +205,7 @@ class PostgresDatabase(Database):
         if self._pool is None:
             raise RuntimeError("PostgresDatabase не ініціалізовано")
         pg_sql, _ = prepare(sql)
-        params = list(params) if params else []
+        params = self._sanitize_params(params) or []
         target = self._conn_or_pool()
         return await target.fetchrow(pg_sql, *params)
 
@@ -199,7 +213,7 @@ class PostgresDatabase(Database):
         if self._pool is None:
             raise RuntimeError("PostgresDatabase не ініціалізовано")
         pg_sql, _ = prepare(sql)
-        params = list(params) if params else []
+        params = self._sanitize_params(params) or []
         target = self._conn_or_pool()
         return await target.fetch(pg_sql, *params)
 

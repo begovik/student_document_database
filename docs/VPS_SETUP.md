@@ -48,7 +48,7 @@ sudo -u postgres psql
 Inside `psql`:
 
 ```sql
-CREATE USER harvester WITH PASSWORD 'CHANGE_ME_STRONG_PASSWORD';
+CREATE USER harvester WITH PASSWORD '****************';
 CREATE DATABASE harvester OWNER harvester;
 GRANT ALL PRIVILEGES ON DATABASE harvester TO harvester;
 \q
@@ -140,11 +140,19 @@ database:
   local_db_path: "data/harvester.db"
 ```
 
-And in the Harvester node's `.env`:
+And in the Harvester node's `.env` (either pair works):
 
 ```
+# preferred names:
+HARVESTER_PG_USER=harvester
 HARVESTER_PG_PASSWORD=CHANGE_ME_STRONG_PASSWORD
+# or short aliases (also supported):
+PG_USER=harvester
+PG_PASS=CHANGE_ME_STRONG_PASSWORD
 ```
+
+> Note: the password/username are read from the environment only, never from
+> a committed file.
 
 ### One-time data transfer (run once, on the Harvester node):
 
@@ -190,3 +198,4 @@ Keep ~14 daily dumps (add a small cleanup command if desired).
 | `no pg_hba.conf entry for host ...` | your node IP is missing in `pg_hba.conf` (step 4) |
 | Timeouts during heavy load | increase `pool_max_size` / `connect_timeout_s` in `database:` block; restart Harvester |
 | After restore, `db-status` still shows outbox>0 | temporary; the outbox is drained on restore. If stuck, check `journalctl -u harvester` for `db_restore_merge_error`. |
+| `invalid byte sequence for encoding "UTF8": 0x00` during seed | text data contains NUL bytes (allowed by SQLite, not by PG). Already sanitized by Harvester's `_sanitize_params`; re-run `harvester db-seed` (idempotent, `ON CONFLICT DO NOTHING`). |
