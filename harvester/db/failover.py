@@ -84,6 +84,7 @@ class FailoverDatabase(Database):
         self._switch_lock = asyncio.Lock()
         self._drain_lock = asyncio.Lock()
         self._restore_task: asyncio.Task | None = None
+        self._mirror_task: asyncio.Task | None = None
         self._is_initialized = False
         self._remote_ever_ok = False
         self._local_drift = False
@@ -129,11 +130,14 @@ class FailoverDatabase(Database):
                     logger.info("db_startup_outbox_drained", ops=drained)
                 self._mode = "remote"
                 logger.info("db_mode_remote", host=self.cfg.host or "")
-                # Відновити локальне дзеркало, якщо воно відстало (outbox уже порожній).
+                # Синхронізація при старті: локальне дзеркало повністю
+                # перебудовується з remote (outbox уже порожній), щоб дані
+                # завжди були свіжими.
                 try:
-                    await self._ensure_local_mirror()
+                    await self._ensure_local_mirror(force=True)
                 except Exception as e:
                     logger.error("db_startup_mirror_check_failed", error=str(e))
+                self._start_mirror_loop()
             except Exception as e:
                 logger.error("db_startup_merge_failed", error=str(e))
                 self._mode = "local"
@@ -195,10 +199,11 @@ class FailoverDatabase(Database):
             await self._drain_outbox()
             row = await self.local.fetchone(f"SELECT COUNT(*) AS c FROM {OUTBOX_TABLE}")
             if row and row["c"] == 0:
-                ok = await self._ensure_local_mirror()
+                ok = await self._ensure_local_mirror(force=True)
                 if not ok:
                     return
                 self._mode = "remote"
+                self._start_mirror_loop()
                 logger.info("db_failover_restored")
 
     # ----------------------------------------------------------------- routing
@@ -372,11 +377,15 @@ class FailoverDatabase(Database):
                 return table
         return None
 
-    async def _ensure_local_mirror(self) -> bool:
+    async def _ensure_local_mirror(self, force: bool = False) -> bool:
         """Перевіряє і (за потреби) відновлює локальне дзеркало з remote.
 
-        Викликається лише при порожньому outbox (старт/restore, під
-        `_switch_lock`): local буде перебудовано з remote повністю.
+        Викликається при порожньому outbox (старт/restore, під `_switch_lock`):
+        local буде перебудовано з remote повністю.
+
+        `force=True` — завжди перебудовувати (старт додатка: дані мають бути
+        свіжими). Інакше — лише коли є розбіжність за кількістю рядків або
+        була зафіксована невдача дзеркала (`_local_drift`).
 
         Захист: якщо remote порожня (наприклад, первинний `db-seed` ще не
         виконано), local НЕ чіпається — він є джерелом для seed.
@@ -384,9 +393,10 @@ class FailoverDatabase(Database):
         if self.remote is None or self.local is None:
             return True
         try:
-            mismatch = await self._mirror_counts_mismatch()
-            if mismatch is None and not self._local_drift:
-                return True
+            if not force:
+                mismatch = await self._mirror_counts_mismatch()
+                if mismatch is None and not self._local_drift:
+                    return True
 
             remote_any = False
             for table in APP_TABLES:
@@ -397,7 +407,7 @@ class FailoverDatabase(Database):
             if not remote_any:
                 logger.info(
                     "db_mirror_skip_remote_empty",
-                    mismatch=mismatch,
+                    force=force,
                 )
                 return True
 
@@ -518,8 +528,39 @@ class FailoverDatabase(Database):
     async def _downgrade(self) -> None:
         if self._mode == "remote":
             self._mode = "local"
+            self._cancel_mirror_loop()
             logger.critical("db_failover_started", host=self.cfg.host or "")
             self._start_restore_loop()
+
+    def _cancel_mirror_loop(self) -> None:
+        if self._mirror_task is not None and not self._mirror_task.done():
+            self._mirror_task.cancel()
+        self._mirror_task = None
+
+    def _start_mirror_loop(self) -> None:
+        """Періодична звірка дзеркала у remote-режимі (фонове самовідновлення).
+
+        Локальне дзеркало залишається свіжим, навіть якщо додаток працює
+        безперервно: розбіжності (втрачені дзеркальні записи, правки на remote
+        з іншого екземпляра) виявляються і виправляються автоматично.
+        """
+        if self.remote is None:
+            return
+        if self._mirror_task is None or self._mirror_task.done():
+            self._mirror_task = asyncio.create_task(self._mirror_loop())
+
+    async def _mirror_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.cfg.restore_probe_interval_s)
+            if self._mode != "remote" or self.remote is None:
+                return
+            async with self._switch_lock:
+                if self._mode != "remote":
+                    return
+                try:
+                    await self._ensure_local_mirror()
+                except Exception as e:
+                    logger.error("db_mirror_loop_failed", error=str(e)[:300])
 
     @staticmethod
     async def _exec_on(db: Database | None, op: str, sql: str, params: Any = None) -> Any:

@@ -1104,12 +1104,16 @@ CREATE TABLE settings (
 
 **Самовідновлення дзеркала (`_ensure_local_mirror`):**
 
-- при старті в remote-режимі та при restore (outbox порожній, під
-  `_switch_lock`) кількості рядків 14 таблиць додатка порівнюються
-  local ⟷ remote;
-- розбіжність або прапорець `db_mirror_local_failed` → `_resync_local_from_remote()`:
-  local очищується (FK вимкнено) та копіюється з remote keyset-батчами
-  (збереження id);
+- **синхронізація при старті додатка** (remote-режим) та при restore
+  (outbox порожній, під `_switch_lock`): local **повністю перебудовується
+  з remote** (`_ensure_local_mirror(force=True)`) — дані завжди свіжі,
+  навіть якщо remote змінювалася з іншого екземпляра;
+- **фоновий цикл** (`_mirror_loop`, кожні `restore_probe_interval_s` = 30 с,
+  поки режим remote): порівнюються кількості рядків 14 таблиць додатка
+  local ⟷ remote; розбіжність або прапорець `db_mirror_local_failed`
+  → `_resync_local_from_remote()`;
+- `_resync_local_from_remote()`: local очищується (FK вимкнено) та
+  копіюється з remote keyset-батчами (збереження id);
 - захист: коли remote порожня (первинний `db-seed` ще не виконано), local
   **не чіпається** — він є джерелом для seed;
 - ручне відновлення: `harvester db-resync`; стан видно у `db-status`/`doctor`.

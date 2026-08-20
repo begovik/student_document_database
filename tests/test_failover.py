@@ -313,10 +313,49 @@ async def test_mirror_skip_when_remote_empty(db):
         db.remote = fake_remote
         db._mode = "remote"
         await db._ensure_local_mirror()
+        await db._ensure_local_mirror(force=True)
         row = await db.local.fetchone("SELECT host FROM domains WHERE host = ?", ("keep.org",))
         assert row is not None
     finally:
         await fake_remote.close()
+
+
+@pytest.mark.asyncio
+async def test_mirror_force_sync_refreshes_content(dual_db):
+    # однакова кількість рядків, але вміст розходиться (правка на remote
+    # з іншого екземпляра): force=True (старт додатка) оновлює local.
+    await dual_db.remote.execute(
+        "INSERT INTO system_events (id, ts, level, component, message) "
+        "VALUES (1, '2026-01-01T00:00:00', 'info', 'test', 'fresh')",
+    )
+    await dual_db.local.execute(
+        "INSERT INTO system_events (id, ts, level, component, message) "
+        "VALUES (1, '2026-01-01T00:00:00', 'info', 'test', 'stale')",
+    )
+
+    await dual_db._ensure_local_mirror(force=True)
+
+    row = await dual_db.local.fetchone("SELECT message FROM system_events WHERE id = 1")
+    assert row is not None and row["message"] == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_mirror_no_force_keeps_content_on_same_counts(dual_db):
+    # без force (фонова звірка) швидкий шлях не перебудовує local,
+    # якщо кількість рядків збігається.
+    await dual_db.remote.execute(
+        "INSERT INTO system_events (id, ts, level, component, message) "
+        "VALUES (1, '2026-01-01T00:00:00', 'info', 'test', 'fresh')",
+    )
+    await dual_db.local.execute(
+        "INSERT INTO system_events (id, ts, level, component, message) "
+        "VALUES (1, '2026-01-01T00:00:00', 'info', 'test', 'stale')",
+    )
+
+    await dual_db._ensure_local_mirror()
+
+    row = await dual_db.local.fetchone("SELECT message FROM system_events WHERE id = 1")
+    assert row is not None and row["message"] == "stale"
 
 
 @pytest.mark.asyncio
