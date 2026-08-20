@@ -1069,16 +1069,16 @@ CREATE TABLE settings (
 
 Окремо від чисто-локального режиму (12.1–12.2) система підтримує **роботу із
 віддаленою PostgreSQL** через шар failover, щоб дані не втрачались при втраті
-доступу до сервера. Локальний SQLite при цьому виконує роль **аварійного
-дубля** (fallback), а не просто кешу.
+доступу до сервера. Локальний SQLite при цьому — **повноцінне дзеркало** даних
+у реальному часі (dual-write), а не просто кеш чи аварійна копія.
 
 **Ролі:**
 
 | Компонент | Роль |
 |---|---|
-| `FailoverDatabase` (`db/failover.py`) | шлюз: спільний інтерфейс `Database` для всього коду; сам обирає, куди йдуть запити |
-| `PostgresDatabase` (`db/postgres.py`) | віддалений бекенд (asyncpg pool) |
-| `SqliteDatabase` (`db/connection.py`) | локальний бекенд (aiosqlite) — автокоміт, WAL |
+| `FailoverDatabase` (`db/failover.py`) | шлюз: спільний інтерфейс `Database` для всього коду; обирає, куди йдуть запити |
+| `PostgresDatabase` (`db/postgres.py`) | віддалений бекенд (asyncpg pool) — джерело істини у remote-режимі |
+| `SqliteDatabase` (`db/connection.py`) | локальний бекенд (aiosqlite) — автокоміт, WAL; дзеркало |
 | `failover_outbox` (таблиця у локальній БД) | черга операцій, накопичених під час роботи на local |
 | `dialect` (`db/dialect.py`) | трансляція SQLite-діалекту → PostgreSQL (`?`→`$N`, `INSERT OR IGNORE`→`ON CONFLICT DO NOTHING`, `RETURNING id`) |
 
@@ -1089,6 +1089,35 @@ CREATE TABLE settings (
 - `auto` (дефолт) — при старті: `SELECT 1` до remote; OK → режим `remote`,
   недоступна → режим `local` + фоновий restore-цикл.
 
+**Dual-write (remote-режим):**
+
+1. **Кожна DML-операція спершу виконується на remote** (джерело істини,
+   зі `retries`), потім **дублюється у локальне дзеркало** тим самим SQL.
+2. Для INSERT у таблиці з серійною колонкою `id` remote-згенерований id
+   **підставляється у локальний INSERT** (`inject_id`), тож рядки в обох БД
+   мають тотожні id, а FK-ланцюжки (documents→refs/attempts/topics)
+   залишаються валідними в обох копіях.
+3. У remote-режимі outbox **не використовується** — рядок вже присутній
+   у remote; локальне дзеркало оновлюється безпосередньо.
+4. Якщо збій remote вичерпав спроби — `_downgrade()` на local; дані вже
+   є у дзеркалі, тож робота продовжується без втрат.
+
+**Самовідновлення дзеркала (`_ensure_local_mirror`):**
+
+- при старті в remote-режимі та при restore (outbox порожній, під
+  `_switch_lock`) кількості рядків 14 таблиць додатка порівнюються
+  local ⟷ remote;
+- розбіжність або прапорець `db_mirror_local_failed` → `_resync_local_from_remote()`:
+  local очищується (FK вимкнено) та копіюється з remote keyset-батчами
+  (збереження id);
+- захист: коли remote порожня (первинний `db-seed` ще не виконано), local
+  **не чіпається** — він є джерелом для seed;
+- ручне відновлення: `harvester db-resync`; стан видно у `db-status`/`doctor`.
+
+**Колокація:** додаток може запускатись на тому ж VPS, де розташована
+PostgreSQL (host = 127.0.0.1) — логіка не змінюється: SQLite лишається
+локальним дзеркалом, PostgreSQL — «віддаленою» БД.
+
 **Failover-поведінка (режим `auto`):**
 
 1. **Старт:** проба з'єднання (`try_connect`, таймаут `connect_timeout_s`).
@@ -1096,7 +1125,7 @@ CREATE TABLE settings (
    кожні `restore_probe_interval_s` (30 с) повторює пробу.
 2. **Під час роботи на remote:** будь-який збій запиту → повторні спроби
    (`retries=3`, пауза `retry_delay_s`); якщо всі невдалі — перемикання на
-   local (`_downgrade`) і продовження роботи без простою.
+   local (`_downgrade`) і продовження роботи без простою (дані вже в local).
 3. **Під час роботи на local:** усі DML-операції виконуються локально **і**
    записуються в `failover_outbox`. Рядки, створені в цьому режимі, отримують
    **зарезервовані id ≥ 2 000 000 000** (постійно зростають за MAX+1), щоб при
@@ -1106,7 +1135,7 @@ CREATE TABLE settings (
    (`_drain_outbox`) у порядку `rid`: ID-INSERTи виконуються з тими самими id
    (дублікати за унікальним ключем пропускаються через `ON CONFLICT DO NOTHING`),
    потім — фінальне перемикання на remote (`_try_finalize_switch`), лише коли
-   outbox порожній.
+   outbox порожній; перед перемиканням відновлюється дзеркало (`_ensure_local_mirror`).
 5. **Idempotентність:** `INSERT OR IGNORE` → `ON CONFLICT DO NOTHING`, тож
    повторне злиття (після рестарту process) не дублює рядки.
 

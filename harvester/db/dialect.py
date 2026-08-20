@@ -127,10 +127,136 @@ def translate_sql(sql: str) -> str:
         returning = ""
         if tbl in ID_TABLES:
             returning = " RETURNING id"
+        # PostgreSQL не дозволяє некваліфіковані колонки у виразах
+        # ON CONFLICT DO UPDATE SET (ambiguous), SQLite — дозволяє.
+        if " ON CONFLICT" in upper and tbl:
+            result = _qualify_upsert_set(result, tbl)
         # Якщо вже є ON CONFLICT (upsert), повертаємо без додавання.
         return result + conflict_clause + returning
 
     return result
+
+
+def _split_top_level_commas(s: str) -> list[str]:
+    """Розбиває на частини за комами поза рядковими літералами та дужками."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    in_str = False
+    i = 0
+    L = len(s)
+    while i < L:
+        ch = s[i]
+        if in_str:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < L:
+                buf.append(s[i + 1])
+                i += 2
+                continue
+            if ch == "'":
+                in_str = False
+            i += 1
+            continue
+        if ch == "'":
+            in_str = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def _qualify_word(expr: str, word: str, qualifier: str) -> str:
+    """Замінює самостійні входження `word` на `qualifier.word` поза літералами."""
+    out: list[str] = []
+    i = 0
+    L = len(expr)
+    in_str = False
+    while i < L:
+        ch = expr[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < L:
+                out.append(expr[i + 1])
+                i += 2
+                continue
+            if ch == "'":
+                in_str = False
+            i += 1
+            continue
+        if ch == "'":
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch.isalnum() or ch == "_":
+            j = i
+            while j < L and (expr[j].isalnum() or expr[j] == "_"):
+                j += 1
+            token = expr[i:j]
+            prev = expr[i - 1] if i > 0 else " "
+            bare = not (prev.isalnum() or prev in "._")
+            if bare and token.lower() == word.lower():
+                out.append(f"{qualifier}.{token}")
+            else:
+                out.append(token)
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _qualify_upsert_set(sql: str, table: str) -> str:
+    """Кваліфікує колонки у `ON CONFLICT ... DO UPDATE SET` для PostgreSQL.
+
+    PG-семантика: некваліфіковане посилання на колонку у виразі SET
+    двозначне між цільовим рядком та псевдо-рядком `excluded` →
+    `column reference "x" is ambiguous`. SQLite таку саму форму приймає,
+    тому кваліфікація додається лише при трансляції у PG.
+    """
+    marker = " DO UPDATE SET "
+    up = sql.upper()
+    idx = up.find(marker)
+    if idx < 0 or " ON CONFLICT" not in up:
+        return sql
+
+    head = sql[: idx + len(marker)]
+    tail = sql[idx + len(marker):]
+
+    assignments = _split_top_level_commas(tail)
+    names: set[str] = set()
+    for part in assignments:
+        lhs, sep, _ = part.partition("=")
+        if sep:
+            name = lhs.strip().strip('"').strip()
+            if name:
+                names.add(name)
+        for m in re.finditer(r"\bexcluded\.(\w+)", part, re.IGNORECASE):
+            names.add(m.group(1))
+
+    qualified: list[str] = []
+    for part in assignments:
+        lhs, sep, rhs = part.partition("=")
+        if not sep:
+            qualified.append(part)
+            continue
+        expr = rhs
+        for name in names:
+            expr = _qualify_word(expr, name, table)
+        qualified.append(f"{lhs}={expr}")
+    return head + ",".join(qualified)
 
 
 def _classify(sql: str) -> str:

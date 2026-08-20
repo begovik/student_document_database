@@ -3,11 +3,14 @@
 Поведінка (згідно з ТЗ):
 - при старті перевіряється доступ до віддаленої БД; якщо недоступна —
   робота йде на локальній;
+- у remote-режимі кожна DML-операція дублюється у локальну SQLite
+  (дзеркало) з тими самими id, тож обидві копії даних завжди актуальні;
 - якщо запит до віддаленої БД не проходить, робиться кілька спроб
-  (`retries`), після чого — перемикання на локальну;
+  (`retries`), після чого — перемикання на локальну (дані вже там, бо
+  дзеркало підтримувалось у реальному часі);
 - фоновий restore-probe повертає роботу на віддалену БД, щойно вона
   знову доступна, попередньо зливаючи (replay) зміни з локальної через
-  outbox-таблицю.
+  outbox-таблицю та відновлюючи локальне дзеркало з remote за потреби.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ import structlog
 
 from harvester.config import DatabaseConfig, get_settings
 from harvester.db.connection import Database, SqliteDatabase
-from harvester.db.dialect import ID_TABLES, inject_id, insert_id_table
+from harvester.db.dialect import inject_id, insert_id_table
 
 try:  # pragma: no cover - asyncpg опційний
     from asyncpg.exceptions import UniqueViolationError as _AsyncpgUniqueError  # type: ignore
@@ -39,10 +42,30 @@ OUTBOX_DDL = (
     "params TEXT NOT NULL)"
 )
 
+# Таблиці додатка (не службові), що дзеркалюються між local та remote.
+APP_TABLES = (
+    "domains",
+    "sources",
+    "documents",
+    "document_mirrors",
+    "document_refs",
+    "fetch_attempts",
+    "tasks",
+    "search_queries",
+    "topics",
+    "document_topics",
+    "blacklist",
+    "channel_stats",
+    "system_events",
+    "settings",
+)
+
 # Джерело id для рядків, створених у local-режимі: 2e9+ ніколи не конфліктує
 # з id, які встигла видати remote-БД (серійні колонки реально < 1e9),
 # і replay у remote виконується з тими самими id (FK-цілісність).
 LOCAL_ID_BASE = 2_000_000_000
+
+MIRROR_BATCH = 500
 
 
 class RemoteUnavailable(Exception):
@@ -63,6 +86,8 @@ class FailoverDatabase(Database):
         self._restore_task: asyncio.Task | None = None
         self._is_initialized = False
         self._remote_ever_ok = False
+        self._local_drift = False
+        self._tx_buf: list[tuple[Any, Any, Any, Any]] | None = None
         self.db_path = self.cfg.local_db_path
 
     # ------------------------------------------------------------------ setup
@@ -104,6 +129,11 @@ class FailoverDatabase(Database):
                     logger.info("db_startup_outbox_drained", ops=drained)
                 self._mode = "remote"
                 logger.info("db_mode_remote", host=self.cfg.host or "")
+                # Відновити локальне дзеркало, якщо воно відстало (outbox уже порожній).
+                try:
+                    await self._ensure_local_mirror()
+                except Exception as e:
+                    logger.error("db_startup_mirror_check_failed", error=str(e))
             except Exception as e:
                 logger.error("db_startup_merge_failed", error=str(e))
                 self._mode = "local"
@@ -154,13 +184,20 @@ class FailoverDatabase(Database):
                 logger.error("db_restore_merge_error", error=str(e))
 
     async def _try_finalize_switch(self) -> None:
-        """Фінальний прохід злиття під локом, потім — перемикання на remote."""
+        """Фінальний прохід злиття під локом, потім — перемикання на remote.
+
+        Outbox порожній → оновлюється локальне дзеркало (якщо відстало),
+        і лише тоді режим змінюється на remote.
+        """
         async with self._switch_lock:
             if self._mode != "local":
                 return
             await self._drain_outbox()
             row = await self.local.fetchone(f"SELECT COUNT(*) AS c FROM {OUTBOX_TABLE}")
             if row and row["c"] == 0:
+                ok = await self._ensure_local_mirror()
+                if not ok:
+                    return
                 self._mode = "remote"
                 logger.info("db_failover_restored")
 
@@ -210,15 +247,51 @@ class FailoverDatabase(Database):
 
     @asynccontextmanager
     async def transaction(self):
-        active = self._active()
-        if active is None:
-            yield None
+        """Транзакційний контекст.
+
+        Remote-режим: кадр транзакції remote; дзеркальні записи буферизуються
+        і виконуються у local лише після успішного COMMIT (інакше rollback
+        remote залишив би зайві рядки у локальному дзеркалі).
+        """
+        if self._mode != "remote" or self.remote is None:
+            active = self._active()
+            if active is None:
+                yield None
+                return
+            async with active.transaction() as conn:
+                yield conn
             return
-        async with active.transaction() as conn:
-            yield conn
+
+        if self._tx_buf is not None:
+            # Вкладений контекст: підтвердження — на зовнішньому кадрі.
+            async with self._remote_tx_conn() as conn:
+                yield conn
+            return
+
+        buf: list[tuple[Any, Any, Any, Any]] = []
+        self._tx_buf = buf
+        try:
+            async with self.remote.transaction() as conn:
+                yield conn
+            for op, sql, params, lid in buf:
+                await self._mirror_local(op, sql, params, lid=lid)
+        finally:
+            self._tx_buf = None
+
+    @asynccontextmanager
+    async def _remote_tx_conn(self):
+        """Доступ до поточного з'єднання remote-транзакції (для вкладення)."""
+        conn = getattr(self.remote, "_tx_conn", None)
+        yield conn
 
     async def _route(self, op: str, sql: str, params: Any = None) -> Any:
-        """Єдина точка входу для DML-операцій (під локом перемикання)."""
+        """Єдина точка входу для DML-операцій (під локом перемикання).
+
+        Remote-режим: remote — джерело істини, операція виконується там,
+        після чого дублюється у локальне дзеркало (з тими самими id).
+        Local-режим: операція виконується локально та записується в outbox
+        для подальшого replay у remote.
+        """
         async with self._switch_lock:
             if self.local is None:
                 raise RuntimeError("FailoverDatabase не ініціалізовано")
@@ -229,9 +302,20 @@ class FailoverDatabase(Database):
 
             if self._mode == "remote":
                 try:
-                    return await self._remote_retry(op, sql, params)
+                    result = await self._remote_retry(op, sql, params)
                 except RemoteUnavailable:
                     await self._downgrade()
+                else:
+                    lid = None
+                    if op == "insert":
+                        lid = result if isinstance(result, int) else None
+                    else:
+                        lid = getattr(result, "lastrowid", None)
+                    if self._tx_buf is not None:
+                        self._tx_buf.append((op, sql, params, lid))
+                    else:
+                        await self._mirror_local(op, sql, params, lid=lid)
+                    return result
 
             # Local-mode (або щойно перемкнено після невдачі remote).
             sql_for_store = sql
@@ -248,16 +332,161 @@ class FailoverDatabase(Database):
             await self._outbox_append(op, sql_for_store, params)
             return result
 
+    async def _mirror_local(self, op: str, sql: str, params: Any = None, lid: int | None = None) -> None:
+        """Дзеркалює успішно виконану на remote операцію у локальну SQLite.
+
+        Для INSERT у таблицю з серійною колонкою `id`, де remote повернув
+        згенерований id, у локальний SQL підставляється той самий `id`
+        (дзеркало зберігає тотожні id — FK-ланцюжки залишаються валідними,
+        і failover дає ідентичну копію даних).
+
+        Невдача дзеркала НЕ впливає на результат операції (remote успішний):
+        позначається `_local_drift`, і дзеркало буде відновлено з remote
+        (`_ensure_local_mirror`).
+        """
+        if self.local is None:
+            return
+
+        mirror_sql = sql
+        if lid is not None and insert_id_table(sql) is not None:
+            injected = inject_id(sql, lid)
+            if injected is not None:
+                mirror_sql = injected
+
+        try:
+            await self._exec_on(self.local, op, mirror_sql, params)
+        except Exception as e:
+            self._local_drift = True
+            logger.error("db_mirror_local_failed", op=op, error=str(e)[:300])
+
+    async def _mirror_counts_mismatch(self) -> str | None:
+        """Перша таблиця, де local-дзеркало розходиться з remote за кількістю рядків."""
+        if self.remote is None or self.local is None:
+            return None
+        for table in APP_TABLES:
+            r = await self.remote.fetchone(f"SELECT COUNT(*) AS c FROM {table}")
+            l = await self.local.fetchone(f"SELECT COUNT(*) AS c FROM {table}")
+            rc = r["c"] if r else 0
+            lc = l["c"] if l else 0
+            if rc != lc:
+                return table
+        return None
+
+    async def _ensure_local_mirror(self) -> bool:
+        """Перевіряє і (за потреби) відновлює локальне дзеркало з remote.
+
+        Викликається лише при порожньому outbox (старт/restore, під
+        `_switch_lock`): local буде перебудовано з remote повністю.
+
+        Захист: якщо remote порожня (наприклад, первинний `db-seed` ще не
+        виконано), local НЕ чіпається — він є джерелом для seed.
+        """
+        if self.remote is None or self.local is None:
+            return True
+        try:
+            mismatch = await self._mirror_counts_mismatch()
+            if mismatch is None and not self._local_drift:
+                return True
+
+            remote_any = False
+            for table in APP_TABLES:
+                r = await self.remote.fetchone(f"SELECT COUNT(*) AS c FROM {table}")
+                if r and r["c"]:
+                    remote_any = True
+                    break
+            if not remote_any:
+                logger.info(
+                    "db_mirror_skip_remote_empty",
+                    mismatch=mismatch,
+                )
+                return True
+
+            await self._resync_local_from_remote()
+        except Exception as e:
+            self._local_drift = True
+            logger.error("db_local_mirror_check_failed", error=str(e)[:300])
+            return False
+        return True
+
+    async def _resync_local_from_remote(self) -> None:
+        """Перебудовує local-дзеркало з remote (delete all + copy, зберігаючи id)."""
+        logger.warning(
+            "db_local_resync_start",
+            path=str(self.local.db_path if self.local else ""),
+        )
+        await self.local.execute("PRAGMA foreign_keys=OFF")
+        try:
+            for table in reversed(APP_TABLES):
+                await self.local.execute(f"DELETE FROM {table}")
+            for table in APP_TABLES:
+                await self._copy_remote_table_to_local(table)
+        finally:
+            await self.local.execute("PRAGMA foreign_keys=ON")
+        self._local_drift = False
+        logger.info("db_local_resynced")
+
+    async def _copy_remote_table_to_local(self, table: str) -> None:
+        """Копіює одну таблицю з remote у local батчами (keyset-пагінація за id)."""
+        sample = await self.remote.fetchone(f"SELECT * FROM {table} LIMIT 1")
+        if sample is None:
+            return
+        cols = list(dict(sample).keys())
+        col_sql = ", ".join(f'"{c}"' for c in cols)
+        placeholders = ", ".join("?" for _ in cols)
+        insert_sql = f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})"
+
+        if "id" in cols:
+            order, where = "id", "id > ?"
+            last_id = 0
+            while True:
+                rows = await self.remote.fetchall(
+                    f"SELECT * FROM {table} WHERE {where} ORDER BY {order} LIMIT ?",
+                    (last_id, MIRROR_BATCH),
+                )
+                if not rows:
+                    break
+                batch = [tuple(dict(r)[c] for c in cols) for r in rows]
+                await self.local.executemany(insert_sql, batch)
+                last_id = dict(rows[-1])["id"]
+        elif table == "document_topics":
+            last_key: tuple[int, int] | None = None
+            while True:
+                if last_key is None:
+                    rows = await self.remote.fetchall(
+                        f"SELECT * FROM {table} ORDER BY document_id, topic_id LIMIT ?",
+                        (MIRROR_BATCH,),
+                    )
+                else:
+                    rows = await self.remote.fetchall(
+                        f"SELECT * FROM {table} "
+                        "WHERE (document_id, topic_id) > (?, ?) "
+                        "ORDER BY document_id, topic_id LIMIT ?",
+                        (*last_key, MIRROR_BATCH),
+                    )
+                if not rows:
+                    break
+                batch = [tuple(dict(r)[c] for c in cols) for r in rows]
+                await self.local.executemany(insert_sql, batch)
+                d = dict(rows[-1])
+                last_key = (d["document_id"], d["topic_id"])
+        else:  # settings: один рядок
+            rows = await self.remote.fetchall(f"SELECT * FROM {table}")
+            if rows:
+                batch = [tuple(dict(r)[c] for c in cols) for r in rows]
+                await self.local.executemany(insert_sql, batch)
+
     async def _next_reserved_id(self, table: str) -> int:
         """Наступний id у зарезервованому діапазоні (>= LOCAL_ID_BASE).
 
         Викликається лише з local-режиму (під `_switch_lock` — послідовно),
-        тож MAX+1 без гонок.
+        тож MAX+1 без гонок. Якщо у local вже є дзеркальні рядки з малими
+        (remote-)id, це не впливає: результат завжди >= LOCAL_ID_BASE.
         """
         row = await self.local.fetchone(
-            f"SELECT COALESCE(MAX(id), {LOCAL_ID_BASE - 1}) + 1 AS nid FROM {table}"
+            f"SELECT MAX(id) + 1 AS nid FROM {table}"
         )
-        return int(row["nid"]) if row else LOCAL_ID_BASE
+        nid = int(row["nid"]) if row and row["nid"] is not None else LOCAL_ID_BASE
+        return max(nid, LOCAL_ID_BASE)
 
     def _active(self) -> Database | None:
         if self._mode == "remote":
@@ -381,6 +610,20 @@ class FailoverDatabase(Database):
         if self.remote is None:
             return False
         return await self.remote.try_connect(timeout_s=self.cfg.connect_timeout_s)
+
+    async def mirror_status(self) -> str:
+        """Стан локального дзеркала.
+
+        Значення: 'synced' | 'drift' | 'mismatch:<table>' | 'local-only' | 'n/a'.
+        """
+        if self.remote is None or self.local is None:
+            return "n/a"
+        if self._mode != "remote":
+            return "local-only"
+        mismatch = await self._mirror_counts_mismatch()
+        if mismatch:
+            return f"mismatch:{mismatch}"
+        return "drift" if self._local_drift else "synced"
 
     async def get_version(self) -> int:
         if self._mode == "remote" and self.remote is not None:

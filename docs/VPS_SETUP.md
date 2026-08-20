@@ -163,9 +163,17 @@ harvester doctor       # all green
 ```
 
 After the first successful connection, Harvester runs on PostgreSQL; its
-`data/harvester.db` acts as a local fallback (outbox). If they are later
-disconnected, everything collected during the outage is merged back
-automatically (see TECHNICAL_DESIGN.md §12.3 for details).
+`data/harvester.db` acts as a **realtime mirror**: every write goes to
+PostgreSQL first (source of truth) and is duplicated into local SQLite with the
+same ids. If they are later disconnected, the local SQLite already contains all
+the data, everything collected during the outage is merged back automatically,
+and the mirror is re-verified on restore (see TECHNICAL_DESIGN.md §12.3 for
+details).
+
+Status of the mirror is shown by `harvester db-status` and `harvester doctor`;
+repair manually with `harvester db-resync` if ever needed. The same logic
+applies when Harvester runs on the VPS itself (`database.host: 127.0.0.1`):
+SQLite stays the local mirror, PostgreSQL the authoritative store.
 
 ---
 
@@ -198,4 +206,5 @@ Keep ~14 daily dumps (add a small cleanup command if desired).
 | `no pg_hba.conf entry for host ...` | your node IP is missing in `pg_hba.conf` (step 4) |
 | Timeouts during heavy load | increase `pool_max_size` / `connect_timeout_s` in `database:` block; restart Harvester |
 | After restore, `db-status` still shows outbox>0 | temporary; the outbox is drained on restore. If stuck, check `journalctl -u harvester` for `db_restore_merge_error`. |
+| `db-status` shows mirror `розбіжність (table)` | local SQLite drifted (e.g. mirror write failed). Run `harvester db-resync`; it rebuilds local from PostgreSQL (only when the outbox is empty). |
 | `invalid byte sequence for encoding "UTF8": 0x00` during seed | text data contains NUL bytes (allowed by SQLite, not by PG). Already sanitized by Harvester's `_sanitize_params`; re-run `harvester db-seed` (idempotent, `ON CONFLICT DO NOTHING`). |

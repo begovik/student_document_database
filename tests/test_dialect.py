@@ -60,6 +60,35 @@ class TestTranslate:
         assert translate_sql(sql) == "SELECT id, title FROM documents WHERE status = $1"
 
 
+class TestUpsertQualify:
+    def test_unqualified_set_columns_qualified(self):
+        sql = (
+            "INSERT INTO channel_stats (channel, ts, requests) VALUES (?, ?, ?) "
+            "ON CONFLICT(channel, ts) DO UPDATE SET "
+            "requests = requests + excluded.requests, ok = ok + excluded.ok"
+        )
+        out = translate_sql(sql)
+        assert "requests = channel_stats.requests + excluded.requests" in out
+        assert "ok = channel_stats.ok + excluded.ok" in out
+
+    def test_qualified_only_untouched(self):
+        sql = (
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+        )
+        out = translate_sql(sql)
+        assert "value = excluded.value" in out
+        assert "updated_at = excluded.updated_at" in out
+
+    def test_returning_still_appended(self):
+        sql = (
+            "INSERT INTO channel_stats (channel, ts, requests) VALUES (?, ?, ?) "
+            "ON CONFLICT(channel, ts) DO UPDATE SET requests = requests + excluded.requests"
+        )
+        out = translate_sql(sql)
+        assert "RETURNING id" in out
+
+
 class TestPrepare:
     def test_rows_mode(self):
         pg, mode = prepare("SELECT 1")

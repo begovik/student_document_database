@@ -244,6 +244,19 @@ def doctor():
                 integrity = await db.local.fetchone("PRAGMA integrity_check")
                 if integrity and integrity[0] == "ok":
                     rprint("[green]✓ Цілісність локальної БД: OK[/green]")
+
+            mirror = await db.mirror_status()
+            if mirror == "synced":
+                rprint("[green]✓ Локальне дзеркало: синхронно[/green]")
+            elif mirror == "drift":
+                rprint("[yellow]⚠ Локальне дзеркало: розбіжність "
+                       "(відновиться при наступному restore)[/yellow]")
+            elif mirror.startswith("mismatch:"):
+                tbl = mirror.split(":", 1)[1]
+                rprint(f"[red]✗ Локальне дзеркало: розбіжність ({tbl}) — "
+                       f"виконайте harvester db-resync[/red]")
+            else:
+                rprint("[dim]— Локальне дзеркало: не активне (local-режим)[/dim]")
         finally:
             await db.close()
 
@@ -285,6 +298,20 @@ def db_status():
                 table.add_row("Хост", f"{cfg.host}:{cfg.port}/{cfg.name}")
             table.add_row("Локальна БД", str(db.db_path))
 
+            mirror = await db.mirror_status()
+            if mirror == "synced":
+                table.add_row("Дзеркало (local SQLite)", "синхронно")
+            elif mirror == "drift":
+                table.add_row("Дзеркало (local SQLite)", "[yellow]розбіжність (буде відновлено)[/yellow]")
+            elif mirror.startswith("mismatch:"):
+                tbl = mirror.split(":", 1)[1]
+                table.add_row(
+                    "Дзеркало (local SQLite)",
+                    f"[yellow]розбіжність ({tbl}), потрібен db-resync[/yellow]",
+                )
+            else:
+                table.add_row("Дзеркало (local SQLite)", "—")
+
             pending = await db.pending_outbox_count()
             table.add_row("Outbox (очікує злиття)", str(pending))
             table.add_row("Restore-інтервал", f"{cfg.restore_probe_interval_s} с")
@@ -294,6 +321,33 @@ def db_status():
             await db.close()
 
     asyncio.run(_db_status())
+
+
+@app.command()
+def db_resync():
+    """Відновити локальне дзеркало SQLite з віддаленої PostgreSQL"""
+    from harvester.db.failover import build_database
+
+    async def _resync():
+        settings = get_settings()
+        db = build_database(settings)
+        await db.initialize()
+
+        try:
+            if db.mode != "remote":
+                rprint("[red]✗ Дзеркало актуальне лише у remote-режимі "
+                       "(зараз: local)[/red]")
+                raise typer.Exit(1)
+            ok = await db._ensure_local_mirror()
+            status = await db.mirror_status()
+            if ok and status == "synced":
+                rprint("[green]✓ Локальне дзеркало синхронізовано[/green]")
+            else:
+                rprint(f"[yellow]⚠ Стан дзеркала: {status}[/yellow]")
+        finally:
+            await db.close()
+
+    asyncio.run(_resync())
 
 
 @app.command()
