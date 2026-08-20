@@ -1,0 +1,105 @@
+contact:
+  email: "you@example.org"
+
+paths:
+  db_path: "data/harvester.db"
+  tmp_dir: "data/tmp"
+  backup_dir: "backups"
+
+workers:
+  verify: 6
+  discovery: 3
+  scanner: 1
+  classify: 1
+
+http:
+  global_concurrency: 32
+  per_host_delay_ms: 2000
+  per_host_burst: 2
+  max_pdf_bytes: 209715200
+  min_pdf_bytes: 10240
+  max_redirects: 5
+  connect_timeout_s: 10
+  read_timeout_s: 30
+  total_timeout_s: 300
+  bandwidth_mbps: 2.0
+  user_agent: "Harvester/1.0 (+contact: you@example.org)"
+
+channels:
+  ddgs:
+    enabled: true
+    backends:
+      - duckduckgo
+      - bing
+      - brave
+      - mojeek
+      - startpage
+      - yahoo
+      - wikipedia
+    query_interval_s: [3, 10]
+  openalex:
+    enabled: true
+    rps: 5
+  crossref:
+    enabled: true
+    rps: 5
+  unpaywall:
+    enabled: true
+    rps: 1
+  semanticscholar:
+    enabled: true
+    rps: 1
+  arxiv:
+    enabled: true
+    interval_s: 3
+  doaj:
+    enabled: true
+    rps: 1
+  internet_archive:
+    enabled: true
+    rps: 1
+  core:
+    enabled: false
+  oai:
+    enabled: true
+    per_host_interval_s: 2
+
+filters:
+  blocked_tlds:
+    - ".ru"
+    - ".su"
+    - ".рф"
+    - ".xn--p1ai"
+  soviet_cutoff_year: 1991
+  soviet_action: reject
+  ru_lang_min_confidence: 0.8
+
+verify:
+  first_pages_for_text: 3
+  title_match_min: 85
+  title_match_review: 60
+  max_pages: 2000
+  max_attempts: 3
+
+classify:
+  min_score: 0.25
+  max_topics: 3
+
+reverify:
+  interval_days_new: 30
+  interval_days_stable: 90
+  broken_retry_days: 3
+
+scanner:
+  max_pages_per_source: 300
+  max_depth: 2
+  sitemap_max_urls: 50000
+
+retention:
+  fetch_attempts_days: 90
+  events_days: 180
+  backups_keep: 14
+
+logging:
+  level: INFO
+  file: "logs/harvester.log"

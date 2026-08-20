@@ -1,0 +1,22 @@
+[Unit]
+Description=Harvester — PDF sources collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=harvester
+WorkingDirectory=/opt/harvester
+ExecStart=/opt/harvester/.venv/bin/harvester start --config /opt/harvester/config.yaml
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+MemoryMax=1G
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/harvester/data /opt/harvester/backups
+
+[Install]
+WantedBy=multi-user.target
