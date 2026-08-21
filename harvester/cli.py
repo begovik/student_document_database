@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from harvester.config import get_settings, load_config
+from harvester.extract.cli import extract_app
 
 app = typer.Typer(
     name="harvester",
@@ -19,6 +20,9 @@ app = typer.Typer(
 )
 
 console = Console()
+
+# Реєстрація subcommand
+app.add_typer(extract_app, name="extract")
 
 
 @app.command()
@@ -711,8 +715,6 @@ def find(
             rprint(f"[green]Знайдено {len(rows)} документів[/green]")
         finally:
             await db.close()
-
-    asyncio.run(_find())
 
 
 if __name__ == "__main__":
