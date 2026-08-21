@@ -258,8 +258,14 @@ class TasksRepository:
         now = datetime.utcnow().isoformat()
 
         sql = """
-        INSERT OR IGNORE INTO tasks (type, payload, payload_hash, status, priority, attempts, max_attempts, run_after, created_at, updated_at)
+        INSERT INTO tasks (type, payload, payload_hash, status, priority, attempts, max_attempts, run_after, created_at, updated_at)
         VALUES (?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?)
+        ON CONFLICT (type, payload_hash) DO UPDATE SET
+            status = 'pending',
+            attempts = 0,
+            run_after = excluded.run_after,
+            updated_at = excluded.updated_at
+        WHERE tasks.status = 'done'
         """
         cursor = await self.db.execute(sql, (task_type, payload_json, payload_hash, priority, max_attempts, run_after, now, now))
         return cursor.lastrowid if cursor.lastrowid else None
