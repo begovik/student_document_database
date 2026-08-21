@@ -288,8 +288,8 @@ async def call_llm_for_extraction(text: str, title: str) -> dict[str, Any] | Non
         {"role": "user", "content": content},
     ]
 
-    # Спробувати Gemini (обидва ключі)
-    for api_key in [llm_config.gemini_api_key, llm_config.gemini_api_key_2, llm_config.gemini_api_key_3]:
+    # Спробувати Gemini (ключі з settings)
+    for api_key in [settings.gemini_api_key, settings.gemini_api_key_2, settings.gemini_api_key_3]:
         if not api_key:
             continue
         try:
@@ -300,9 +300,9 @@ async def call_llm_for_extraction(text: str, title: str) -> dict[str, Any] | Non
             logger.warning("gemini_try_failed", error=str(e))
 
     # Спробувати OpenRouter
-    if llm_config.openrouter_api_key:
+    if settings.open_router_api_key:
         try:
-            result = await call_openrouter(llm_config.openrouter_api_key, llm_config, messages)
+            result = await call_openrouter(settings.open_router_api_key, llm_config, messages)
             if result is not None:
                 return result
         except Exception as e:
