@@ -583,5 +583,137 @@ def vacuum():
     asyncio.run(_vacuum())
 
 
+@app.command()
+def find(
+    topic: str = typer.Option(
+        ...,
+        "--topic",
+        "-t",
+        help="Тематика/спеціальність для пошуку (наприклад, 'Підприємництво, торгівля та біржова діяльність' або код 076)",
+    ),
+    limit: int = typer.Option(
+        30,
+        "--limit",
+        "-n",
+        min=1,
+        max=500,
+        help="Максимальна кількість документів у каталозі",
+    ),
+    lang: str = typer.Option(
+        None,
+        "--lang",
+        "-l",
+        help="Фільтр за мовою (uk, en, ru, de, fr, ...)",
+    ),
+    doc_type: str = typer.Option(
+        None,
+        "--type",
+        "-d",
+        help="Фільтр за типом документу (article, book, thesis, dissertation, methodical, report, preprint, other)"
+    )):
+    """Знайти літературу в базі даних за тематикою
+
+    Пошук документів відбувається в існуючій базі.
+    Фільтрується: мова, тип документу, наявність title.
+    """
+    from harvester.db.failover import build_database
+    from harvester.db.repositories import DocumentsRepository
+    from harvester.classify.taxonomy import load_topics
+
+    async def _find():
+        settings = get_settings()
+        db = build_database(settings)
+        await db.initialize(sync_mirror=False)
+
+        try:
+            docs_repo = DocumentsRepository(db)
+
+            # Спробувати знайти топік по назві
+            topics = await load_topics(db)
+            topic_code = None
+            for t in topics:
+                if topic.lower() in t["name_uk"].lower() or topic.lower() in t["name_en"].lower():
+                    topic_code = t["code"]
+                    rprint(f"[cyan]Знайдено топік: {t['name_uk']} ({t['code']})[/cyan]")
+                    break
+
+            where = ""
+            params: list = []
+
+            if doc_type:
+                where += " AND d.doc_type = ?"
+                params.append(doc_type)
+
+            if lang:
+                where += " AND d.language = ?"
+                params.append(lang)
+
+            where += " AND d.title IS NOT NULL"
+            where += " AND d.title != ''"
+
+            if topic_code:
+                where += " AND d.id IN (SELECT dt.document_id FROM document_topics dt JOIN topics t ON t.id = dt.topic_id WHERE t.code = ?)"
+                params.append(topic_code)
+            else:
+                # Пошук по УДК якщо топік не знайдено
+                query_text = f"%{topic}%"
+                where += " AND (d.udc LIKE ? OR d.title LIKE ? OR d.authors LIKE ?)"
+                params.extend([query_text, query_text, query_text])
+
+            query = f"""
+                SELECT d.id, d.title, d.authors, d.year, d.publisher, d.language,
+                       d.doc_type, d.udc, d.doi, d.canonical_url, d.isbn,
+                       t.name_uk as topic_name
+                FROM documents d
+                LEFT JOIN document_topics dt ON dt.document_id = d.id
+                LEFT JOIN topics t ON t.id = dt.topic_id
+                WHERE 1=1 {where}
+                ORDER BY d.year DESC NULLS LAST, d.title
+                LIMIT ?
+            """
+            params.append(limit)
+
+            rows = await db.fetchall(query, tuple(params))
+
+            if not rows:
+                rprint(f"[yellow]У базі не знайдено документів для теми «{topic}»[/yellow]")
+                return
+
+            table = Table(title=f"Каталог літератури: {topic}")
+            table.add_column("№", style="cyan", width=4)
+            table.add_column("Назва", style="green")
+            table.add_column("Автори", style="yellow")
+            table.add_column("Рік", justify="right", style="magenta")
+            table.add_column("Тип", style="blue")
+            table.add_column("Тематика", style="cyan")
+
+            for i, row in enumerate(rows, 1):
+                title_display = row["title"] or "(без назви)"
+                if len(title_display) > 50:
+                    title_display = title_display[:47] + "..."
+                authors_display = row["authors"] or "—"
+                if len(authors_display) > 30:
+                    authors_display = authors_display[:27] + "..."
+                year_display = str(row["year"]) if row["year"] else "—"
+                doc_type_display = row["doc_type"] or "other"
+                topic_display = row["topic_name"] or "—"
+
+                table.add_row(
+                    str(i),
+                    title_display,
+                    authors_display,
+                    year_display,
+                    doc_type_display,
+                    topic_display,
+                )
+
+            console.print(table)
+            rprint(f"[green]Знайдено {len(rows)} документів[/green]")
+        finally:
+            await db.close()
+
+    asyncio.run(_find())
+
+
 if __name__ == "__main__":
     app()

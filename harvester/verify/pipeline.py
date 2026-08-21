@@ -182,6 +182,13 @@ class VerifyPipeline:
 
             authors = [parse_result.metadata.author] if parse_result.metadata.author else None
 
+            title = parse_result.metadata.title
+            if not title and parse_result.text:
+                from harvester.verify.pdfparse import extract_title_from_text
+                title = extract_title_from_text(parse_result.text)
+                if title:
+                    logger.info("title_extracted_from_text", doc_id=doc_id, title=title[:80])
+
             await self.docs_repo.update_verified(
                 doc_id=doc_id,
                 sha256=sha256,
@@ -189,7 +196,7 @@ class VerifyPipeline:
                 page_count=parse_result.page_count,
                 language=lang_result.language,
                 lang_confidence=lang_result.confidence,
-                title=parse_result.metadata.title,
+                title=title,
                 authors=authors,
                 doc_type="article",
                 udc=udc,
