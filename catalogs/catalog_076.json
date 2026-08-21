@@ -1,0 +1,1182 @@
+{
+  "query": "Підприємництво, торгівля та біржова діяльність (076)",
+  "udc_prefixes": [
+    "334.7",
+    "334.72",
+    "334.722",
+    "334.723",
+    "334.724",
+    "334.726",
+    "334.73",
+    "334.75",
+    "334.758",
+    "334.764",
+    "334.772",
+    "339.1",
+    "339.13",
+    "339.132",
+    "339.138",
+    "339.5",
+    "339.56",
+    "339.564",
+    "336.76",
+    "333.17",
+    "333.18",
+    "333.5"
+  ],
+  "total_found": 800,
+  "with_quality_authors": 544,
+  "selected_count": 30,
+  "documents": [
+    {
+      "id": 157,
+      "title": "РОЛЬ FINTECH У РОЗВИТКУ ФІНАНСОВОГО РИНКУ УКРАЇНИ",
+      "authors": "[\"\\u041c. \\u041f. \\u0424\\u0435\\u0434\\u0438\\u0448\\u0438\\u043d\", \"Ruslan Zhurko\", \"\\u041e\\u043b\\u0435\\u0433 \\u041b\\u043e\\u0431\\u043a\\u043e\"]",
+      "year": 2024,
+      "publisher": "Актуальні проблеми розвитку економіки регіону",
+      "doi": "10.15330/apred.2.20.278-291",
+      "canonical_url": "https://journals.pnu.edu.ua/index.php/aprde/article/download/8186/8286",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "336.76(477)",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 14,
+      "size_bytes": 368970,
+      "verified_at": "2026-08-19T18:32:19.684081",
+      "first_seen_at": "2026-08-19T18:23:23.376705",
+      "sha256": "08854cdf8f18e0c467e143515b287c8d04bdbdfa811e0b99997c9767b7f767d1",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.5349
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.186
+        }
+      ]
+    },
+    {
+      "id": 454,
+      "title": "ВПЛИВ ЦИФРОВОГО МАРКЕТИНГУ НА РОЗВИТОК ПІДПРИЄМНИЦТВА В УМОВАХ ВІЙНИ THE IMPACT OF DIGITAL MARKETING ON ENTREPRENEURIAL DEVELOPMENT IN A WAR ENVIRONMENT",
+      "authors": "[\"\\u041e\\u043a\\u0441\\u0430\\u043d\\u0430 \\u0412\\u0438\\u0442\\u0432\\u0438\\u0446\\u044c\\u043a\\u0430\", \"\\u0421\\u0432\\u0456\\u0442\\u043b\\u0430\\u043d\\u0430 \\u0421\\u0443\\u0432\\u043e\\u0440\\u043e\\u0432\\u0430\", \"\\u0410\\u043d\\u0434\\u0440\\u0456\\u0439 \\u041a\\u043e\\u0440\\u044e\\u0433\\u0456\\u043d\"]",
+      "year": 2022,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2022-40-66",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/1518/1460",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "379.8:339.1",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 7,
+      "size_bytes": 187853,
+      "verified_at": "2026-08-19T18:47:16.398248",
+      "first_seen_at": "2026-08-19T18:23:52.533370",
+      "sha256": "ba6c66433d5d7ebcf90e5f0092d60ccaf0ef4cf7ae893699c5f74a4965bc330d",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.2131
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.1967
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1967
+        }
+      ]
+    },
+    {
+      "id": 1031,
+      "title": "DIGITAL-МАРКЕТИНГ В УМОВАХ ЦИФРОВІЗАЦІЇ СУЧАСНИХ БІЗНЕС-ПРОЦЕСІВ DIGITAL MARKETING IN THE CONTEXT OF DIGITALIZATION OF MODERN BUSINESS PROCESSES",
+      "authors": "[\"\\u0421\\u0432\\u0456\\u0442\\u043b\\u0430\\u043d\\u0430 \\u041e\\u0431\\u0456\\u0445\\u043e\\u0434\", \"\\u041c\\u0438\\u043a\\u043e\\u043b\\u0430 \\u041c\\u0430\\u0442\\u0432\\u0435\\u0454\\u0432\", \"\\u0412\\u043e\\u043b\\u043e\\u0434\\u0438\\u043c\\u0438\\u0440 \\u0411\\u043e\\u0439\\u043a\\u043e\"]",
+      "year": 2023,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2023-50-76",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/2439/2359",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.138:338.242",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 8,
+      "size_bytes": 315860,
+      "verified_at": "2026-08-19T18:55:20.552104",
+      "first_seen_at": "2026-08-19T18:24:59.113342",
+      "sha256": "759cf0f91e5dfbc25b802d780498998b2f8b6b78bdf728c3b9b03450491789fd",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3056
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.3056
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1528
+        }
+      ]
+    },
+    {
+      "id": 1352,
+      "title": "МІЖНАРОДНІ ЕКОНОМІЧНІ ВІДНОСИНИ",
+      "authors": "[\"\\u0406\\u0440\\u0438\\u043d\\u0430 \\u041a\\u0438\\u0446\\u044e\\u043a\", \"\\u041d\\u0430\\u0442\\u0430\\u043b\\u0456\\u044f \\u041d\\u0430\\u0443\\u043c\\u0435\\u043d\\u043a\\u043e\", \"\\u0412\\u043e\\u043b\\u043e\\u0434\\u0438\\u043c\\u0438\\u0440 \\u041f\\u0440\\u0438\\u0441\\u044f\\u0436\\u043d\\u044e\\u043a\"]",
+      "year": 2023,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2023-56-87",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/3048/2969",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "334.72(477:061.1",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 7,
+      "size_bytes": 313568,
+      "verified_at": "2026-08-19T18:59:35.191896",
+      "first_seen_at": "2026-08-19T18:25:27.774164",
+      "sha256": "4eb059480de8a24e228a129343d43a7770233ae07a9d9e1cfd6b3264af1a29ed",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3889
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.2222
+        },
+        {
+          "topic_id": 16,
+          "topic_name": "Екологія",
+          "score": 0.2037
+        }
+      ]
+    },
+    {
+      "id": 1401,
+      "title": "ДОСЛІДЖЕННЯ ЗМІНИ ПОВЕДІНКИ СПОЖИВАЧІВ У СУЧАСНИХ УМОВАХ RESEARCH OF CHANGES IN CONSUMER BEHAVIOR IN MODERN CONDITIONS",
+      "authors": "[\"\\u041d\\u0430\\u0442\\u0430\\u043b\\u0456\\u044f \\u041a\\u043e\\u0441\\u0430\\u0440\", \"\\u041c\\u0438\\u0440\\u043e\\u0441\\u043b\\u0430\\u0432\\u0430 \\u041c\\u0430\\u043c\\u0447\\u0438\\u043d\", \"\\u0410\\u043d\\u0430\\u0441\\u0442\\u0430\\u0441\\u0456\\u044f \\u0411\\u0430\\u0440\\u0430\\u043d\"]",
+      "year": 2022,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2022-45-68",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/1978/1905",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.13",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 8,
+      "size_bytes": 230762,
+      "verified_at": "2026-08-19T18:59:56.986210",
+      "first_seen_at": "2026-08-19T18:25:29.430813",
+      "sha256": "18f16df684b02d694493cc7b2a194b490aa10efc5f330eb18b3f0897b00b41b5",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.4375
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.2708
+        },
+        {
+          "topic_id": 14,
+          "topic_name": "Соціологія",
+          "score": 0.2292
+        }
+      ]
+    },
+    {
+      "id": 1481,
+      "title": "ОСОБЛИВОСТІ ФОРМУВАННЯ МЕТОДІВ ПРИЙНЯТТЯ РІШЕНЬ ВІТЧИЗНЯНИМИ ПІДПРИЄМСТВАМИ У ЗОВНІШНЬОЕКОНОМІЧНІЙ ДІЯЛЬНОСТІ: ІНФОРМАЦІЙНИЙ АСПЕКТ PECULIARITIES OF FORMATION THE DECISION-MAKING METHODS BY DOMESTIC ENTERPRISES IN THE FOREIGN ECONOMIC ACTIVITY: INFORMATION ASPECT",
+      "authors": "[\"\\u0410\\u043d\\u0434\\u0440\\u0456\\u0439 \\u0417\\u0430\\u0432\\u0435\\u0440\\u0431\\u043d\\u0438\\u0439\", \"\\u041b\\u044e\\u0431\\u043e\\u0432 \\u0417\\u0430\\u043b\\u0456\\u0437\\u043d\\u0430\", \"\\u041e\\u043b\\u0435\\u043a\\u0441\\u0430\\u043d\\u0434\\u0440 \\u0416\\u0443\\u043a\"]",
+      "year": 2023,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2023-50-39",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/2400/2321",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "004:658.012.32:338.24.01:339.56",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 6,
+      "size_bytes": 254582,
+      "verified_at": "2026-08-19T19:00:30.785767",
+      "first_seen_at": "2026-08-19T18:25:32.092295",
+      "sha256": "8c3d0898636dd764f3abc4104d0a5cc4fc5e3924a902f63931250ddf67f57286",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.2766
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.234
+        },
+        {
+          "topic_id": 4,
+          "topic_name": "Інформатика та ПЗ",
+          "score": 0.1915
+        }
+      ]
+    },
+    {
+      "id": 1532,
+      "title": "АНАЛІТИЧНІ АСПЕКТИ ДОСЛІДЖЕННЯ ПОВЕДІНКИ СПОЖИВАЧІВ В УМОВАХ ЦИФРОВІЗАЦІЇ ЕКОНОМІКИ УКРАЇНИ ANALYTICAL ASPECTS OF RESEARCH OF CONSUMER BEHAVIOR IN CONDITIONS OF DIGITALIZATION OF UKRAINIAN ECONOMY",
+      "authors": "[\"\\u041d\\u0430\\u0434\\u0456\\u044f \\u041f\\u0440\\u043e\\u0441\\u043a\\u0443\\u0440\\u043d\\u0456\\u043d\\u0430\", \"\\u0421\\u0432\\u0456\\u0442\\u043b\\u0430\\u043d\\u0430 \\u0411\\u0435\\u0441\\u0442\\u0443\\u0436\\u0435\\u0432\\u0430\", \"\\u0412\\u0456\\u043a\\u0442\\u043e\\u0440\\u0456\\u044f \\u041e\\u043b\\u0435\\u043a\\u0441\\u0430\\u043d\\u0434\\u0440\\u0456\\u0432\\u043d\\u0430 \\u041a\\u043e\\u0437\\u0443\\u0431\"]",
+      "year": 2022,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2022-36-40",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/1149/1107",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "004.738:339.133.2",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 12,
+      "size_bytes": 521131,
+      "verified_at": "2026-08-19T19:01:07.169966",
+      "first_seen_at": "2026-08-19T18:25:36.335102",
+      "sha256": "e82c807cb3463d9ef30079129a654540434261ef0173054fb3ae23e981cf8b7b",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.25
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.2308
+        },
+        {
+          "topic_id": 4,
+          "topic_name": "Інформатика та ПЗ",
+          "score": 0.1731
+        }
+      ]
+    },
+    {
+      "id": 1763,
+      "title": "СВІТОВА ПРОДОВОЛЬЧА КРИЗА ЯК НАСЛІДОК РОСІЙСЬКО-УКРАЇНСЬКОЇ ВІЙНИ WORLD FOOD CRISIS AS A RESULT OF THE RUSSIAN-UKRAINIAN WAR",
+      "authors": "[\"\\u041d\\u0430\\u0442\\u0430\\u043b\\u0456\\u044f \\u0420\\u043e\\u0434\\u0456\\u043d\\u043e\\u0432\\u0430\", \"\\u0410\\u043d\\u043d\\u0430 \\u0414\\u0435\\u0440\\u0433\\u0430\\u0447\", \"\\u0413\\u0435\\u043d\\u0440\\u0456\\u0445 \\u0413\\u0443\\u0434\\u0437\\u044c\"]",
+      "year": 2022,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2022-40-25",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/1463/1408",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "332.2:339.56",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 9,
+      "size_bytes": 202535,
+      "verified_at": "2026-08-19T19:06:16.715225",
+      "first_seen_at": "2026-08-19T18:25:53.530386",
+      "sha256": "af810add11f7cce2c0d4aabafac412613381ee417c9b9a31adeccca49e82a683",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3704
+        },
+        {
+          "topic_id": 15,
+          "topic_name": "Політологія",
+          "score": 0.2037
+        },
+        {
+          "topic_id": 21,
+          "topic_name": "Агрономія",
+          "score": 0.2037
+        }
+      ]
+    },
+    {
+      "id": 50567,
+      "title": "СУЧАСНІ ПРОБЛЕМИ ЕКСПЕРТИЗИ, РЕГУЛЮВАННЯ ТА БЕЗПЕКИ ГОСПОДАРСЬКИХ СИСТЕМ",
+      "authors": "[\"Mykhailo Bodak\", \"\\u041e. \\u0406. \\u0413\\u0438\\u0440\\u043a\\u0430\", \"\\u041c\\u0430\\u0440\\u0456\\u044f \\u0424\\u0456\\u043b\\u044c\"]",
+      "year": 2023,
+      "publisher": "Львівський торговельно-економічний університет",
+      "doi": "10.32782/2522-1221-2023-34-08",
+      "canonical_url": "https://journals-lute.lviv.ua/index.php/visnyk-tech/article/download/1369/1290",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.5",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 8,
+      "size_bytes": 473648,
+      "verified_at": "2026-08-20T06:32:53.205434",
+      "first_seen_at": "2026-08-19T19:20:28.288251",
+      "sha256": "a13183d00f6eade42fa31b8024cbc5fb2430459861a18b82a4861dd55e286039",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3879
+        },
+        {
+          "topic_id": 2,
+          "topic_name": "Право",
+          "score": 0.271
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.271
+        }
+      ]
+    },
+    {
+      "id": 66363,
+      "title": "АНАЛІЗ ВПЛИВУ МОБІЛЬНИХ ТЕХНОЛОГІЙ НА МАРКЕТИНГОВУ ВЗАЄМОДІЮ З КЛІЄНТАМИ ANALYSIS OF THE IMPACT OF MOBILE TECHNOLOGIES ON MARKETING INTERACTION WITH CUSTOMERS",
+      "authors": "[\"Anna Krymska\", \"\\u0412\\u0456\\u043a\\u0442\\u043e\\u0440 \\u041c\\u0438\\u0440\\u043e\\u0448\\u043d\\u0438\\u0447\\u0435\\u043d\\u043a\\u043e\", \"\\u0414\\u0430\\u0440\\u2019\\u044f \\u041a\\u043e\\u0432\\u0430\\u043b\\u0435\\u043d\\u043a\\u043e-\\u0421\\u0430\\u0432\\u0447\\u0443\\u043a\"]",
+      "year": 2024,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2024-67-126",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/4809/4749",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.138:004.738.5",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 9,
+      "size_bytes": 331623,
+      "verified_at": "2026-08-20T11:11:10.772335",
+      "first_seen_at": "2026-08-19T19:26:56.194041",
+      "sha256": "70afbb7fe34851dd012f505248fd372cef0dcb255de667919722bacf342ee500",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.386
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.386
+        }
+      ]
+    },
+    {
+      "id": 710,
+      "title": "untitled",
+      "authors": "[\"\\u0410\\u043d\\u0434\\u0440\\u0456\\u0439 \\u0422\\u0410\\u0420\\u0410\\u041d\\u0418\\u0427\", \"\\u0414\\u043c\\u0438\\u0442\\u0440\\u043e \\u041f\\u0435\\u043b\\u0435\\u0445\\u0430\\u0446\\u044c\\u043a\\u0438\\u0439\"]",
+      "year": 2024,
+      "publisher": "ВД «Академперіодика» НАН України",
+      "doi": "10.15407/economyukr.2024.01.054",
+      "canonical_url": "https://nasu-periodicals.org.ua/index.php/economyukr/article/download/2024-01-3/2024-01-3",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "338.45:339.138+004.89",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 12,
+      "size_bytes": 221593,
+      "verified_at": "2026-08-19T18:52:12.496837",
+      "first_seen_at": "2026-08-19T18:24:27.796002",
+      "sha256": "fc84981f51c6b749f457e0c87b2a0c50b3ab928724fcc45ac13d873e062321e8",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3889
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.2222
+        },
+        {
+          "topic_id": 24,
+          "topic_name": "Машинне навчання та ШІ",
+          "score": 0.2222
+        }
+      ]
+    },
+    {
+      "id": 951,
+      "title": "МІЖНАРОДНІ ЕКОНОМІЧНІ ВІДНОСИНИ",
+      "authors": "[\"Ganna Duginets\", \"\\u041a\\u043e\\u0441\\u0442\\u044f\\u043d\\u0442\\u0438\\u043d \\u041d\\u0456\\u0436\\u0435\\u0439\\u043a\\u043e\"]",
+      "year": 2023,
+      "publisher": "ЕКОНОМІКА ТА СУСПІЛЬСТВО",
+      "doi": "10.32782/2524-0072/2023-56-148",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/3109/3033",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.5",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 8,
+      "size_bytes": 308865,
+      "verified_at": "2026-08-19T18:53:31.502708",
+      "first_seen_at": "2026-08-19T18:24:56.561878",
+      "sha256": "47d4b79b12a738a08ad2de310c38fe751b14a1246f0c6d7e814ac66d485544ee",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3962
+        },
+        {
+          "topic_id": 21,
+          "topic_name": "Агрономія",
+          "score": 0.2075
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1509
+        }
+      ]
+    },
+    {
+      "id": 1047,
+      "title": "НАПРЯМИ РОЗВИТКУ ТОРГІВЛІ В УКРАЇНІ В УМОВАХ ВОЄННОГО СТАНУ DIRECTIONS OF TRADE DEVELOPMENT IN UKRAINE UNDER THE CONDITIONS OF MARITAL STATE",
+      "authors": "[\"\\u0422\\u0435\\u0442\\u044f\\u043d\\u0430 \\u041f\\u0430\\u0448\\u043a\\u0443\\u0434\\u0430\", \"\\u0410\\u043d\\u043d\\u0430 \\u0410\\u0444\\u0435\\u043d\\u0434\\u0456\"]",
+      "year": 2022,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2022-43-73",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/1759/1695",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.13.012.42",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 7,
+      "size_bytes": 194957,
+      "verified_at": "2026-08-19T18:55:38.983851",
+      "first_seen_at": "2026-08-19T18:24:59.519703",
+      "sha256": "b24a1a0d15db982ca98150096768eddbf4a9f060431f14019be0a0d94f89e931",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.4468
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.1702
+        },
+        {
+          "topic_id": 23,
+          "topic_name": "Статистика",
+          "score": 0.1702
+        }
+      ]
+    },
+    {
+      "id": 1358,
+      "title": "ЦИФРОВИЙ МАРКЕТИНГ СЬОГОДЕННЯ: ПЕРЕВАГИ ТА НЕДОЛІКИ DIGITAL MARKETING OF TODAY: ADVANTAGES AND DISADVANTAGES",
+      "authors": "[\"\\u0412\\u0430\\u043b\\u0435\\u0440\\u0456\\u0439 \\u0411\\u043e\\u043d\\u0434\\u0430\\u0440\\u0435\\u043d\\u043a\\u043e\", \"Oleksandr Omelianenko\"]",
+      "year": 2024,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2024-67-3",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/4681/4623",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.138:004.67",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 7,
+      "size_bytes": 200587,
+      "verified_at": "2026-08-19T18:59:37.082285",
+      "first_seen_at": "2026-08-19T18:25:27.911789",
+      "sha256": "9022d7a44f93920f28a006648a8225c4df1b086a50c6747c084f0d4af0276d2e",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.3485
+        },
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3182
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1818
+        }
+      ]
+    },
+    {
+      "id": 1724,
+      "title": "ПЕРСОНАЛІЗАЦІЯ В СУЧАСНОМУ МАРКЕТИНГУ ТА ЇЇ ВПЛИВ НА ЛОЯЛЬНІСТЬ КЛІЄНТІВ PERSONALIZATION IN MODERN MARKETING AND ITS IMPACT ON CUSTOMER LOYALTY",
+      "authors": "[\"\\u041e\\u043b\\u0435\\u043d\\u0430 \\u041f\\u043e\\u043f\\u043a\\u043e\", \"\\u0412\\u044f\\u0447\\u0435\\u0441\\u043b\\u0430\\u0432 \\u0424\\u0456\\u043b\\u0430\\u0442\\u043e\\u0432\"]",
+      "year": 2023,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2023-58-10",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/3266/3189",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.138",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 10,
+      "size_bytes": 301427,
+      "verified_at": "2026-08-19T19:05:53.555070",
+      "first_seen_at": "2026-08-19T18:25:45.645829",
+      "sha256": "4f351c092cfd71f60ba375c20a1c9adef9c6b138de2f1c0f607db2db3ae21394",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.3594
+        },
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3281
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1719
+        }
+      ]
+    },
+    {
+      "id": 1797,
+      "title": "МАРКЕТИНГОВА СТРАТЕГІЯ ПІДПРИЄМСТВА: СУТЬ І ПРОЦЕС ВИБОРУ MARKETING STRATEGY OF THE ENTERPRISE: ESSENCE AND SELECTION PROCESS",
+      "authors": "[\"\\u041d\\u0430\\u0442\\u0430\\u043b\\u0456\\u044f \\u0421\\u0442\\u0440\\u0443\\u043a\", \"\\u041e\\u043b\\u044c\\u0433\\u0430 \\u041a\\u0430\\u043f\\u0440\\u0430\\u043b\\u044c\"]",
+      "year": 2023,
+      "publisher": "ЕКОНОМІКА ТА СУСПІЛЬСТВО",
+      "doi": "10.32782/2524-0072/2023-55-75",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/2927/2848",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.138",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 6,
+      "size_bytes": 293193,
+      "verified_at": "2026-08-19T19:06:31.425814",
+      "first_seen_at": "2026-08-19T18:26:03.737602",
+      "sha256": "280b8323673dfc41e97f59cd68fabc6fad913e58d107232a759a332acd00926b",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3286
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.3
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1714
+        }
+      ]
+    },
+    {
+      "id": 50000,
+      "title": "АКТИВІЗАЦІЯ МАРКЕТИНГОВИХ КОМУНІКАЦІЙ АТ «КОНЦЕРН «ГАЛНАФТОГАЗ» У НАПРЯМІ ПІДВИЩЕННЯ ЙОГО КОНКУРЕНТОСПРОМОЖНОСТІ",
+      "authors": "[\"Nataliya Kosar\", \"Yaryna Yarychevska\"]",
+      "year": 2023,
+      "publisher": "Національний університет «Львівська політехніка»",
+      "doi": "10.15330/apred.1.19.115-125",
+      "canonical_url": "https://journals.pnu.edu.ua/index.php/aprde/article/download/6879/7138",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.138",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 11,
+      "size_bytes": 303814,
+      "verified_at": "2026-08-20T06:24:04.591451",
+      "first_seen_at": "2026-08-19T19:20:15.015417",
+      "sha256": "c721e4631b96da9f8ff85f8c4b50508e7d5e3f80d3715f276052c2dc29f94fe9",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3143
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.3143
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1571
+        }
+      ]
+    },
+    {
+      "id": 51333,
+      "title": "РОЗВИТОК ТРАНСПОРТУ",
+      "authors": "[\"Olha Petrenko\", \"M.O. Potapovska\"]",
+      "year": 2021,
+      "publisher": "Державний університет інфраструктури та технологій",
+      "doi": "10.33082/td.2021.1-8.02",
+      "canonical_url": "https://journals.onmu.in.ua/index.php/journal/article/download/104/168",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "334.756:656.615",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 11,
+      "size_bytes": 388623,
+      "verified_at": "2026-08-20T06:45:20.321656",
+      "first_seen_at": "2026-08-19T19:20:52.192437",
+      "sha256": "abb0d2d91f2dd51f38db7a38742d566eed707d1d13c61230122e9fd5f6d78372",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.5714
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.3429
+        }
+      ]
+    },
+    {
+      "id": 65850,
+      "title": "ОПТИМІЗАЦІЯ ОРГАНІЗАЦІЙНОЇ СТРУКТУРИ УПРАВЛІННЯ ПІДПРИЄМСТВОМ",
+      "authors": "[\"\\u042e. \\u0412. \\u0421\\u043e\\u043b\\u043e\\u043d\\u0435\\u043d\\u043a\\u043e\", \"\\u042f\\u043d\\u0430 \\u041a\\u0443\\u0446\\u0430\"]",
+      "year": 2021,
+      "publisher": "ФІНАНСОВИЙ ПРОСТІР",
+      "doi": "10.18371/fp.4(44).2021.136145",
+      "canonical_url": "https://fpnpu.cibs.ubs.edu.ua/article/download/249572/247095",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "334.722:005-048.34",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 10,
+      "size_bytes": 459492,
+      "verified_at": "2026-08-20T11:02:38.971923",
+      "first_seen_at": "2026-08-19T19:26:44.471703",
+      "sha256": "437dc68e7f37adea0f560e88107d0be05726280d5b632bde95514b00c271baa0",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6364
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.3636
+        }
+      ]
+    },
+    {
+      "id": 66274,
+      "title": "МЕТОДИЧНІ ПІДХОДИ ЩОДО ФОРМУВАННЯ КАНАЛІВ ІНТЕРНЕТ-ТОРГІВЛІ METHODOLOGICAL APPROACHES TO THE FORMATION OF INTERNET TRADE CHANNELS",
+      "authors": "[\"\\u0422\\u0435\\u0442\\u044f\\u043d\\u0430 \\u0421\\u0435\\u043c\\u0435\\u043d\\u043e\\u0432\\u0430\", \"\\u041c\\u0430\\u043a\\u0441\\u0438\\u043c \\u041b\\u044f\\u0448\\u0435\\u043d\\u043a\\u043e\"]",
+      "year": 2024,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2024-67-101",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/4772/4713",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.17:004.738.5",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 6,
+      "size_bytes": 271318,
+      "verified_at": "2026-08-20T11:09:24.996261",
+      "first_seen_at": "2026-08-19T19:26:53.850375",
+      "sha256": "1e3f39972c90012d8074bbe2839198ed6e96a1444a82f28a7927a9544341f9e7",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.4045
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.2298
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1522
+        }
+      ]
+    },
+    {
+      "id": 1068,
+      "title": "ЦИФРОВІЗАЦІЯ МАРКЕТИНГОВОЇ ДІЯЛЬНОСТІ ПІДПРИЄМСТВА DIGITIZATION OF MARKETING ACTIVITIES OF THE ENTERPRISE",
+      "authors": "[\"\\u0422\\u0435\\u0442\\u044f\\u043d\\u0430 \\u0411\\u0456\\u043b\\u043e\\u0443\\u0441\\u044c\\u043a\\u043e\"]",
+      "year": 2023,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2023-52-76",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/2608/2526",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.1",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 6,
+      "size_bytes": 265388,
+      "verified_at": "2026-08-19T18:56:01.487395",
+      "first_seen_at": "2026-08-19T18:25:00.314491",
+      "sha256": "c0f64606370f55f006e80c07a95a27bcce73a223d6b9d7f7a09297736283e127",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.4107
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.2321
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1429
+        }
+      ]
+    },
+    {
+      "id": 1430,
+      "title": "ІННОВАЦІЙНІ МАРКЕТИНГОВІ СТРАТЕГІЇ СУЧАСНОГО УКРАЇНСЬКОГО ПІДПРИЄМСТВА INNOVATIVE MARKETING STRATEGIES OF MODERN UKRAINIAN ENTERPRISES",
+      "authors": "[\"\\u041d\\u0430\\u0442\\u0430\\u043b\\u0456\\u044f \\u041d\\u043e\\u0441\\u0430\\u043d\\u044c\"]",
+      "year": 2024,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2024-59-106",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/3472/3400",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.138",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 5,
+      "size_bytes": 277097,
+      "verified_at": "2026-08-19T19:00:15.787459",
+      "first_seen_at": "2026-08-19T18:25:30.491321",
+      "sha256": "8fc2d697dff70fb3e1831794129b895737686f432a96db92d86570618d37f3e3",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3651
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.3492
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1746
+        }
+      ]
+    },
+    {
+      "id": 1434,
+      "title": "АНАЛІЗ НОВІТНІХ ТЕХНОЛОГІЙ, МЕТОДІВ ТА ПІДХОДІВ У ЛОГІСТИЦІ, ЇХ ВПЛИВ НА ОПТИМІЗАЦІЮ ЛАНЦЮГІВ ПОСТАЧАННЯ ТА ПІДВИЩЕННЯ ПРОДУКТИВНОСТІ ANALYSIS OF THE NEWEST TECHNOLOGIES, METHODS AND APPROACHES IN LOGISTICS, THEIR IMPACT ON SUPPLY CHAIN OPTIMIZATION AND INCREASE OF PRODUCTIVITY",
+      "authors": "[\"\\u0406\\u0440\\u0438\\u043d\\u0430 \\u0417\\u0440\\u0438\\u0431\\u043d\\u0454\\u0432\\u0430\"]",
+      "year": 2024,
+      "publisher": "ЕКОНОМІКА ТА СУСПІЛЬСТВО",
+      "doi": "10.32782/2524-0072/2024-60-60",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/3615/3546",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.5+656",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 9,
+      "size_bytes": 495259,
+      "verified_at": "2026-08-19T19:00:17.907192",
+      "first_seen_at": "2026-08-19T18:25:30.719195",
+      "sha256": "a6c4db01288c20ef080cd5f9eaed3f0bfe5b154ee9aeaf25fdfd1d59947f5971",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.4055
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.2087
+        },
+        {
+          "topic_id": 24,
+          "topic_name": "Машинне навчання та ШІ",
+          "score": 0.1496
+        }
+      ]
+    },
+    {
+      "id": 1585,
+      "title": "АДАПТАЦІЯ МАРКЕТИНГОВИХ СТРАТЕГІЙ ЦІНОУТВОРЕННЯ ДО ОСОБЛИВОСТЕЙ НАЦІОНАЛЬНИХ",
+      "authors": "[\"\\u0422\\u0435\\u0442\\u044f\\u043d\\u0430 \\u041b\\u0443\\u043d\\u044c\\u043e\\u0432\\u0430\"]",
+      "year": 2025,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2025-78-123",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/6609/6548",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.138",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 7,
+      "size_bytes": 309263,
+      "verified_at": "2026-08-19T19:02:23.271024",
+      "first_seen_at": "2026-08-19T18:25:39.241532",
+      "sha256": "afb39b78952f264d5a26d2693a94511006a3b71749bc2c0a8da1582a01bce85a",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3382
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.3088
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1912
+        }
+      ]
+    },
+    {
+      "id": 1596,
+      "title": "ВПЛИВ МАРКЕТИНГОВОЇ ЦІНОВОЇ ПОЛІТИКИ НА ФІНАНСОВІ РЕЗУЛЬТАТИ ТА РИНКОВІ ПОЗИЦІЇ ПІДПРИЄМСТВА THE IMPACT OF MARKETING PRICING POLICY ON THE FINANCIAL RESULTS AND MARKET POSITIONS OF THE ENTERPRISE",
+      "authors": "[\"\\u0422\\u0435\\u0442\\u044f\\u043d\\u0430 \\u041b\\u0443\\u043d\\u044c\\u043e\\u0432\\u0430\"]",
+      "year": 2025,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2025-79-150",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/6765/6706",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "658.8:339.138.2",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 7,
+      "size_bytes": 231133,
+      "verified_at": "2026-08-19T19:02:38.501200",
+      "first_seen_at": "2026-08-19T18:25:40.191597",
+      "sha256": "7794e2ab24613148713de3751bd445f1553ca677f4dcfbb79eccaa2afd11e395",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.2642
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.2453
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.2453
+        }
+      ]
+    },
+    {
+      "id": 1782,
+      "title": "БРЕНД-МЕНЕДЖМЕНТ ЯК ІНСТРУМЕНТ МАРКЕТИНГОВОЇ ДІЯЛЬНОСТІ ПІДПРИЄМСТВ BRAND MANAGEMENT AS A TOOL FOR THE MARKETING ACTIVITIES OF ENTERPRISES",
+      "authors": "[\"\\u041c\\u0430\\u0440\\u0433\\u0430\\u0440\\u0438\\u0442\\u0430 \\u041b\\u0438\\u0448\\u0435\\u043d\\u043a\\u043e\"]",
+      "year": 2023,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2023-48-80",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/2289/2210",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.138",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 7,
+      "size_bytes": 243326,
+      "verified_at": "2026-08-19T19:06:24.941606",
+      "first_seen_at": "2026-08-19T18:26:02.038748",
+      "sha256": "69ca2cc6e7ca8e9c32f9b8fc742786d838141d59241b2b20fa979df6719bc0b1",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.3382
+        },
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3235
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.2059
+        }
+      ]
+    },
+    {
+      "id": 49556,
+      "title": "Microsoft Word - 1_...._..... 2.doc",
+      "authors": "[\"<C0E4ECE8EDE8F1F2F0E0F2EEF0>\"]",
+      "year": 2017,
+      "publisher": "Полтавська державна аграрна академія",
+      "doi": "10.31210/visnyk2017.04.24",
+      "canonical_url": "https://journals.pdaa.edu.ua/visnyk/article/download/297/375",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.138:633.1:631.11",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 6,
+      "size_bytes": 345535,
+      "verified_at": "2026-08-20T06:16:52.557939",
+      "first_seen_at": "2026-08-19T19:20:03.187453",
+      "sha256": "b6397c9ad75c36bddb618ebd02b223442389c101ba0139adcd4e32548f53873c",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3134
+        },
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.2985
+        },
+        {
+          "topic_id": 21,
+          "topic_name": "Агрономія",
+          "score": 0.1642
+        }
+      ]
+    },
+    {
+      "id": 50781,
+      "title": "СПІВПРАЦЯ УКРАЇНИ ТА ЄВРОПЕЙСЬКОГО СОЮЗУ В ЕЛЕКТРОЕНЕРГЕТИЧНІЙ СФЕРІ",
+      "authors": "[\"\\u0414\\u043c\\u0438\\u0442\\u0440\\u043e \\u0422\\u043a\\u0430\\u0447\"]",
+      "year": 2023,
+      "publisher": "Наукові перспективи",
+      "doi": "10.52058/2708-7530-2023-7(37)-399-410",
+      "canonical_url": "https://perspectives.pp.ua/index.php/np/article/download/5671/5703",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.13-045.73:620.9(477+4)",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 12,
+      "size_bytes": 460866,
+      "verified_at": "2026-08-20T06:36:28.249549",
+      "first_seen_at": "2026-08-19T19:20:36.590180",
+      "sha256": "0fd2277581835b26f0cc5a9b109c6dd0aa17b889c908b57ee197fb6efb9a449b",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3936
+        },
+        {
+          "topic_id": 18,
+          "topic_name": "Електротехніка",
+          "score": 0.2129
+        },
+        {
+          "topic_id": 15,
+          "topic_name": "Політологія",
+          "score": 0.1526
+        }
+      ]
+    },
+    {
+      "id": 65069,
+      "title": "МЕТОДИЧНІ ПІДХОДИ ДО ОЦІНКИ КОНКУРЕНТНИХ ПЕРЕВАГ ОРГАНІЧНОЇ ПРОДУКЦІЇ METHODICAL APPROACHES TO THE EVALUATION OF COMPETITIVE ADVANTAGES OF ORGANIC PRODUCTS",
+      "authors": "[\"\\u041c\\u0430\\u0440\\u0456\\u043d\\u0430 \\u041a\\u043e\\u0446\\u0435\\u043d\\u043a\\u043e\"]",
+      "year": 2021,
+      "publisher": "Економіка та суспільство",
+      "doi": "10.32782/2524-0072/2021-24-26",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/196/188",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.137.2:338.43",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 9,
+      "size_bytes": 429943,
+      "verified_at": "2026-08-20T10:48:58.981034",
+      "first_seen_at": "2026-08-19T19:26:22.626991",
+      "sha256": "90305b7c96c59ecac2d3a698b034b02b74b132a993a9f27a0840a2982da4ba1f",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.448
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1685
+        },
+        {
+          "topic_id": 21,
+          "topic_name": "Агрономія",
+          "score": 0.1685
+        }
+      ]
+    },
+    {
+      "id": 66318,
+      "title": "УДК 339",
+      "authors": "[\"\\u041b\\u0435\\u043e\\u043d\\u0435\\u0446\\u044c \\u0406\\u0440\\u0438\\u043d\\u0430 \\u0412\\u043e\\u043b\\u043e\\u0434\\u0438\\u043c\\u0438\\u0440\\u0456\\u0432\\u043d\\u0430\"]",
+      "year": 2022,
+      "publisher": "Київський національний торговельно-економічний університет",
+      "doi": "10.26642/ema-2022-1(99)-3-10",
+      "canonical_url": "https://ema.ztu.edu.ua/article/download/254274/251530",
+      "landing_url": null,
+      "language": "uk",
+      "doc_type": "article",
+      "udc": "339.138:338.46:658.1",
+      "isbn": null,
+      "is_oa": 1,
+      "oa_status": null,
+      "page_count": 8,
+      "size_bytes": 591882,
+      "verified_at": "2026-08-20T11:09:58.590184",
+      "first_seen_at": "2026-08-19T19:26:55.339731",
+      "sha256": "05491c4674c3531ed28256aedf481e90a2776f77847b0c708ae5eada03ffab0b",
+      "has_text_layer": 1,
+      "topics": [
+        {
+          "topic_id": 19,
+          "topic_name": "Маркетинг",
+          "score": 0.3621
+        },
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.3448
+        },
+        {
+          "topic_id": 20,
+          "topic_name": "Менеджмент",
+          "score": 0.1897
+        }
+      ]
+    }
+  ]
+}
