@@ -173,7 +173,7 @@ async def get_documents_to_process(
     """Отримати список документів для обробки."""
     if retry_failed:
         query = """
-            SELECT DISTINCT d.id, d.title, d.canonical_url, d.authors, d.year, d.udc, d.language, d.doc_type, d.verified_at
+            SELECT d.id, d.title, d.canonical_url, d.authors, d.year, d.udc, d.language, d.doc_type, d.verified_at
             FROM documents d
             LEFT JOIN extractions e ON e.document_id = d.id
             WHERE d.status = 'verified'
@@ -186,7 +186,7 @@ async def get_documents_to_process(
         rows = await db.fetchall(query, (limit * 2,))
     else:
         query = """
-            SELECT DISTINCT d.id, d.title, d.canonical_url, d.authors, d.year, d.udc, d.language, d.doc_type, d.verified_at
+            SELECT d.id, d.title, d.canonical_url, d.authors, d.year, d.udc, d.language, d.doc_type, d.verified_at
             FROM documents d
             LEFT JOIN extractions e ON e.document_id = d.id
             WHERE d.status = 'verified'
