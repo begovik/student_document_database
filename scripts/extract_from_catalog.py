@@ -150,13 +150,22 @@ def apply_results_to_catalog(
 
 def save_catalog_atomic(catalog_path: str, catalog: dict[str, Any]) -> None:
     """Атомарний запис каталогу: спочатку у тимчасовий файл, потім rename."""
-    dir_path = os.path.dirname(os.path.abspath(catalog_path)) or "."
+    path_obj = Path(catalog_path)
+    if path_obj.is_dir():
+        # Папкова структура: записати JSON у папку
+        json_path = path_obj / f"{path_obj.name}.json"
+        dir_path = str(path_obj)
+    else:
+        # Файловий формат: записати у сам файл
+        json_path = path_obj
+        dir_path = str(path_obj.parent)
+    
     fd, tmp_path = tempfile.mkstemp(suffix=".json", dir=dir_path)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(catalog, f, ensure_ascii=False, indent=2)
             f.write("\n")
-        os.replace(tmp_path, catalog_path)
+        os.replace(tmp_path, str(json_path))
     except BaseException:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -56,7 +57,7 @@ def run(
         harvester extract run --retry-failed
         harvester extract run --dry-run
     """
-    asyncio.run(main(topic, topic_code, limit, batch, dry_run, retry_failed, skip_extracted))
+    asyncio.run(main(topic, topic_code, limit, batch, dry_run, retry_failed, skip_extracted, catalog_dir))
 
 
 async def main(
