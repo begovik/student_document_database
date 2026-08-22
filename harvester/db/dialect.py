@@ -23,6 +23,7 @@ ID_TABLES = {
     "domains",
     "sources",
     "document_refs",
+    "extractions",
     "fetch_attempts",
     "document_mirrors",
     "topics",

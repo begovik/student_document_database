@@ -49,6 +49,7 @@ APP_TABLES = (
     "documents",
     "document_mirrors",
     "document_refs",
+    "extractions",
     "fetch_attempts",
     "tasks",
     "search_queries",
