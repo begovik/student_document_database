@@ -252,14 +252,27 @@ async def verify_catalog(
     """Верифікувати каталог: знайти помилки, вирішити що робити, виправити."""
     logger.info("curator_verify_start", path=catalog_path)
 
+    # Розв'язати шлях до каталогу: якщо це папка — знайти JSON всередині
+    path_obj = Path(catalog_path)
+    if path_obj.is_dir():
+        catalog_json = path_obj / f"{path_obj.name}.json"
+        if not catalog_json.exists():
+            logger.error("catalog_not_found", path=catalog_json)
+            return None
+        catalog_json_path = str(catalog_json)
+        resources_dir = path_obj / "resources" if (path_obj / "resources").exists() else None
+    else:
+        catalog_json_path = str(path_obj)
+        resources_dir = None
+
     try:
-        with open(catalog_path, "r", encoding="utf-8") as f:
+        with open(catalog_json_path, "r", encoding="utf-8") as f:
             catalog = json.load(f)
     except FileNotFoundError:
-        logger.error("catalog_not_found", path=catalog_path)
+        logger.error("catalog_not_found", path=catalog_json_path)
         return None
     except json.JSONDecodeError as e:
-        logger.error("catalog_invalid_json", path=catalog_path, error=str(e)[:100])
+        logger.error("catalog_invalid_json", path=catalog_json_path, error=str(e)[:100])
         return None
 
     settings = get_settings()
@@ -382,7 +395,13 @@ async def verify_catalog(
         catalog["fixed_count"] = fixed
         catalog["replaced_count"] = replaced
 
-        new_path = catalog_path.replace(".json", "_fixed.json")
+        # Зберегти в тій же папці, що й оригінал
+        if resources_dir is not None:
+            # Папкова структура: catalog_folder/catalog_folder_fixed.json
+            new_path = str(Path(catalog_json_path).parent / f"{path_obj.name}_fixed.json")
+        else:
+            # Файловий формат: catalog.json -> catalog_fixed.json
+            new_path = catalog_path.replace(".json", "_fixed.json")
         await save_catalog_atomically(new_path, catalog)
 
         logger.info("curator_verify_complete", path=new_path, fixed=fixed, replaced=replaced, skipped=skipped, errors=errors)

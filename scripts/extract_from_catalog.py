@@ -3,6 +3,11 @@
 extract_from_catalog.py — витяг цитат і сумаризацій для документів з каталогу
 та запис результатів назад у JSON-файл каталогу.
 
+Каталог може бути:
+    - Файл: catalogs/catalog_YYYYMMDD_HHMMSS.json
+    - Папка: catalogs/catalog_YYYYMMDD_HHMMSS/ (всередині лежить catalog_YYYYMMDD_HHMMSS.json
+      і папка resources/ з PDF-файлами)
+
 Поведінка:
     - документи, які вже є в таблиці extractions, беруться з БД (без LLM-викликів);
     - решта проходить повний цикл: завантаження PDF -> LLM -> збереження в БД;
@@ -15,6 +20,8 @@ extract_from_catalog.py — витяг цитат і сумаризацій дл
     python extract_from_catalog.py catalogs/catalog_076.json --limit 5
     python extract_from_catalog.py catalogs/catalog_076.json --dry-run
     python extract_from_catalog.py catalogs/catalog_076.json --force
+    python extract_from_catalog.py catalogs/catalog_YYYYMMDD_HHMMSS/  # папкова структура
+    python extract_from_catalog.py catalogs/catalog_YYYYMMDD_HHMMSS/catalog_YYYYMMDD_HHMMSS.json  # файл у папці
 """
 
 import asyncio
@@ -36,6 +43,23 @@ from harvester.extract.engine import ExtractionJob, ExtractionResult, process_do
 STANDARD_ERROR_TEXT = "Помилка витягу даних: деталі недоступні"
 NO_URL_ERROR_TEXT = "Помилка витягу: у документа відсутній canonical_url"
 CONCURRENCY = 3
+
+
+def resolve_catalog_path(user_path: str) -> tuple[str, Path | None]:
+    """Розв'язати шлях до каталогу: якщо це папка — знайти JSON всередині.
+
+    Returns (catalog_json_path, resources_dir).
+    resources_dir — це шлях до папки resources (None якщо каталог файл).
+    """
+    path = Path(user_path)
+    if path.is_dir():
+        catalog_json = path / f"{path.name}.json"
+        if not catalog_json.exists():
+            raise FileNotFoundError(f"JSON-файл каталогу не знайдено у папці: {catalog_json}")
+        resources_dir = path / "resources"
+        return str(catalog_json), resources_dir if resources_dir.exists() else None
+    else:
+        return str(path), None
 
 
 async def load_extractions_from_db(repo: ExtractionsRepository) -> dict[int, dict[str, Any]]:
@@ -146,13 +170,17 @@ async def main(
     force: bool = False,
 ) -> None:
     settings = get_settings()
+    
+    # Розв'язати шлях до каталогу (підтримка папки та файлу)
+    catalog_json_path, resources_dir = resolve_catalog_path(catalog_path)
+    
     db = build_database(settings)
     await db.initialize(sync_mirror=False)
 
     try:
         repo = ExtractionsRepository(db)
 
-        with open(catalog_path, "r", encoding="utf-8") as f:
+        with open(catalog_json_path, "r", encoding="utf-8") as f:
             catalog = json.load(f)
 
         docs = catalog.get("documents", [])
@@ -160,8 +188,8 @@ async def main(
             print("Каталог порожній або не має документів.")
             return
 
-        print(f"📚 Завантажено {len(docs)} документів з каталогу {catalog_path}")
-        print(f"🔍 Запит: {catalog.get('query', 'невідомий')}")
+        print(f"📚 Завантажено {len(docs)} документів з каталогу {catalog_json_path}")
+        print(f"🔍 Запит: {catalog.get('topic', 'невідомий')}")
 
         # 1. Вже витягнуті дані з БД
         db_data = {} if force else await load_extractions_from_db(repo)
@@ -186,14 +214,28 @@ async def main(
             todo = [d for d in todo if d["id"] in allowed_ids]
             print(f"📝 Обмежено до {limit} нових документів")
 
-        jobs = [
-            ExtractionJob(
+        jobs = []
+        for d in todo:
+            pdf_path = None
+            if resources_dir and d.get("pdf_path"):
+                # Використовувати локальний PDF з папки каталогу
+                local_pdf = resources_dir / d["pdf_path"]
+                if local_pdf.exists():
+                    pdf_path = str(local_pdf)
+                else:
+                    # Спроба знайти PDF за іменем файлу в resources/
+                    alt_pdf = resources_dir / f"{d['id']}.pdf"
+                    if alt_pdf.exists():
+                        pdf_path = str(alt_pdf)
+                    else:
+                        print(f"  📄 Локальний PDF для #{d['id']} не знайдено, буде завантажено за URL")
+            
+            jobs.append(ExtractionJob(
                 document_id=d["id"],
-                canonical_url=d["canonical_url"],
+                canonical_url=d.get("canonical_url") or "",
                 title=d.get("title") or "",
-            )
-            for d in todo
-        ]
+                pdf_path=pdf_path,
+            ))
 
         # 3. Обробка нових документів
         fresh_results: list[ExtractionResult] = []

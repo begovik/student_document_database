@@ -101,6 +101,7 @@ class ExtractionJob:
     document_id: int
     canonical_url: str
     title: str
+    pdf_path: str | None = None  # Відносний шлях до PDF (наприклад, "resources/157.pdf") або None для завантаження
     # already_extracted: bool — якщо True, пропускати
 
 
@@ -166,19 +167,34 @@ async def process_document(job: ExtractionJob) -> ExtractionResult:
     """
     tmp_pdf: Path | None = None
     try:
-        # 1. Завантажити PDF
+        # 1. Отримати PDF (локальний або завантажити)
         logger.info("extract_start", document_id=job.document_id, url=job.canonical_url)
-        tmp_pdf, download_error = await download_pdf(job.canonical_url)
-        if tmp_pdf is None:
-            error_text = "Не вдалося завантажити PDF"
-            if download_error:
-                error_text = f"{error_text}: {download_error}"
-            return ExtractionResult(
-                document_id=job.document_id,
-                canonical_url=job.canonical_url,
-                success=False,
-                error=error_text,
-            )
+        
+        if job.pdf_path:
+            # Використовувати локальний PDF
+            tmp_pdf = Path(job.pdf_path)
+            if not tmp_pdf.exists():
+                logger.warning("pdf_not_found_locally", document_id=job.document_id, pdf_path=job.pdf_path)
+                return ExtractionResult(
+                    document_id=job.document_id,
+                    canonical_url=job.canonical_url,
+                    success=False,
+                    error=f"Локальний PDF не знайдено: {job.pdf_path}",
+                )
+            logger.info("using_local_pdf", document_id=job.document_id, pdf_path=job.pdf_path)
+        else:
+            # Завантажити PDF
+            tmp_pdf, download_error = await download_pdf(job.canonical_url)
+            if tmp_pdf is None:
+                error_text = "Не вдалося завантажити PDF"
+                if download_error:
+                    error_text = f"{error_text}: {download_error}"
+                return ExtractionResult(
+                    document_id=job.document_id,
+                    canonical_url=job.canonical_url,
+                    success=False,
+                    error=error_text,
+                )
 
         # 2. Парсити PDF (витягнути весь текст, усі сторінки)
         # Максимальна кількість сторінок для витягу

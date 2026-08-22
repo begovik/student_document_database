@@ -1,15 +1,16 @@
-"""Етап 1: підготовка каталогу — відбір + перевірка доступності + запис JSON."""
+"""Етап 1: підготовка каталогу — відбір + завантаження PDF + запис JSON."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import tempfile
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import structlog
 
 from harvester.config import get_settings
@@ -17,7 +18,6 @@ from harvester.db.failover import build_database
 from harvester.db.repositories import DocumentsRepository, TopicsRepository
 from harvester.curator.availability import check_availability
 from harvester.curator.selector import SelectionResult, call_llm_for_selection
-
 
 logger = structlog.get_logger()
 
@@ -286,6 +286,63 @@ async def find_replacement(
     return available[0]  # Найкращий за score/рік
 
 
+async def download_pdf_to_resources(
+    url: str,
+    resources_dir: Path,
+    document_id: int,
+    timeout_s: float = 60.0,
+) -> tuple[Path | None, str | None]:
+    """Завантажити PDF з URL у папку resources каталогу.
+
+    Returns (path_to_pdf, None) if successful, or (None, error_description) if failed.
+    PDF saved as: resources_dir / f"{document_id}.pdf"
+    """
+    settings = get_settings()
+    timeout = httpx.Timeout(timeout_s, connect=10.0, read=30.0, pool=None)
+    headers = {
+        "User-Agent": settings.http.user_agent,
+        "Accept": "application/pdf,*/*",
+    }
+
+    pdf_path = resources_dir / f"{document_id}.pdf"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                reason = f"HTTP {resp.status_code}"
+                logger.warning("pdf_download_failed_to_resources", url=url, document_id=document_id, status=resp.status_code)
+                return None, reason
+
+            content_type = resp.headers.get("content-type", "")
+            if "pdf" not in content_type.lower() and "octet-stream" not in content_type.lower():
+                if "html" in content_type.lower():
+                    reason = f"не PDF (content-type={content_type})"
+                    logger.warning("pdf_download_not_pdf_to_resources", url=url, document_id=document_id)
+                    return None, reason
+
+            data = resp.content
+            if len(data) < 1024:
+                reason = f"файл занадто малий ({len(data)} байт)"
+                logger.warning("pdf_download_too_small_to_resources", url=url, document_id=document_id, size=len(data))
+                return None, reason
+
+            if data[:4] != b"%PDF":
+                reason = "відсутні %PDF magic bytes"
+                logger.warning("pdf_download_not_pdf_magic_to_resources", url=url, document_id=document_id)
+                return None, reason
+
+            pdf_path.write_bytes(data)
+            logger.info("pdf_downloaded_to_resources", url=url, document_id=document_id, path=str(pdf_path))
+            return pdf_path, None
+
+    except Exception as e:
+        detail = str(e).strip() or type(e).__name__
+        reason = f"{type(e).__name__}: {detail}" if str(e).strip() else type(e).__name__
+        logger.error("pdf_download_error_to_resources", url=url, document_id=document_id, error=reason)
+        return None, reason
+
+
 async def save_catalog_atomically(path: str, data: dict[str, Any]) -> None:
     """Атомарно записати каталог (temp файл + os.replace)."""
     dir_path = os.path.dirname(os.path.abspath(path)) or "."
@@ -512,38 +569,86 @@ async def prepare_catalog(
                 success_count=len(available),
             )
 
-        # 6. Запис каталогу
+        # 6. Створити структуру каталогу та завантажити PDF
         now = datetime.now()
-        catalog_name = f"catalog_{now.strftime('%Y%m%d_%H%M%S')}.json"
-        catalog_path = os.path.join(output_dir, catalog_name)
-        os.makedirs(output_dir, exist_ok=True)
+        now_str = now.strftime('%Y%m%d_%H%M%S')
+        catalog_folder = f"catalog_{now_str}"
+        catalog_path = os.path.join(output_dir, catalog_folder)
+        resources_dir = os.path.join(catalog_path, "resources")
+        catalog_json_path = os.path.join(catalog_path, f"{catalog_folder}.json")
+        
+        os.makedirs(resources_dir, exist_ok=True)
+        logger.info("catalog_structure_created", catalog_path=catalog_path, resources_dir=resources_dir)
 
+        # Завантажити PDF для обраних документів
         documents_data = []
+        downloaded = []
+        download_failed = []
+        
         for doc in available:
-            doc_data = {
-                "id": doc["id"],
-                "title": doc["title"],
-                "authors": doc["authors"],
-                "year": doc["year"],
-                "publisher": doc["publisher"],
-                "doc_type": doc["doc_type"],
-                "canonical_url": doc["canonical_url"],
-                "language": doc["language"],
-                "udc": doc["udc"],
-                "page_count": doc["page_count"],
-                "size_bytes": doc["size_bytes"],
-                "sha256": doc["sha256"],
-                "has_text_layer": doc["has_text_layer"],
-                "verified_at": doc["verified_at"],
-                "first_seen_at": doc["first_seen_at"],
-            }
-            if doc.get("topic_id") and doc.get("topic_name"):
-                doc_data["topics"] = [{
-                    "topic_id": doc["topic_id"],
-                    "topic_name": doc["topic_name"],
-                    "score": doc["topic_score"],
-                }]
-            documents_data.append(doc_data)
+            pdf_path, error = await download_pdf_to_resources(
+                doc["canonical_url"],
+                Path(resources_dir),
+                doc["id"],
+            )
+            if pdf_path:
+                downloaded.append((doc["id"], str(pdf_path)))
+                doc_data = {
+                    "id": doc["id"],
+                    "title": doc["title"],
+                    "authors": doc["authors"],
+                    "year": doc["year"],
+                    "publisher": doc["publisher"],
+                    "doc_type": doc["doc_type"],
+                    "canonical_url": doc["canonical_url"],
+                    "language": doc["language"],
+                    "udc": doc["udc"],
+                    "page_count": doc["page_count"],
+                    "size_bytes": doc["size_bytes"],
+                    "sha256": doc["sha256"],
+                    "has_text_layer": doc["has_text_layer"],
+                    "verified_at": doc["verified_at"],
+                    "first_seen_at": doc["first_seen_at"],
+                    "pdf_path": f"resources/{doc['id']}.pdf",  # Відносний шлях до PDF
+                }
+                if doc.get("topic_id") and doc.get("topic_name"):
+                    doc_data["topics"] = [{
+                        "topic_id": doc["topic_id"],
+                        "topic_name": doc["topic_name"],
+                        "score": doc["topic_score"],
+                    }]
+                documents_data.append(doc_data)
+            else:
+                download_failed.append((doc["id"], error or "Невідомо"))
+                logger.warning("pdf_download_failed", document_id=doc["id"], error=error or "Невідомо")
+                # Все одно додамо документ до каталогу, але без PDF
+                doc_data = {
+                    "id": doc["id"],
+                    "title": doc["title"],
+                    "authors": doc["authors"],
+                    "year": doc["year"],
+                    "publisher": doc["publisher"],
+                    "doc_type": doc["doc_type"],
+                    "canonical_url": doc["canonical_url"],
+                    "language": doc["language"],
+                    "udc": doc["udc"],
+                    "page_count": doc["page_count"],
+                    "size_bytes": doc["size_bytes"],
+                    "sha256": doc["sha256"],
+                    "has_text_layer": doc["has_text_layer"],
+                    "verified_at": doc["verified_at"],
+                    "first_seen_at": doc["first_seen_at"],
+                    "pdf_path": None,  # PDF не завантажено
+                }
+                if doc.get("topic_id") and doc.get("topic_name"):
+                    doc_data["topics"] = [{
+                        "topic_id": doc["topic_id"],
+                        "topic_name": doc["topic_name"],
+                        "score": doc["topic_score"],
+                    }]
+                documents_data.append(doc_data)
+
+        logger.info("pdf_download_results", total=len(available), downloaded=len(downloaded), failed=len(download_failed))
 
         catalog_data = {
             "topic": topic_name_uk,
@@ -551,24 +656,36 @@ async def prepare_catalog(
             "total_documents": len(documents_data),
             "replaced_count": len(replaced),
             "documents": documents_data,
+            "resources_dir": "resources",
         }
 
-        await save_catalog_atomically(catalog_path, catalog_data)
+        # Атомарно записати JSON каталогу
+        fd, tmp_json = tempfile.mkstemp(suffix=".json", dir=catalog_path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(catalog_data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            os.replace(tmp_json, catalog_json_path)
+            logger.info("catalog_written", path=catalog_json_path)
+        except BaseException:
+            if os.path.exists(tmp_json):
+                os.unlink(tmp_json)
+            raise
 
         # Позначити недоступні в БД
         for doc_id, reason in still_unavailable:
-            await mark_unavailable_in_db(db, doc_id, reason, catalog_name=catalog_name)
+            await mark_unavailable_in_db(db, doc_id, reason, catalog_name=catalog_folder)
 
         for original_id, replacement_id in replaced:
-            await mark_unavailable_in_db(db, original_id, "replaced_by_curator", replacement_id, catalog_name)
+            await mark_unavailable_in_db(db, original_id, "replaced_by_curator", replacement_id, catalog_name=catalog_folder)
 
         # 7. Підсумок
         result = PrepareResult(
-            catalog_path=catalog_path,
+            catalog_path=catalog_folder,
             topic_name=topic_name_uk,
             document_count=len(documents_data),
             replaced_count=len(replaced),
-            unavailable_count=len(still_unavailable),
+            unavailable_count=len(still_unavailable) + len(download_failed),
             success_count=len(documents_data),
         )
 

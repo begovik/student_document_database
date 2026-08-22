@@ -42,6 +42,7 @@ def run(
     dry_run: bool = typer.Option(False, "--dry-run", "-d", help="Не зберігати результати, лише показати що було б зроблено"),
     retry_failed: bool = typer.Option(False, "--retry-failed", "-r", help="Пере процесувати тільки документи з помилками (попередні спроби не вдалися)"),
     skip_extracted: bool = typer.Option(True, "--skip-extracted/--no-skip-extracted", help="Пропускати документи, для яких вже є дані в extractions"),
+    catalog_dir: str | None = typer.Option(None, "--catalog-dir", "-C", help="Шлях до каталогу з resources/ (для використання локальних PDF замість завантаження)"),
 ):
     """Запустити витяг цитат і сумаризацій для обраного набору документів.
 
@@ -66,6 +67,7 @@ async def main(
     dry_run: bool,
     retry_failed: bool,
     skip_extracted: bool,
+    catalog_dir: str | None,
 ) -> None:
     settings = get_settings()
     db = build_database(settings)
@@ -89,14 +91,24 @@ async def main(
         print("=" * 80)
 
         # 2. Створити завдання
-        jobs = [
-            ExtractionJob(
+        jobs = []
+        for d in docs:
+            pdf_path = None
+            if catalog_dir:
+                # Спроба знайти локальний PDF у каталозі
+                local_pdf = Path(catalog_dir) / "resources" / f"{d['id']}.pdf"
+                if local_pdf.exists():
+                    pdf_path = str(local_pdf)
+                    print(f"  📄 Знайдено локальний PDF для #{d['id']}: {pdf_path}")
+                else:
+                    print(f"  📄 Локальний PDF для #{d['id']} не знайдено, буде завантажено за URL")
+            
+            jobs.append(ExtractionJob(
                 document_id=d["id"],
                 canonical_url=d["canonical_url"],
                 title=d["title"] or "",
-            )
-            for d in docs
-        ]
+                pdf_path=pdf_path,
+            ))
 
         # 3. Обробити по черзі (конкурентно, але не більше batch)
         results: list[ExtractionResult] = []

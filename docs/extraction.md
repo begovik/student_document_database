@@ -260,10 +260,10 @@ llm:
 `total_found` тощо) зберігаються без змін.
 
 ```bash
-python scripts/extract_from_catalog.py catalogs/catalog_076.json
-python scripts/extract_from_catalog.py catalogs/catalog_076.json --limit 5
-python scripts/extract_from_catalog.py catalogs/catalog_076.json --dry-run
-python scripts/extract_from_catalog.py catalogs/catalog_076.json --force  # ігнорувати БД
+python scripts/extract_from_catalog.py catalogs/catalog_YYYYMMDD_HHMMSS.json
+python scripts/extract_from_catalog.py catalogs/catalog_YYYYMMDD_HHMMSS.json --limit 5
+python scripts/extract_from_catalog.py catalogs/catalog_YYYYMMDD_HHMMSS.json --dry-run
+python scripts/extract_from_catalog.py catalogs/catalog_YYYYMMDD_HHMMSS.json --force  # ігнорувати БД
 ```
 
 Приклад елементів після обробки:
