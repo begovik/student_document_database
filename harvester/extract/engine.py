@@ -104,10 +104,11 @@ class ExtractionJob:
     # already_extracted: bool — якщо True, пропускати
 
 
-async def download_pdf(url: str, timeout_s: float = 60.0) -> Path | None:
+async def download_pdf(url: str, timeout_s: float = 60.0) -> tuple[Path | None, str | None]:
     """Завантажити PDF за URL у тимчасовий файл.
 
-    Повертає шлях до тимчасового файлу або None, якщо завантаження не вдалося.
+    Повертає (шлях_до_файлу, None) у разі успіху або
+    (None, опис_помилки), якщо завантаження не вдалося.
     """
     settings = get_settings()
     timeout = httpx.Timeout(timeout_s, connect=10.0, read=30.0, pool=None)
@@ -121,35 +122,41 @@ async def download_pdf(url: str, timeout_s: float = 60.0) -> Path | None:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code != 200:
+                reason = f"HTTP {resp.status_code}"
                 logger.warning("pdf_download_failed", url=url, status=resp.status_code)
-                return None
+                return None, reason
 
             content_type = resp.headers.get("content-type", "")
             if "pdf" not in content_type.lower() and not url.lower().endswith(".pdf"):
                 # Можливо, це HTML-сторінка, а не PDF
                 if "html" in content_type.lower():
+                    reason = f"відповідь не є PDF (content-type={content_type})"
                     logger.warning("pdf_download_not_pdf", url=url, content_type=content_type)
-                    return None
+                    return None, reason
 
             data = resp.content
             if len(data) < 1024:
+                reason = f"файл занадто малий ({len(data)} байт)"
                 logger.warning("pdf_download_too_small", url=url, size=len(data))
-                return None
+                return None, reason
 
             # Перевірка magic bytes
             if data[:4] != b"%PDF":
+                reason = "відсутні %PDF magic bytes"
                 logger.warning("pdf_download_not_pdf_magic", url=url)
-                return None
+                return None, reason
 
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
             tmp.write(data)
             tmp.close()
             logger.info("pdf_downloaded", url=url, bytes=len(data))
-            return Path(tmp.name)
+            return Path(tmp.name), None
 
     except Exception as e:
-        logger.error("pdf_download_error", url=url, error=str(e))
-        return None
+        detail = str(e).strip() or type(e).__name__
+        reason = f"{type(e).__name__}: {detail}" if str(e).strip() else type(e).__name__
+        logger.error("pdf_download_error", url=url, error=reason)
+        return None, reason
 
 
 async def process_document(job: ExtractionJob) -> ExtractionResult:
@@ -161,13 +168,16 @@ async def process_document(job: ExtractionJob) -> ExtractionResult:
     try:
         # 1. Завантажити PDF
         logger.info("extract_start", document_id=job.document_id, url=job.canonical_url)
-        tmp_pdf = await download_pdf(job.canonical_url)
+        tmp_pdf, download_error = await download_pdf(job.canonical_url)
         if tmp_pdf is None:
+            error_text = "Не вдалося завантажити PDF"
+            if download_error:
+                error_text = f"{error_text}: {download_error}"
             return ExtractionResult(
                 document_id=job.document_id,
                 canonical_url=job.canonical_url,
                 success=False,
-                error="Не вдалося завантажити PDF",
+                error=error_text,
             )
 
         # 2. Парсити PDF (витягнути весь текст, усі сторінки)

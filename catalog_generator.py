@@ -21,6 +21,26 @@ from harvester.config import get_settings
 from harvester.db.failover import build_database
 
 
+def _parse_authors(authors):
+    """Розпарсити authors з рядка в список, якщо це JSON."""
+    if not authors or authors == "None":
+        return None
+    if isinstance(authors, list):
+        return authors
+    if isinstance(authors, str):
+        try:
+            parsed = json.loads(authors)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, str):
+                # Це рядок, який не є списком — повертаємо як є
+                return parsed
+        except json.JSONDecodeError:
+            # Не JSON — повертаємо як є
+            pass
+    return authors
+
+
 async def generate_full_catalog(db, limit: int = 200000) -> list[dict]:
     """Повний каталог: усі документи з title."""
     r = db.remote
@@ -58,7 +78,7 @@ async def generate_full_catalog(db, limit: int = 200000) -> list[dict]:
         docs.append({
             "id": row["id"],
             "title": row["title"],
-            "authors": row["authors"] if row["authors"] and row["authors"] != "None" else None,
+            "authors": _parse_authors(row["authors"]),
             "year": row["year"],
             "publisher": row["publisher"] if row["publisher"] and row["publisher"] != "None" else None,
             "doi": row["doi"],
@@ -141,7 +161,7 @@ async def generate_topic_catalog(db, topic_code: str | None = None, topic_name: 
                 docs.append({
                     "id": row["id"],
                     "title": row["title"],
-                    "authors": row["authors"] if row["authors"] and row["authors"] != "None" else None,
+                    "authors": _parse_authors(row["authors"]),
                     "year": row["year"],
                     "publisher": row["publisher"] if row["publisher"] and row["publisher"] != "None" else None,
                     "doi": row["doi"],
@@ -327,6 +347,12 @@ async def main():
                 topic_name=args.topic,
                 limit=args.limit,
             )
+            # Переважаємо authors з JSON-рядків у списки
+            for doc in docs:
+                if isinstance(doc.get("authors"), str):
+                    parsed = _parse_authors(doc["authors"])
+                    if isinstance(parsed, list):
+                        doc["authors"] = parsed
             code_str = args.topic_code or "custom"
             name_str = args.topic or "unknown"
             path = output_dir / f"catalog_{code_str}.json"
