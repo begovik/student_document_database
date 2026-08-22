@@ -12,6 +12,7 @@ from rich.table import Table
 
 from harvester.config import get_settings, load_config
 from harvester.extract.cli import extract_app
+from harvester.curator.cli import curator_app
 
 app = typer.Typer(
     name="harvester",
@@ -23,6 +24,7 @@ console = Console()
 
 # Реєстрація subcommand
 app.add_typer(extract_app, name="extract")
+app.add_typer(curator_app, name="curator")
 
 
 @app.command()

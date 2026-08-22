@@ -1,0 +1,532 @@
+"""Етап 1: підготовка каталогу — відбір + перевірка доступності + запис JSON."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import structlog
+
+from harvester.config import get_settings
+from harvester.db.failover import build_database
+from harvester.db.repositories import DocumentsRepository, TopicsRepository
+from harvester.curator.availability import check_availability
+from harvester.curator.selector import SelectionResult, call_llm_for_selection
+
+
+logger = structlog.get_logger()
+
+# Мінімальні вимоги до документа для відбору
+REQUIRED_STATUS = "verified"
+REQUIRED_FIELDS = {
+    "title": "Назва має бути непорожньою",
+    "authors": "Автори мають бути задані",
+    "language": "Мова має бути визначена",
+    "canonical_url": "Має бути визначений canonical_url",
+    "page_count": "Має бути визначена кількість сторінок",
+    "has_text_layer": "Має бути текстовий шар",
+}
+
+
+def is_document_complete(doc: dict[str, Any]) -> tuple[bool, str | None]:
+    """Перевірити, чи документ має повний набір даних."""
+    if doc.get("status") != REQUIRED_STATUS:
+        return False, f"status={doc.get('status')} (потрібно {REQUIRED_STATUS})"
+
+    for field, reason in REQUIRED_FIELDS.items():
+        value = doc.get(field)
+        if field == "has_text_layer":
+            if value is None or int(value) != 1:
+                return False, f"{field}={value}"
+        elif field in ("page_count",):
+            if not value or int(value) <= 0:
+                return False, f"{field}={value}"
+        elif value is None or value == "" or value == "None":
+            return False, reason
+
+    # Додаткові перевірки якості
+    title = doc.get("title", "")
+    if len(title) < 10:
+        return False, f"title слишком короткий ({len(title)} символів)"
+    if ".docx" in title.lower() or ".doc" in title.lower():
+        return False, "title містить розширення файлу (бракує відділеного title)"
+    if "microsoft word" in title.lower():
+        return False, "title містить 'Microsoft Word' (бракує відділеного title)"
+
+    authors = doc.get("authors", [])
+    if not authors or (isinstance(authors, list) and len(authors) > 0 and all(a == "USER" or a == "" for a in authors)):
+        return False, "автори некоректні (USER або порожні)"
+
+    if doc.get("extra") and isinstance(doc.get("extra"), str):
+        try:
+            extra = json.loads(doc["extra"])
+            if extra.get("curator", {}).get("unavailable_since"):
+                return False, "позначений як недоступний"
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return True, None
+
+
+async def find_topic_in_db(db, topic_name: str) -> dict[str, Any] | None:
+    """Знайти тему в БД за назвою."""
+    repo = TopicsRepository(db)
+    topics = await repo.list_all()
+    for t in topics:
+        if topic_name.lower() in t.get("name_uk", "").lower():
+            return t
+    return None
+
+
+async def get_candidates_for_topic(
+    db,
+    topic_name: str,
+    topic_id: int | None = None,
+    udc_prefixes: list[str] | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Отримати кандидатів для теми з БД."""
+    repo = DocumentsRepository(db)
+
+    if topic_id:
+        rows = await repo.db.fetchall(
+            """
+            SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
+                   d.canonical_url, d.language, d.udc, d.page_count, d.has_text_layer,
+                   d.size_bytes, d.sha256, d.status, d.extra,
+                   d.verified_at, d.first_seen_at,
+                   dt.score as topic_score,
+                   t.id as topic_id, t.name_uk as topic_name
+            FROM documents d
+            LEFT JOIN document_topics dt ON dt.document_id = d.id
+            LEFT JOIN topics t ON t.id = dt.topic_id
+            WHERE d.status = 'verified'
+              AND d.title IS NOT NULL AND d.title != ''
+              AND d.authors IS NOT NULL
+              AND d.language IS NOT NULL
+              AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
+              AND d.page_count > 0
+              AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
+              AND d.id IN (
+                  SELECT dt2.document_id
+                  FROM document_topics dt2
+                  JOIN topics t2 ON t2.id = dt2.topic_id
+                  WHERE t2.id = ?
+              )
+              AND (d.extra IS NULL OR d.extra NOT LIKE '%"curator"%')
+            ORDER BY dt.score DESC NULLS LAST, d.year DESC NULLS LAST
+            LIMIT ?
+            """,
+            (topic_id, limit),
+        )
+    elif udc_prefixes:
+        rows = await repo.db.fetchall(
+            """
+            SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
+                   d.canonical_url, d.language, d.udc, d.page_count, d.has_text_layer,
+                   d.size_bytes, d.sha256, d.status, d.extra,
+                   d.verified_at, d.first_seen_at,
+                   COALESCE(dt.score, 0) as topic_score,
+                   t.id as topic_id, t.name_uk as topic_name
+            FROM documents d
+            LEFT JOIN document_topics dt ON dt.document_id = d.id
+            LEFT JOIN topics t ON t.id = dt.topic_id
+            WHERE d.status = 'verified'
+              AND d.title IS NOT NULL AND d.title != ''
+              AND d.authors IS NOT NULL
+              AND d.language IS NOT NULL
+              AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
+              AND d.page_count > 0
+              AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
+              AND (
+                  """ + " OR ".join(f"d.udc LIKE '{p}%'" for p in udc_prefixes) + """
+              )
+              AND (d.extra IS NULL OR d.extra NOT LIKE '%"curator"%')
+            ORDER BY dt.score DESC NULLS LAST, d.year DESC NULLS LAST
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    else:
+        rows = await repo.db.fetchall(
+            """
+            SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
+                   d.canonical_url, d.language, d.udc, d.page_count, d.has_text_layer,
+                   d.size_bytes, d.sha256, d.status, d.extra,
+                   d.verified_at, d.first_seen_at,
+                   COALESCE(dt.score, 0) as topic_score,
+                   t.id as topic_id, t.name_uk as topic_name
+            FROM documents d
+            LEFT JOIN document_topics dt ON dt.document_id = d.id
+            LEFT JOIN topics t ON t.id = dt.topic_id
+            WHERE d.status = 'verified'
+              AND d.title IS NOT NULL AND d.title != ''
+              AND d.authors IS NOT NULL
+              AND d.language IS NOT NULL
+              AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
+              AND d.page_count > 0
+              AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
+              AND (d.extra IS NULL OR d.extra NOT LIKE '%"curator"%')
+            ORDER BY dt.score DESC NULLS LAST, d.year DESC NULLS LAST
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+    candidates = []
+    seen_ids = set()
+    for row in rows:
+        if row["id"] in seen_ids:
+            continue
+        seen_ids.add(row["id"])
+        candidates.append({
+            "id": row["id"],
+            "title": row["title"],
+            "authors": json.loads(row["authors"]) if row["authors"] else [],
+            "year": row["year"],
+            "publisher": row["publisher"],
+            "doc_type": row["doc_type"],
+            "canonical_url": row["canonical_url"],
+            "language": row["language"],
+            "udc": row["udc"],
+            "page_count": row["page_count"],
+            "topic_score": float(row["topic_score"]) if row["topic_score"] else 0.0,
+            "topic_id": row["topic_id"],
+            "topic_name": row["topic_name"],
+            "has_text_layer": row["has_text_layer"],
+            "status": row["status"],
+            "size_bytes": row["size_bytes"],
+            "sha256": row["sha256"],
+            "verified_at": row["verified_at"],
+            "first_seen_at": row["first_seen_at"],
+            "extra": row["extra"],
+        })
+
+    return candidates
+
+
+async def find_replacement(
+    db,
+    original_doc: dict[str, Any],
+    selected_ids: set[int],
+    topic_id: int | None = None,
+    udc_prefixes: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Знайти заміну для недоступного документа."""
+    candidates = await get_candidates_for_topic(
+        db,
+        topic_name=original_doc.get("topic_name", ""),
+        topic_id=topic_id,
+        udc_prefixes=udc_prefixes,
+        limit=50,
+    )
+
+    available = [
+        c for c in candidates
+        if c["id"] not in selected_ids
+        and is_document_complete(c)[0]
+        and (await check_availability(c["canonical_url"]))[0]
+    ]
+
+    if not available:
+        return None
+
+    return available[0]  # Найкращий за score/рік
+
+
+async def save_catalog_atomically(path: str, data: dict[str, Any]) -> None:
+    """Атомарно записати каталог (temp файл + os.replace)."""
+    dir_path = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(suffix=".json", dir=dir_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+async def mark_unavailable_in_db(
+    db,
+    doc_id: int,
+    reason: str,
+    replacement_id: int | None = None,
+    catalog_name: str | None = None,
+):
+    """Позначити документ як недоступний в БД (documents.extra)."""
+    import json as json_module
+
+    now = datetime.now().isoformat()
+    curator_extra = {
+        "curator": {
+            "unavailable_since": now,
+            "reason": reason,
+            "replaced_by": replacement_id,
+            "catalog": catalog_name,
+        }
+    }
+
+    existing = await db.fetchone("SELECT extra FROM documents WHERE id = ?", (doc_id,))
+    existing_extra = {}
+    if existing and existing["extra"] and existing["extra"] != "None":
+        try:
+            existing_extra = json_module.loads(existing["extra"])
+        except (json_module.JSONDecodeError, TypeError):
+            existing_extra = {}
+
+    combined_extra = {**existing_extra, **curator_extra}
+
+    await db.execute(
+        "UPDATE documents SET extra = ? WHERE id = ?",
+        (json_module.dumps(combined_extra, ensure_ascii=False), doc_id),
+    )
+
+
+class PrepareResult:
+    """Результат підготовки каталогу."""
+
+    def __init__(
+        self,
+        catalog_path: str,
+        topic_name: str,
+        document_count: int,
+        replaced_count: int,
+        unavailable_count: int,
+        success_count: int,
+    ):
+        self.catalog_path = catalog_path
+        self.topic_name = topic_name
+        self.document_count = document_count
+        self.replaced_count = replaced_count
+        self.unavailable_count = unavailable_count
+        self.success_count = success_count
+
+    def summary(self) -> str:
+        return (
+            f"📚 Каталог: {self.catalog_path}\n"
+            f"📖 Тема: {self.topic_name}\n"
+            f"📄 Документів: {self.document_count} (успішно {self.success_count}, замінено {self.replaced_count}, недоступно {self.unavailable_count})\n"
+        )
+
+
+async def prepare_catalog(
+    topic_name: str,
+    output_dir: str = "catalogs",
+    limit: int | None = None,
+    dry_run: bool = False,
+) -> PrepareResult | None:
+    """Підготувати каталог документів для теми.
+
+    Steps:
+    1. Знайти тему в БД
+    2. Зібрати кандидатів (verified, повні дані)
+    3. LLM-відбір оптимальної кількості та найкращих документів
+    4. Перевірка доступності кожного обраного документа
+    5. Заміна недоступних на схожі
+    6. Запис JSON-каталогу (якщо не dry_run)
+
+    Returns PrepareResult або None за помилки.
+    """
+    settings = get_settings()
+    db = build_database(settings)
+    await db.initialize(sync_mirror=False)
+
+    try:
+        tags = log_tags = {}
+        logger.info("curator_prepare_start", topic=topic_name)
+
+        # 1. Знайти тему в БД або визначити UDC
+        topic_info = await find_topic_in_db(db, topic_name)
+        topic_id = topic_info["id"] if topic_info else None
+
+        tag = topic_info if topic_info else {"name_uk": topic_name}
+        topic_name_uk = tag.get("name_uk", topic_name)
+        udc_prefixes = []
+
+        if topic_info and topic_info.get("udc_prefixes"):
+            try:
+                udc_prefixes = json.loads(topic_info["udc_prefixes"])
+            except (TypeError, json.JSONDecodeError):
+                pass
+
+        if not topic_id and not udc_prefixes:
+            logger.warning("topic_not_found_in_db", topic=topic_name)
+            # Для теми без точної прив'язки використати UDC-префікси
+            # як у catalog_generator для теми 076 (Підприємництво, торгівля)
+            topic_name_lower = topic_name.lower()
+            if "підприєм" in topic_name_lower or "торгівля" in topic_name_lower or "бірж" in topic_name_lower or "економ" in topic_name_lower or "фінанс" in topic_name_lower:
+                udc_prefixes = [
+                    "334.7", "334.72", "339.1", "339.3", "339.5", "336.76",
+                    "334.722", "339.13", "339.132", "339.138", "339.564",
+                    "334.72", "339.138", "339.56", "336.76", "334.722",
+                ]
+                topic_name_uk = topic_info.get("name_uk", topic_name) if topic_info else "Економіка"
+            elif "інформатик" in topic_name_lower or "програмуван" in topic_name_lower or "комп'ютер" in topic_name_lower or "алгоритм" in topic_name_lower or "база даних" in topic_name_lower or "софт" in topic_name_lower or "машинне навчання" in topic_name_lower:
+                udc_prefixes = ["004"]
+            # Додати інші філтри за потреби
+
+        if not topic_id and not udc_prefixes:
+            logger.warning("cannot_resolve_topic_to_udc", topic=topic_name)
+            return None
+
+        logger.info("topic_resolved", topic_name=topic_name_uk, topic_id=topic_id, udc_count=len(udc_prefixes))
+
+        # 2. Зібрати кандидатів
+        candidates = await get_candidates_for_topic(
+            db,
+            topic_name=topic_name_uk,
+            topic_id=topic_id,
+            udc_prefixes=udc_prefixes,
+            limit=200,
+        )
+
+        complete_candidates = []
+        incomplete_count = 0
+        for c in candidates:
+            ok, reason = is_document_complete(c)
+            if ok:
+                complete_candidates.append(c)
+            else:
+                incomplete_count += 1
+
+        logger.info("candidates_found", total=len(candidates), complete=len(complete_candidates), incomplete=incomplete_count)
+
+        if not complete_candidates:
+            logger.warning("no_complete_candidates", topic=topic_name_uk)
+            return None
+
+        # 3. LLM-відбір
+        selection = await call_llm_for_selection(topic_name_uk, complete_candidates)
+        if selection is None:
+            # Якщо LLM недоступний — обираємо перші complete_candidates
+            logger.warning("llm_selection_failed_fallback_to_first", count=len(complete_candidates))
+            suggested_count = min(30, len(complete_candidates))
+            selection = SelectionResult(
+                topic=topic_name_uk,
+                candidates_count=len(complete_candidates),
+                suggested_count=suggested_count,
+                selected_ids=[c["id"] for c in complete_candidates[:suggested_count]],
+                reasoning="LLM недоступний, обрано перші N документів",
+            )
+
+        selected_ids = set(selection.selected_ids)
+        selected_docs = [c for c in complete_candidates if c["id"] in selected_ids]
+
+        logger.info("selection_done", suggested=selection.suggested_count, actual=len(selected_docs))
+
+        # 4. Перевірка доступності
+        unavailable = []
+        available = []
+
+        for doc in selected_docs:
+            available_flag, reason = await check_availability(doc["canonical_url"])
+            if available_flag:
+                available.append(doc)
+            else:
+                unavailable.append((doc, reason))
+                logger.warning("document_unavailable", doc_id=doc["id"], reason=reason)
+
+        # 5. Заміна недоступних
+        replaced = []
+        still_unavailable = []
+
+        for doc, reason in unavailable:
+            replacement = await find_replacement(
+                db,
+                doc,
+                selected_ids - {doc["id"]},
+                topic_id=topic_id,
+                udc_prefixes=udc_prefixes,
+            )
+            if replacement:
+                available.append(replacement)
+                replaced.append((doc["id"], replacement["id"]))
+                logger.info("replacement_found", original=doc["id"], replacement=replacement["id"])
+            else:
+                still_unavailable.append((doc["id"], reason))
+                logger.warning("no_replacement_found", doc_id=doc["id"])
+
+        if dry_run:
+            logger.info("dry_run_skip_write", catalog_path="(не записано)")
+            return PrepareResult(
+                catalog_path="(dry-run)",
+                topic_name=topic_name_uk,
+                document_count=len(available),
+                replaced_count=len(replaced),
+                unavailable_count=len(still_unavailable),
+                success_count=len(available),
+            )
+
+        # 6. Запис каталогу
+        now = datetime.now()
+        catalog_name = f"catalog_{now.strftime('%Y%m%d_%H%M%S')}.json"
+        catalog_path = os.path.join(output_dir, catalog_name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        documents_data = []
+        for doc in available:
+            doc_data = {
+                "id": doc["id"],
+                "title": doc["title"],
+                "authors": doc["authors"],
+                "year": doc["year"],
+                "publisher": doc["publisher"],
+                "doc_type": doc["doc_type"],
+                "canonical_url": doc["canonical_url"],
+                "language": doc["language"],
+                "udc": doc["udc"],
+                "page_count": doc["page_count"],
+                "size_bytes": doc["size_bytes"],
+                "sha256": doc["sha256"],
+                "has_text_layer": doc["has_text_layer"],
+                "verified_at": doc["verified_at"],
+                "first_seen_at": doc["first_seen_at"],
+            }
+            if doc.get("topic_id") and doc.get("topic_name"):
+                doc_data["topics"] = [{
+                    "topic_id": doc["topic_id"],
+                    "topic_name": doc["topic_name"],
+                    "score": doc["topic_score"],
+                }]
+            documents_data.append(doc_data)
+
+        catalog_data = {
+            "topic": topic_name_uk,
+            "created_at": now.isoformat(),
+            "total_documents": len(documents_data),
+            "replaced_count": len(replaced),
+            "documents": documents_data,
+        }
+
+        await save_catalog_atomically(catalog_path, catalog_data)
+
+        # Позначити недоступні в БД
+        for doc_id, reason in still_unavailable:
+            await mark_unavailable_in_db(db, doc_id, reason, catalog_name=catalog_name)
+
+        for original_id, replacement_id in replaced:
+            await mark_unavailable_in_db(db, original_id, "replaced_by_curator", replacement_id, catalog_name)
+
+        # 7. Підсумок
+        result = PrepareResult(
+            catalog_path=catalog_path,
+            topic_name=topic_name_uk,
+            document_count=len(documents_data),
+            replaced_count=len(replaced),
+            unavailable_count=len(still_unavailable),
+            success_count=len(documents_data),
+        )
+
+        logger.info("curator_prepare_complete", **result.__dict__)
+        return result
+
+    finally:
+        await db.close()

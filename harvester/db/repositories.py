@@ -685,3 +685,29 @@ class ExtractionsRepository:
             tuple(params),
         )
         return [dict(row) for row in rows]
+
+
+class TopicsRepository:
+    """Робота з темами (таблиця `topics`)."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    async def list_all(self) -> list[dict]:
+        rows = await self.db.fetchall("SELECT * FROM topics ORDER BY id")
+        return [dict(row) for row in rows]
+
+    async def get_by_code(self, code: str) -> dict | None:
+        row = await self.db.fetchone("SELECT * FROM topics WHERE code = ?", (code,))
+        return dict(row) if row else None
+
+    async def get_by_name(self, name_uk_fragment: str) -> list[dict]:
+        rows = await self.db.fetchall(
+            "SELECT * FROM topics WHERE name_uk LIKE ? ORDER BY id",
+            (f"%{name_uk_fragment}%",),
+        )
+        return [dict(row) for row in rows]
+
+    async def count(self) -> int:
+        row = await self.db.fetchone("SELECT COUNT(*) as count FROM topics")
+        return row["count"] if row else 0
