@@ -1,0 +1,817 @@
+{
+  "topic": "Економіка",
+  "created_at": "2026-08-22T22:52:52.188423",
+  "total_documents": 30,
+  "replaced_count": 0,
+  "documents": [
+    {
+      "id": 47879,
+      "title": "ПІДПРИЄМНИЦТВО, ТОРГІВЛЯ ТА БІРЖОВА ДІЯЛЬНІСТЬ",
+      "authors": [
+        "Iryna Khoma",
+        "Юліана Мисько"
+      ],
+      "year": 2023,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/3217/3140",
+      "language": "uk",
+      "udc": "336.76",
+      "page_count": 10,
+      "size_bytes": 417127,
+      "sha256": "d9f0869293a55dfec052833d446e821ff84b80daf56a26e4c53bc0c4c4ce94f1",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T05:47:32.451634",
+      "first_seen_at": "2026-08-19T19:19:22.566989",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.8333
+        }
+      ]
+    },
+    {
+      "id": 61508,
+      "title": "ДИСТРИБ’ЮТОРСТВО ЯК ОСОБЛИВИЙ ВИД ЕКОНОМІЧНОЇ ДІЯЛЬНОСТІ ПІДПРИЄМСТВ",
+      "authors": [
+        "ВНЗ «Університет економіки та права «КРОК»",
+        "Іван Мельніченко"
+      ],
+      "year": 2024,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://snku.krok.edu.ua/index.php/vcheni-zapiski-universitetu-krok/article/download/690/694/1824",
+      "language": "uk",
+      "udc": "339.1:658.8",
+      "page_count": 9,
+      "size_bytes": 745672,
+      "sha256": "be3d1d826deb2de59ce2247048d998a32a5f672ef4cc547369ddbd7d3b67d617",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T09:42:46.233068",
+      "first_seen_at": "2026-08-19T19:25:01.165727",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.8235
+        }
+      ]
+    },
+    {
+      "id": 55216,
+      "title": "РЕАЛІЗАЦІЯ ПРИНЦИПІВ ЦИРКУЛЯРНОЇ ЕКОНОМІКИ У ДІЯЛЬНОСТІ МІЖНАРОДНИХ КОМПАНІЙ IMPLEMENTATION OF CIRCULAR ECONOMY PRINCIPLES IN THE ACTIVITIES OF INTERNATIONAL COMPANIES",
+      "authors": [
+        "Наталя Кондратенко",
+        "Надія Шиловцева"
+      ],
+      "year": 2023,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/2309/2231",
+      "language": "uk",
+      "udc": "334.726:",
+      "page_count": 6,
+      "size_bytes": 169787,
+      "sha256": "36b3afb40007918de1526d106f864159749f85d2b37a70ecc22f89c7df59214e",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T07:49:23.162316",
+      "first_seen_at": "2026-08-19T19:22:32.250419",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.8125
+        }
+      ]
+    },
+    {
+      "id": 43739,
+      "title": "ТЕОРІЯ ТА ПРАКТИКА СУЧАСНОГО МАТЕРІАЛОЗНАВСТВА ТА ТОВАРОЗНАВСТВА",
+      "authors": [
+        "Mykhailo Bodak",
+        "О. І. Гирка",
+        "Марія Філь"
+      ],
+      "year": 2022,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://journals-lute.lviv.ua/index.php/visnyk-tech/article/download/1198/1130",
+      "language": "uk",
+      "udc": "339.5:684",
+      "page_count": 7,
+      "size_bytes": 413809,
+      "sha256": "7382edf04f9007a0e8df2c15b4462a09d047b98300bfc4f1f46f2be99b8f675b",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T04:45:36.016524",
+      "first_seen_at": "2026-08-19T19:17:36.058233",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.8125
+        }
+      ]
+    },
+    {
+      "id": 24433,
+      "title": "ЦИФРОВА ЕКОНОМІКА ТА ЕКОНОМІЧНА БЕЗПЕКА",
+      "authors": [
+        "Л. М. Сатир",
+        "Valentyna Kepko",
+        "Леонід Стаднік"
+      ],
+      "year": 2023,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://dees.iei.od.ua/index.php/journal/article/download/134/122",
+      "language": "uk",
+      "udc": "339.166.8",
+      "page_count": 6,
+      "size_bytes": 335557,
+      "sha256": "65b6b5f16e3b9fbf275ce08d50885529869968072d05f92d37aa132c1edf04f5",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T00:16:07.873479",
+      "first_seen_at": "2026-08-19T19:06:41.132156",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.7368
+        }
+      ]
+    },
+    {
+      "id": 58414,
+      "title": "ФІНАНСИ, БАНКІВСЬКА СПРАВА ТА СТРАХУВАННЯ",
+      "authors": [
+        "Зоряна Лапішко",
+        "Уляна Грудзевич",
+        "Анастасія Тищенко"
+      ],
+      "year": 2024,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/4496/4435",
+      "language": "uk",
+      "udc": "336.76",
+      "page_count": 11,
+      "size_bytes": 730423,
+      "sha256": "d899209f27ff021425c4f57eba7e04477c7e0eac4a5653ff07427f493f031776",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T08:44:04.331710",
+      "first_seen_at": "2026-08-19T19:23:55.591044",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.7143
+        }
+      ]
+    },
+    {
+      "id": 41718,
+      "title": "РИНОК КАВИ В УКРАЇНІ: ТЕНДЕНЦІЇ ТА ПЕРСПЕКТИВИ COFFEE MARKET IN UKRAINE: TRENDS AND PROSPECTS",
+      "authors": [
+        "Kostiantyn Vorobiov",
+        "Наталія Гуржій"
+      ],
+      "year": 2022,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/1514/1456",
+      "language": "uk",
+      "udc": "339.13.021:663.93",
+      "page_count": 7,
+      "size_bytes": 218374,
+      "sha256": "093b542412dad270d4ea65001c3f6876b1e4035819bc614c5a207bbb618f219e",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T04:06:47.225995",
+      "first_seen_at": "2026-08-19T19:16:46.385069",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.7143
+        }
+      ]
+    },
+    {
+      "id": 36825,
+      "title": "ПІДПРИЄМНИЦТВО, ТОРГІВЛЯ ТА БІРЖОВА ДІЯЛЬНІСТЬ",
+      "authors": [
+        "Микола Ільчук",
+        "Валентина Яворська",
+        "Віталій Радько",
+        "Ольга Томашевська"
+      ],
+      "year": 2025,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/7074/7017",
+      "language": "uk",
+      "udc": "339.172",
+      "page_count": 8,
+      "size_bytes": 335101,
+      "sha256": "a08d6f7eb76c79790b3e6e594304730beabe9950d0d87f8db723a348f8c8421a",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T02:57:34.623594",
+      "first_seen_at": "2026-08-19T19:14:27.283621",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.7
+        }
+      ]
+    },
+    {
+      "id": 63860,
+      "title": "ОГЛЯД ІНСТРУМЕНТІВ ХЕДЖУВАННЯ КРЕДИТНОГО РИЗИКУ НА РИНКУ ЕЛЕКТРИЧНОЇ ЕНЕРГІЇ",
+      "authors": [
+        "Юлія Грисюк"
+      ],
+      "year": 2024,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://nayka.com.ua/index.php/ee/article/download/4272/4307",
+      "language": "uk",
+      "udc": "339.3",
+      "page_count": 12,
+      "size_bytes": 339118,
+      "sha256": "9c0dc0b79d653fbbcbbbf2b201a803fa8f1aca62db451a60b2d5a29cba8a5e5a",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T10:23:14.418260",
+      "first_seen_at": "2026-08-19T19:26:02.599843",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6842
+        }
+      ]
+    },
+    {
+      "id": 52948,
+      "title": "МІЖНАРОДНІ ЕКОНОМІЧНІ ВІДНОСИНИ",
+      "authors": [
+        "Вікторія Олександрівна Козуб",
+        "Світлана Бестужева"
+      ],
+      "year": 2022,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/1240/1195",
+      "language": "uk",
+      "udc": "339.562:341.241.8",
+      "page_count": 9,
+      "size_bytes": 326145,
+      "sha256": "45e1a388bb08a10032dc63cc695ca6c0e38736d02e6ea1738ded9bb967c5cd03",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T07:14:25.958960",
+      "first_seen_at": "2026-08-19T19:21:29.166135",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6842
+        }
+      ]
+    },
+    {
+      "id": 45499,
+      "title": "АНАЛІЗ ПОЗИЦІЙ УКРАЇНИ У ВИМІРІ КОНКУРЕНТОСПРОМОЖНІСТЬ – ІННОВАЦІЙНІСТЬ ANALYSIS OF UKRAINE'S POSITION IN THE COMPETITIVENESS – INNOVATIVENESS DIMENSION",
+      "authors": [
+        "Iryna Chmutova",
+        "Анастасія Гайналій"
+      ],
+      "year": 2021,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/948/906",
+      "language": "uk",
+      "udc": "339.137.2(477)",
+      "page_count": 11,
+      "size_bytes": 357099,
+      "sha256": "c814a479c2e0f769b363e81c770037ceb8de9bc979af14a79da53f3183ed541c",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T05:08:31.967780",
+      "first_seen_at": "2026-08-19T19:18:17.246874",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6842
+        }
+      ]
+    },
+    {
+      "id": 30148,
+      "title": "ПІДПРИЄМНИЦТВО, ТОРГІВЛЯ ТА БІРЖОВА ДІЯЛЬНІСТЬ",
+      "authors": [
+        "Л. В. Вербівська"
+      ],
+      "year": 2024,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/4223/4150",
+      "language": "uk",
+      "udc": "339.137.22:65.011.46",
+      "page_count": 7,
+      "size_bytes": 293057,
+      "sha256": "ac33be06a417117501f48062af0f8e21bdf177d0f37818c63b4377ffbc6d357c",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T01:26:46.221046",
+      "first_seen_at": "2026-08-19T19:10:47.583115",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6667
+        }
+      ]
+    },
+    {
+      "id": 20978,
+      "title": "ФІНАНСИ, БАНКІВСЬКА СПРАВА ТА СТРАХУВАННЯ",
+      "authors": [
+        "Валентин Бур’янов",
+        "Ганна Куліш"
+      ],
+      "year": 2023,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/2216/2138",
+      "language": "uk",
+      "udc": "336.763.3:334.78",
+      "page_count": 11,
+      "size_bytes": 496812,
+      "sha256": "2d599ae5af0420e017323e3ea5e9feef08f9e0f9408f72c6d13ceb3718948f64",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-19T23:23:58.928651",
+      "first_seen_at": "2026-08-19T19:03:48.044315",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6667
+        }
+      ]
+    },
+    {
+      "id": 47116,
+      "title": "ЦИФРОВА ЕКОНОМІКА ТА ЕКОНОМІЧНА БЕЗПЕКА",
+      "authors": [
+        "А.О. Максимук",
+        "С.Я. Мрочко"
+      ],
+      "year": 2023,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://dees.iei.od.ua/index.php/journal/article/download/144/132",
+      "language": "uk",
+      "udc": "339.562",
+      "page_count": 7,
+      "size_bytes": 209975,
+      "sha256": "f9ae5d2ac39884051c079d257abbf806ffcc47530b8dad644cd226ebc23d87b3",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T05:35:28.888211",
+      "first_seen_at": "2026-08-19T19:18:48.815006",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6667
+        }
+      ]
+    },
+    {
+      "id": 42671,
+      "title": "СТРАТЕГІЧНІ АЛЬТЕРНАТИВИ РОЗВИТКУ ЗОВНІШНЬОЕКОНОМІЧНОЇ ДІЯЛЬНОСТІ ПІДПРИЄМСТВ",
+      "authors": [
+        "Олексій Джусов",
+        "A.D. Prokof'ieva"
+      ],
+      "year": 2014,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://mi-dnu.dp.ua/index.php/MI/article/download/19/102",
+      "language": "uk",
+      "udc": "339.5.012",
+      "page_count": 8,
+      "size_bytes": 585122,
+      "sha256": "66b8d201295eeffdf9abd0ee55b4b8f0ffd9873ee97f125d03fdb2658b01ceca",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T04:26:44.151909",
+      "first_seen_at": "2026-08-19T19:17:11.728089",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6522
+        }
+      ]
+    },
+    {
+      "id": 47674,
+      "title": "ОСОБЛИВОСТІ ВПЛИВУ ЦИФРОВІЗУВАННЯ НА РОЗВИТОК ЗОВНІШНЬОЕКОНОМІЧНОЇ ДІЯЛЬНОСТІ ПІДПРИЄМСТВ В УМОВАХ ВІЙНИ ТА ПІСЛЯВОЄННИЙ ПЕРІОД: ПЛАНОВИЙ АСПЕКТ PECULIARITIES OF THE IMPACT OF DIGITALIZATION ON THE DEVELOPMENT OF FOREIGN ECONOMIC ACTIVITY OF ENTERPRISES DURING THE WAR AND THE POST-WAR PERIOD: THE PLANNING ASPECT",
+      "authors": [
+        "Мар’яна Нагірна"
+      ],
+      "year": 2023,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/2741/2657",
+      "language": "uk",
+      "udc": "339.5:339.9(06):330.3(334):333.13",
+      "page_count": 6,
+      "size_bytes": 270347,
+      "sha256": "37b6699c9b6d6afe36a5a8e52b32bb0e688f5c297f81483e4f3a721012b2d6a4",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T05:45:06.088393",
+      "first_seen_at": "2026-08-19T19:19:06.038723",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6364
+        }
+      ]
+    },
+    {
+      "id": 21537,
+      "title": "ПІДПРИЄМНИЦТВО, ТОРГІВЛЯ ТА БІРЖОВА ДІЯЛЬНІСТЬ",
+      "authors": [
+        "Liudmyla Shostak",
+        "Інна Милько",
+        "Світлана Павлова"
+      ],
+      "year": 2023,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/2930/2851",
+      "language": "uk",
+      "udc": "339.1",
+      "page_count": 6,
+      "size_bytes": 280240,
+      "sha256": "1512d56b8778ed249442a7fc761c66c4aec24d8bbd246252743531883ef10dc9",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-19T23:32:48.536985",
+      "first_seen_at": "2026-08-19T19:04:25.010175",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6364
+        }
+      ]
+    },
+    {
+      "id": 52940,
+      "title": "МЕТОДОЛОГІЯ ФОРМУВАННЯ РЕГІОНАЛЬНИХ МЕРЕЖЕВИХ ОБ’ЄДНАНЬ METHODOLOGY FOR FORMING NETWORK ASSOCIATIONS",
+      "authors": [
+        "Марта Данилович-Кропивницька"
+      ],
+      "year": 2022,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/1258/1212",
+      "language": "uk",
+      "udc": "339.187.44",
+      "page_count": 9,
+      "size_bytes": 320094,
+      "sha256": "7030f8f1a72d742a0032e2be45b54083d1054f6abdf8bb7a7a4a8ca5f7c819cf",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T07:14:20.006606",
+      "first_seen_at": "2026-08-19T19:21:28.854234",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6364
+        }
+      ]
+    },
+    {
+      "id": 63379,
+      "title": "A PROMISING, ALTERNATIVE FORM OF URBAN PUBLIC TRANSPORT",
+      "authors": [
+        "Аскар Рахімбаєв",
+        "Шолпан Алмагамбетова",
+        "Р.Ж. Калгулова",
+        "Оксана Дмитрієва"
+      ],
+      "year": 2024,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://ppb.khadi.kharkov.ua/article/download/307422/298860",
+      "language": "en",
+      "udc": "334.724.2",
+      "page_count": 13,
+      "size_bytes": 675047,
+      "sha256": "7816a52cfa731123e1153648c87b85ab1570b80cbfa667e070eeb41662d3b07d",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T10:14:57.043487",
+      "first_seen_at": "2026-08-19T19:25:44.444678",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6316
+        }
+      ]
+    },
+    {
+      "id": 58772,
+      "title": "МІЖНАРОДНІ ЕКОНОМІЧНІ ВІДНОСИНИ",
+      "authors": [
+        "Nataliya Krasnikova",
+        "Катерина Колісник"
+      ],
+      "year": 2024,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/4915/4858",
+      "language": "uk",
+      "udc": "339.1",
+      "page_count": 9,
+      "size_bytes": 363953,
+      "sha256": "8199bbfb3159ab26dc6c2a89202595dc6691342159bb97962e04f99cdf921a94",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T08:50:24.906582",
+      "first_seen_at": "2026-08-19T19:24:04.777171",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6316
+        }
+      ]
+    },
+    {
+      "id": 27665,
+      "title": "МІЖНАРОДНА ПРАКТИКА НАГЛЯДУ ЗА ДІЯЛЬНІСТЮ ФІНАНСОВИХ (КРЕДИТНИХ) КООПЕРАТИВІВ ЧЕРЕЗ МЕХАНІЗМИ САМОКОНТРОЛЮ",
+      "authors": [
+        "Сергій Хоружий"
+      ],
+      "year": 2019,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://ser.net.ua/index.php/SER/article/download/104/109",
+      "language": "uk",
+      "udc": "334.732",
+      "page_count": 6,
+      "size_bytes": 169567,
+      "sha256": "98788de6ab0658177bda85c461a6518a43a92de6d3ab37ea41ba56c8a655183c",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T00:52:49.331233",
+      "first_seen_at": "2026-08-19T19:09:33.976447",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6316
+        }
+      ]
+    },
+    {
+      "id": 26047,
+      "title": "СЕГМЕНТУВАННЯ РИНКУ ЦИФРОВИХ ПРОДУКТІВ І ПОСЛУГ З ЇХ РОЗРОБКИ В УКРАЇНІ SEGMENTATION OF THE MARKET FOR DIGITAL PRODUCTS AND DEVELOPMENT SERVICES IN UKRAINE",
+      "authors": [
+        "Kostiantyn Fuks"
+      ],
+      "year": 2025,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/5891/5829",
+      "language": "uk",
+      "udc": "339.1",
+      "page_count": 6,
+      "size_bytes": 253879,
+      "sha256": "d7c8ee054042c83a58d87b6a869ef2cc7d5aa581d5db3f1a29d35725dadd9528",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T00:33:59.107763",
+      "first_seen_at": "2026-08-19T19:08:29.857091",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.625
+        }
+      ]
+    },
+    {
+      "id": 28993,
+      "title": "ОСНОВИ ДОСЛІДЖЕННЯ РИНКУ НАФТОПРОДУКТІВ НА ЕТАПІ ВІДБУДОВИ ЕКОНОМІКИ BASICS OF RESEARCHING THE OIL PRODUCTS MARKET AT THE STAGE OF ECONOMIC RECONSTRUCTION",
+      "authors": [
+        "Дмитро Донець"
+      ],
+      "year": 2023,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/3268/3191",
+      "language": "uk",
+      "udc": "339.137:665.6",
+      "page_count": 7,
+      "size_bytes": 284610,
+      "sha256": "509b4de14b9316f4805f89b42159428cc9e1c4e60c037799a0839cb68aa23a14",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T01:11:12.039473",
+      "first_seen_at": "2026-08-19T19:10:24.122020",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.625
+        }
+      ]
+    },
+    {
+      "id": 46585,
+      "title": "ФІНАНСИ, БАНКІВСЬКА СПРАВА ТА СТРАХУВАННЯ",
+      "authors": [
+        "Богдан Сорока"
+      ],
+      "year": 2022,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/1762/1698",
+      "language": "uk",
+      "udc": "336.76",
+      "page_count": 6,
+      "size_bytes": 212638,
+      "sha256": "78122bf9c3bde9e8e7d88d6d60c2a6b82143e74f588de4110a46cd2005de0b6c",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T05:26:33.514969",
+      "first_seen_at": "2026-08-19T19:18:35.763144",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.625
+        }
+      ]
+    },
+    {
+      "id": 15901,
+      "title": "ФІНАНСИ, БАНКІВСЬКА СПРАВА ТА СТРАХУВАННЯ",
+      "authors": [
+        "Сергій Канигін",
+        "V. F. Tyschenko",
+        "Катерина Азізова"
+      ],
+      "year": 2022,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/1411/1360",
+      "language": "uk",
+      "udc": "339.543",
+      "page_count": 5,
+      "size_bytes": 142947,
+      "sha256": "106181a39f3fd87088c3e85bed0465c2518b3acde01f66d332819d582b978bc8",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-19T22:17:56.283709",
+      "first_seen_at": "2026-08-19T18:58:23.649910",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.625
+        }
+      ]
+    },
+    {
+      "id": 6003,
+      "title": "МІЖНАРОДНІ ЕКОНОМІЧНІ ВІДНОСИНИ",
+      "authors": [
+        "Tamila H. Kovalchuk",
+        "Віта Загарій"
+      ],
+      "year": 2024,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/3404/3332",
+      "language": "uk",
+      "udc": "339.1",
+      "page_count": 8,
+      "size_bytes": 303237,
+      "sha256": "7ab93f66518479026c656dfb9ec253aa5b5b97fbffbccbad0846494c1c639afd",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-19T20:09:40.602749",
+      "first_seen_at": "2026-08-19T18:46:47.437917",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6087
+        }
+      ]
+    },
+    {
+      "id": 9631,
+      "title": "МІЖНАРОДНІ ЕКОНОМІЧНІ ВІДНОСИНИ",
+      "authors": [
+        "Наталія Станасюк",
+        "Артур Паліса"
+      ],
+      "year": 2024,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/5131/5077",
+      "language": "uk",
+      "udc": "339.56",
+      "page_count": 6,
+      "size_bytes": 273303,
+      "sha256": "d7f63afd9a73bcfd2139a7aa11e7693a9eb8a7de558ef8d60408f4ce320fd479",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-19T20:58:18.985266",
+      "first_seen_at": "2026-08-19T18:51:22.787719",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6087
+        }
+      ]
+    },
+    {
+      "id": 29565,
+      "title": "ОЦІНКА БАЛАНСУ ПОПИТУ ТА ПРОПОЗИЦІЇ НА РИНКУ ЯБЛУК ТА ПРОДУКТІВ ЇХ ПЕРЕРОБКИ В УКРАЇНІ ASSESSMENT OF THE BALANCE OF DEMAND AND SUPPLY ON THE MARKET OF APPLES AND THEIR PROCESSING PRODUCTS IN UKRAINE",
+      "authors": [
+        "Володимир Лужанський"
+      ],
+      "year": 2024,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/3620/3550",
+      "language": "uk",
+      "udc": "339.13.017:634.42",
+      "page_count": 7,
+      "size_bytes": 301568,
+      "sha256": "0755c37c46b9634ad75dc19951f260e700ce452cc17c89b15548b41116550789",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T01:18:51.476404",
+      "first_seen_at": "2026-08-19T19:10:35.268602",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6087
+        }
+      ]
+    },
+    {
+      "id": 28965,
+      "title": "ПІДПРИЄМНИЦТВО, ТОРГІВЛЯ ТА БІРЖОВА ДІЯЛЬНІСТЬ",
+      "authors": [
+        "Тетяна Жамбей"
+      ],
+      "year": 2023,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/3252/3175",
+      "language": "uk",
+      "udc": "334.716:005.418:330.31",
+      "page_count": 6,
+      "size_bytes": 388393,
+      "sha256": "1a7b33a43953b67825544ada6a9a35f9045cdbac7d325f4fd744a2b7eb148786",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-20T01:10:44.937682",
+      "first_seen_at": "2026-08-19T19:10:23.870440",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6087
+        }
+      ]
+    },
+    {
+      "id": 8555,
+      "title": "ПРОБЛЕМИ ТА ПЕРСПЕКТИВИ УПРАВЛІННЯ РИЗИКАМИ В ЛАНЦЮГАХ ПОСТАЧАННЯ ЗА УМОВ НЕВИЗНАЧЕНОСТІ CHALLENGES AND PROSPECTS FOR RISK MANAGEMENT IN SUPPLY CHAINS UNDER UNCERTAINTY",
+      "authors": [
+        "Левко Прокіпчук",
+        "Andrii TODOSHCHUK"
+      ],
+      "year": 2025,
+      "publisher": null,
+      "doc_type": "article",
+      "canonical_url": "https://economyandsociety.in.ua/index.php/journal/article/download/5548/5486",
+      "language": "uk",
+      "udc": "339.5:519.8:658.45:658.7:658.8",
+      "page_count": 6,
+      "size_bytes": 306886,
+      "sha256": "19f876ef36a731289de0416cb6185782d98262744dc21f03a362ae13bf26ffbc",
+      "has_text_layer": 1,
+      "verified_at": "2026-08-19T20:46:13.904909",
+      "first_seen_at": "2026-08-19T18:49:48.374970",
+      "topics": [
+        {
+          "topic_id": 3,
+          "topic_name": "Економіка",
+          "score": 0.6
+        }
+      ]
+    }
+  ]
+}
