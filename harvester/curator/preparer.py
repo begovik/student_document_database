@@ -51,16 +51,63 @@ def is_document_complete(doc: dict[str, Any]) -> tuple[bool, str | None]:
 
     # Додаткові перевірки якості
     title = doc.get("title", "")
-    if len(title) < 10:
+    if not title or len(title.strip()) < 10:
         return False, f"title слишком короткий ({len(title)} символів)"
-    if ".docx" in title.lower() or ".doc" in title.lower():
-        return False, "title містить розширення файлу (бракує відділеного title)"
-    if "microsoft word" in title.lower():
-        return False, "title містить 'Microsoft Word' (бракує відділеного title)"
+    title_lower = title.lower()
+    if ".docx" in title_lower or ".doc" in title_lower:
+        return False, "title містить розширення файлу"
+    if "microsoft word" in title_lower:
+        return False, "title містить 'Microsoft Word'"
+    # Перевірка що title містить хоча б 2 слова з літер
+    import re
+    words = re.findall(r'[a-zA-Zа-яА-ЯіІєЇїЄєҐёЁ]{2,}', title)
+    if len(words) < 2:
+        return False, f"title не містить слів (знайдено {len(words)})"
+    # Відкидати якщо title містить ".mdi", "c--", "c-document" (windows garbage)
+    if ".mdi" in title_lower or "c--documents" in title_lower:
+        return False, f"title містить garbage-патерн"
 
+    # Перевірка авторів
     authors = doc.get("authors", [])
-    if not authors or (isinstance(authors, list) and len(authors) > 0 and all(a == "USER" or a == "" for a in authors)):
-        return False, "автори некоректні (USER або порожні)"
+    if not authors:
+        return False, "автори відсутні"
+    if isinstance(authors, list):
+        # Відкидати списки з одного елементом якщо це ініціали (типу "Г.А.") 
+        # або загальновідомі garbage-значення
+        if len(authors) == 1:
+            a = authors[0]
+            if re.match(r'^[А-ЩЬьюЯ]{1,3}\.[А-ЩЬьюЯ]{1,3}\.*$', a):
+                return False, f"автор '{a}' виглядає як ініціали (бракує прізвища)"
+            if a in ("USER", "1", "Unknown", "service", "", "Admin", "Lena"):
+                return False, f"автор '{a}' некоректний"
+            # Якщо це одне слово коротке (<3 літери) - швидше за все це garbage
+            if len(a) < 3 and not a[0].isupper():
+                return False, f"автор '{a}' некоректний"
+        # Відкидати якщо всі автори некоректні
+        bad_authors = []
+        for a in authors:
+            if a in ("USER", "1", "Unknown", "service", "", "Admin"):
+                bad_authors.append(a)
+            elif re.match(r'^[А-ЩЬьюЯ]{1,3}\.[А-ЩЬьюЯ]{1,3}\.*$', a):
+                bad_authors.append(a)
+            elif len(a.strip()) < 2:
+                bad_authors.append(a)
+        if len(bad_authors) == len(authors):
+            return False, f"всі автори некоректні: {bad_authors[:2]}"
+        if len(bad_authors) > 0:
+            # Якщо більшість авторів некоректні - відкидати
+            if len(bad_authors) >= len(authors) * 0.5:
+                return False, f"більшість авторів некоректні: {bad_authors[:2]}"
+    else:
+        # Якщо автори не список - намагаємось розібрати
+        try:
+            parsed = json.loads(authors)
+            if isinstance(parsed, list):
+                authors = parsed
+            else:
+                return False, "автори не є списком"
+        except (json.JSONDecodeError, TypeError):
+            return False, "автори некоректний формат"
 
     if doc.get("extra") and isinstance(doc.get("extra"), str):
         try:
