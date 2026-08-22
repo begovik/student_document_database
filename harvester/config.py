@@ -146,6 +146,8 @@ class LLMConfig(BaseModel):
     temperature: float = Field(default=0.1, ge=0.0, le=2.0)
     min_interval_s: float = Field(default=1.5, ge=0.0)
     daily_limit_wait_s: float = Field(default=120.0, gt=0)
+    max_text_chars_for_llm: int = Field(default=80000, ge=10000, le=500000)
+    max_pages_for_extraction: int = Field(default=100, ge=10, le=1000)
 
 
 class Settings(BaseSettings):

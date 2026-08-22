@@ -613,3 +613,75 @@ class SearchQueriesRepository:
             (limit,),
         )
         return [dict(row) for row in rows]
+
+
+class ExtractionsRepository:
+    def __init__(self, db: Database):
+        self.db = db
+
+    async def upsert(
+        self,
+        document_id: int,
+        quotations: list[dict],
+        summary: dict | None = None,
+    ) -> int | None:
+        now = datetime.utcnow().isoformat()
+        quotations_json = json.dumps(quotations, ensure_ascii=False)
+        summary_json = json.dumps(summary, ensure_ascii=False) if summary else None
+
+        sql = """
+        INSERT INTO extractions (document_id, quotations, summary, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (document_id) DO UPDATE SET
+            quotations = excluded.quotations,
+            summary = excluded.summary,
+            updated_at = excluded.updated_at
+        """
+        cursor = await self.db.execute(sql, (document_id, quotations_json, summary_json, now, now))
+        return cursor.lastrowid if cursor.lastrowid else None
+
+    async def get_by_document_id(self, document_id: int) -> dict | None:
+        row = await self.db.fetchone(
+            "SELECT * FROM extractions WHERE document_id = ?",
+            (document_id,),
+        )
+        return dict(row) if row else None
+
+    async def exists_for_document(self, document_id: int) -> bool:
+        row = await self.db.fetchone(
+            "SELECT 1 FROM extractions WHERE document_id = ?",
+            (document_id,),
+        )
+        return row is not None
+
+    async def count(self) -> int:
+        row = await self.db.fetchone("SELECT COUNT(*) as count FROM extractions")
+        return row["count"] if row else 0
+
+    async def get_documents_without_extractions(
+        self,
+        topic_id: int | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        params: list = []
+        topic_join = ""
+        if topic_id is not None:
+            topic_join = "JOIN document_topics dt ON dt.document_id = d.id AND dt.topic_id = ?"
+            params.append(topic_id)
+
+        params.extend([limit, offset])
+        rows = await self.db.fetchall(
+            f"""
+            SELECT d.id, d.canonical_url, d.title
+            FROM documents d
+            {topic_join}
+            LEFT JOIN extractions e ON e.document_id = d.id
+            WHERE e.id IS NULL
+              AND d.status = 'verified'
+            ORDER BY d.id
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params),
+        )
+        return [dict(row) for row in rows]

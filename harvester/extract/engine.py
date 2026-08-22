@@ -80,7 +80,7 @@ LLM_SYSTEM_PROMPT = """Ти — дослідник, який аналізує н
 {"quotations":[{"page":5,"text":"Ціна цитати...","type":"conclusion"}],"summary":{"page":1,"overview":"...","key_ideas":["..."],"methodology":"...","findings":"...","conclusions":"...","authors_mentioned":["..."]}}"""
 
 # Максимальна кількість символів тексту для відправки в LLM
-MAX_TEXT_CHARS_FOR_LLM = 80000
+MAX_TEXT_CHARS_FOR_LLM = 80000  # Deprecated: use settings.llm.max_text_chars_for_llm
 
 
 @dataclass
@@ -172,7 +172,8 @@ async def process_document(job: ExtractionJob) -> ExtractionResult:
 
         # 2. Парсити PDF (витягнути весь текст, усі сторінки)
         # Максимальна кількість сторінок для витягу
-        max_pages = 100
+        settings = get_settings()
+        max_pages = settings.llm.max_pages_for_extraction
         parse_result = await parse_pdf(tmp_pdf, max_pages=max_pages)
         if parse_result.is_corrupt or parse_result.is_encrypted:
             return ExtractionResult(
@@ -196,8 +197,9 @@ async def process_document(job: ExtractionJob) -> ExtractionResult:
             )
 
         # Обрізати текст до максимальної довжини для LLM
-        if len(text) > MAX_TEXT_CHARS_FOR_LLM:
-            text = text[:MAX_TEXT_CHARS_FOR_LLM] + "\n\n[... текст обрізано, далі йде додатковий матеріал ...]"
+        max_chars = settings.llm.max_text_chars_for_llm
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n\n[... текст обрізано, далі йде додатковий матеріал ...]"
 
         # 3. Викликати LLM для витягу цитат і сумаризації
         llm_result = await call_llm_for_extraction(text, job.title)

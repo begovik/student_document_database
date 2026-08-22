@@ -21,6 +21,7 @@ import typer
 
 from harvester.config import get_settings
 from harvester.db.failover import build_database
+from harvester.db.repositories import ExtractionsRepository
 from harvester.extract.engine import ExtractionJob, ExtractionResult, process_document
 
 logger = structlog.get_logger()
@@ -69,6 +70,7 @@ async def main(
     settings = get_settings()
     db = build_database(settings)
     await db.initialize(sync_mirror=False)
+    repo = ExtractionsRepository(db)
 
     try:
         # 1. Отримати список документів для обробки
@@ -109,7 +111,7 @@ async def main(
 
         # 4. Зберегти результати (якщо не dry-run)
         if not dry_run:
-            saved = await save_results(db, results)
+            saved = await save_results(repo, results)
             print(f"\n✅ Збережено {saved} результатів у базу даних")
         else:
             print("\n📝 Dry-run: результати не збережено")
@@ -235,37 +237,20 @@ async def get_documents_to_process(
 
 
 async def save_results(
-    db,
+    repo: ExtractionsRepository,
     results: list[ExtractionResult],
 ) -> int:
-    """Зберегти результати витягу в базу даних."""
+    """Зберегти результати витягу в базу даних (атомарно)."""
     saved = 0
-    now = datetime.utcnow().isoformat()
+    successful_results = [r for r in results if r.success]
 
-    for r in results:
-        if not r.success:
-            continue
-
-        quotations_json = json.dumps(r.quotations, ensure_ascii=False)
-        summary_json = json.dumps(r.summary, ensure_ascii=False) if r.summary else None
-
-        existing = await db.fetchone(
-            "SELECT id FROM extractions WHERE document_id = ?",
-            (r.document_id,),
-        )
-        if existing:
-            await db.execute(
-                """UPDATE extractions
-                   SET quotations = ?, summary = ?, updated_at = ?
-                   WHERE document_id = ?""",
-                (quotations_json, summary_json, now, r.document_id),
+    async with repo.db.transaction():
+        for r in successful_results:
+            await repo.upsert(
+                document_id=r.document_id,
+                quotations=r.quotations,
+                summary=r.summary,
             )
-        else:
-            await db.execute(
-                """INSERT INTO extractions (document_id, quotations, summary, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (r.document_id, quotations_json, summary_json, now, now),
-            )
-        saved += 1
+            saved += 1
 
     return saved
