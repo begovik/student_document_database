@@ -242,6 +242,9 @@ sudo -u harvester bash -c 'cd /opt/harvester && .venv/bin/harvester <коман�
 | `queries` | черга пошукових запитів |
 | `vacuum` | стиснення локальної SQLite |
 | `export` | експорт даних |
+| `extract run` | витяг цитат і сумаризацій з PDF-документів (викликає LLM) |
+| `curator prepare` | підготовка каталогу документів для теми |
+| `curator verify` | перевірка і виправлення каталогу |
 
 ## 10. Резервне копіювання
 
