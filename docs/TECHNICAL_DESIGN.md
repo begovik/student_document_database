@@ -1063,6 +1063,19 @@ CREATE TABLE settings (
     value      TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- ======================= ЕКСТРАКЦІЇ ===================
+-- Цитати та сумаризації, витягнуті з PDF-документів через LLM
+CREATE TABLE extractions (
+    id              INTEGER PRIMARY KEY,
+    document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    quotations      TEXT,                -- JSON: [{"page":3,"text":"...","type":"conclusion"}]
+    summary         TEXT,                -- JSON: {"page":1,"overview":"...","key_ideas":[...],...}
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    UNIQUE(document_id)
+);
+CREATE INDEX idx_extractions_doc ON extractions(document_id);
 ```
 
 ### 12.3. Віддалена PostgreSQL із локальним failover (архітектура)
@@ -1265,6 +1278,8 @@ real_sources_for_students/
 │   │   ├── pg_migrations/        # NNN_*.sql для PostgreSQL
 │   │   ├── migrations.py         # user_version, застосування міграцій
 │   │   ├── migrations/001_init.sql
+│   │   ├── migrations/002_text_sample.sql
+│   │   ├── migrations/003_extractions.sql
 │   │   └── repositories.py       # DocumentsRepo, SourcesRepo, TasksRepo, ...
 │   ├── net/
 │   │   ├── client.py             # httpx.AsyncClient: UA, таймаути, редірект-фільтр
@@ -1301,6 +1316,10 @@ real_sources_for_students/
 │   │   ├── taxonomy.py           # завантаження/валідація topics
 │   │   ├── udc.py                # парсинг УДК, маппінг префіксів
 │   │   └── classifier.py         # зважене голосування сигналів S1–S4
+│   ├── extract/
+│   │   ├── __init__.py
+│   │   ├── engine.py             # витяг цитат і сумаризацій (PDF→LLM→JSON)
+│   │   └── cli.py                # команда 'harvester extract' (розділ 16.1)
 │   └── export/
 │       └── exporter.py           # CSV/JSONL з фільтрами
 └── tests/
@@ -1331,6 +1350,7 @@ real_sources_for_students/
 | `structlog` | структуровані JSON-логи | MIT/Apache |
 | `typer` (або argparse) | CLI | MIT |
 | `python-dateutil` | дати OAI/метаданих | Apache |
+| `aiohttp` | HTTP-клієнт для Gemini/OpenRouter LLM-викликів | Apache-2.0 |
 | dev: `pytest`, `pytest-asyncio`, `respx`, `vcrpy`, `ruff` | тести/лінт | — |
 
 > **Примітка про PyMuPDF (AGPL).** Для некомерційного внутрішнього сервісу AGPL прийнятна (код проєкту відкритий). Якщо колись знадобиться пропрієтарне поширення — заміна на `pypdfium2` (Apache-2.0) ізольована в `pdfparse.py` за інтерфейсом. Це свідомо задокументоване рішення.
@@ -1354,8 +1374,55 @@ real_sources_for_students/
 | `harvester reclassify [--all]` | Перекласифікація після зміни таксономії |
 | `harvester backup [--out DIR]` / `vacuum` | Обслуговування БД |
 | `harvester doctor` | Самодіагностика: integrity БД, доступність каналів, конфіг, диск |
+| `harvester extract run [--topic T] [--topic-code C] [--limit N] [--batch B] [--dry-run] [--retry-failed]` | Витяг цитат і сумаризацій з PDF-документів (розділ 16.1) |
 
 Вивід людино-читабельний (таблиці); `--json` — машинний. Коди виходу: 0 ок, 1 помилка, 2 некоректні аргументи.
+
+### 16.1. Команда `extract` — витяг цитат і сумаризацій
+
+Команда `harvester extract` аналізує PDF-документи з бази даних за допомогою LLM
+(Gemini/OpenRouter) та витягує цитати й сумаризації.
+
+**Формат:**
+```
+harvester extract run [OPTIONS]
+
+--topic, -t       Фільтр по назві теми (часткова підстрока)
+--topic-code, -c  Фільтр по коду теми (trade, 076, econ, ...)
+--limit, -n       Максимальна кількість документів (дефолт: 30)
+--batch, -b       Кількість одночасних завдань (дефолт: 5)
+--dry-run, -d     Не зберігати результати, лише показати
+--retry-failed    Обробляти тільки документи з попередніми помилками
+--skip-extracted  Пропускати вже оброблені (дефолт: так)
+```
+
+**Потік виконання:**
+1. Вибірка документів з `documents` (status=verified) з урахуванням фільтрів
+2. Для кожного документа:
+   - Завантаження PDF за canonical_url
+   - Парсинг через PyMuPDF (повний текст)
+   - Виклик LLM (Gemini ключ 1→2→3, fallback на OpenRouter)
+3. LLM повертає JSON:
+   - `quotations`: `[{page, text, type}]` — type: conclusion|definition|fact|method|insight
+   - `summary`: `{page, overview, key_ideas[], methodology, findings, conclusions, authors_mentioned[]}`
+4. Збереження в таблицю `extractions` (upsert по document_id)
+5. Вивід статистики та результатів
+
+**Таблиця extractions (DDL):**
+```sql
+CREATE TABLE extractions (
+    id              INTEGER PRIMARY KEY,
+    document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    quotations      TEXT,     -- JSON-масив цитат
+    summary         TEXT,     -- JSON-об'єкт сумаризації
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    UNIQUE(document_id)
+);
+```
+
+**Синхронізація:** таблиця існує як у SQLite, так і у PostgreSQL;
+міграція 003 застосовується автоматично при старті.
 
 ---
 
