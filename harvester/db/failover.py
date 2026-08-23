@@ -135,6 +135,9 @@ class FailoverDatabase(Database):
             if sync_mirror:
                 # Якщо попередній запуск завершився під час аварії — спершу злити outbox.
                 try:
+                    pending = await self.pending_outbox_count()
+                    if pending:
+                        logger.info("db_startup_outbox_found", pending=pending)
                     drained = await self._drain_outbox()
                     if drained:
                         logger.info("db_startup_outbox_drained", ops=drained)
@@ -190,10 +193,16 @@ class FailoverDatabase(Database):
                     continue
 
             try:
-                await self._drain_outbox()
+                drained = await self._drain_outbox()
+                if drained:
+                    logger.info("db_restore_drain_progress", ops_drained=drained)
                 await self._try_finalize_switch()
             except Exception as e:
-                logger.error("db_restore_merge_error", error=str(e))
+                logger.error(
+                    "db_restore_merge_error",
+                    error=str(e)[:500],
+                    outbox_remaining=await self.pending_outbox_count(),
+                )
 
     async def _try_finalize_switch(self) -> None:
         """Фінальний прохід злиття під локом, потім — перемикання на remote.
@@ -206,13 +215,17 @@ class FailoverDatabase(Database):
                 return
             await self._drain_outbox()
             row = await self.local.fetchone(f"SELECT COUNT(*) AS c FROM {OUTBOX_TABLE}")
-            if row and row["c"] == 0:
-                ok = await self._ensure_local_mirror(force=True)
-                if not ok:
-                    return
-                self._mode = "remote"
-                self._start_mirror_loop()
-                logger.info("db_failover_restored")
+            remaining = row["c"] if row else 0
+            if remaining:
+                logger.info("db_switch_pending_outbox", remaining=remaining)
+                return
+            ok = await self._ensure_local_mirror(force=True)
+            if not ok:
+                logger.warning("db_switch_mirror_failed")
+                return
+            self._mode = "remote"
+            self._start_mirror_loop()
+            logger.info("db_failover_restored")
 
     # ----------------------------------------------------------------- routing
     async def execute(self, sql: str, params: tuple | None = None) -> Any:
@@ -605,17 +618,32 @@ class FailoverDatabase(Database):
 
         Рядок, що спричиняє порушення унікальності (дублікат у remote),
         вважається вже застосованим і пропускається (лог + продовження).
+        Рядки з порушенням FK-цілісності (сирітські посилання) також
+        пропускаються з попередженням — дані можуть бути відновлені
+        при наступному повному resync.
         """
         if self.remote is None:
             return 0
         async with self._drain_lock:
             total = 0
+            skipped = 0
+            batch_num = 0
             while True:
                 rows = await self.local.fetchall(
                     f"SELECT rid, op, sql, params FROM {OUTBOX_TABLE} ORDER BY rid LIMIT 1000"
                 )
                 if not rows:
                     break
+                batch_num += 1
+                if batch_num == 1:
+                    first_rid = rows[0]["rid"]
+                    last_rid = rows[-1]["rid"]
+                    logger.info(
+                        "db_outbox_drain_start",
+                        first_rid=first_rid,
+                        last_rid=last_rid,
+                        batch_size=len(rows),
+                    )
                 for row in rows:
                     params = json.loads(row["params"])
                     try:
@@ -625,14 +653,30 @@ class FailoverDatabase(Database):
                             logger.warning(
                                 "db_outbox_dup_skipped", rid=row["rid"], error=str(e)[:200]
                             )
+                        elif self._is_fk_violation(e):
+                            skipped += 1
+                            logger.warning(
+                                "db_outbox_fk_skipped",
+                                rid=row["rid"],
+                                op=row["op"],
+                                sql_preview=row["sql"][:120],
+                                error=str(e)[:300],
+                            )
                         else:
+                            logger.error(
+                                "db_outbox_replay_error",
+                                rid=row["rid"],
+                                op=row["op"],
+                                sql_preview=row["sql"][:120],
+                                error=str(e)[:500],
+                            )
                             raise
                     await self.local.execute(
                         f"DELETE FROM {OUTBOX_TABLE} WHERE rid = ?", (row["rid"],)
                     )
                     total += 1
-            if total:
-                logger.info("db_outbox_replayed", ops=total)
+            if total or skipped:
+                logger.info("db_outbox_replayed", ops=total, skipped_fk=skipped)
             return total
 
     @staticmethod
@@ -641,6 +685,17 @@ class FailoverDatabase(Database):
         if name in ("UniqueViolationError", "IntegrityError"):
             return True
         if _AsyncpgUniqueError is not None and isinstance(e, _AsyncpgUniqueError):
+            return True
+        return False
+
+    @staticmethod
+    def _is_fk_violation(e: Exception) -> bool:
+        """Визначає, чи є помилка порушенням FK-цілісності."""
+        msg = str(e).lower()
+        if "foreign key constraint" in msg or "violates foreign key" in msg:
+            return True
+        name = type(e).__name__
+        if name == "ForeignKeyViolationError":
             return True
         return False
 

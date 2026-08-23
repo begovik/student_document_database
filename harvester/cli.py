@@ -330,6 +330,94 @@ def db_status():
 
 
 @app.command()
+def db_size():
+    """Показати розмір баз даних (локальна SQLite + віддалена PostgreSQL)"""
+    from harvester.db.failover import build_database
+
+    async def _db_size():
+        settings = get_settings()
+        db = build_database(settings)
+        await db.initialize(sync_mirror=False)
+
+        try:
+            table = Table(title="Розмір баз даних")
+            table.add_column("Параметр", style="cyan")
+            table.add_column("Значення", style="green")
+
+            # Локальна SQLite
+            db_path = settings.db_path
+            if db_path.exists():
+                size_bytes = db_path.stat().st_size
+                if size_bytes >= 1024**3:
+                    size_str = f"{size_bytes / 1024**3:.2f} ГБ"
+                elif size_bytes >= 1024**2:
+                    size_str = f"{size_bytes / 1024**2:.1f} МБ"
+                else:
+                    size_str = f"{size_bytes / 1024:.1f} КБ"
+                table.add_row("Локальна SQLite", str(db_path))
+                table.add_row("  Розмір файлу", size_str)
+
+                # Розмір по таблицях
+                try:
+                    tables = [row[0] for row in await db.local.fetchall(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                    )]
+                    for tbl in sorted(tables):
+                        try:
+                            row = await db.local.fetchone(f"SELECT COUNT(*) AS c FROM {tbl}")
+                            count = row["c"] if row else 0
+                            if count > 0:
+                                table.add_row(f"  · {tbl}", f"{count:,} рядків")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            else:
+                table.add_row("Локальна SQLite", f"[dim]{db_path} (не знайдено)[/dim]")
+
+            # Віддалена PostgreSQL
+            if db.remote is not None and db.mode == "remote":
+                try:
+                    # Оцінка розміру через pg_database
+                    row = await db.remote.fetchone(
+                        "SELECT pg_database_size(current_database()) AS size_bytes"
+                    )
+                    if row and row["size_bytes"]:
+                        pg_bytes = row["size_bytes"]
+                        if pg_bytes >= 1024**3:
+                            pg_str = f"{pg_bytes / 1024**3:.2f} ГБ"
+                        elif pg_bytes >= 1024**2:
+                            pg_str = f"{pg_bytes / 1024**2:.1f} МБ"
+                        else:
+                            pg_str = f"{pg_bytes / 1024:.1f} КБ"
+                        table.add_row("Віддалена PostgreSQL", f"{settings.database.host}:{settings.database.port}/{settings.database.name}")
+                        table.add_row("  Розмір БД", pg_str)
+
+                    # Розмір по таблицях
+                    pg_tables = await db.remote.fetchall(
+                        "SELECT relname, n_live_tup FROM pg_stat_user_tables "
+                        "WHERE schemaname = 'public' ORDER BY n_live_tup DESC LIMIT 15"
+                    )
+                    for tbl_row in pg_tables:
+                        tbl_name = tbl_row["relname"]
+                        count = tbl_row["n_live_tup"]
+                        if count > 0:
+                            table.add_row(f"  · {tbl_name}", f"{count:,} рядків")
+                except Exception as e:
+                    table.add_row("Віддалена PostgreSQL", f"[yellow]помилка: {str(e)[:80]}[/yellow]")
+            elif db.remote is not None:
+                table.add_row("Віддалена PostgreSQL", "[dim]недоступна (local-режим)[/dim]")
+            else:
+                table.add_row("Віддалена PostgreSQL", "[dim]не налаштована[/dim]")
+
+            console.print(table)
+        finally:
+            await db.close()
+
+    asyncio.run(_db_size())
+
+
+@app.command()
 def db_resync():
     """Відновити локальне дзеркало SQLite з віддаленої PostgreSQL"""
     from harvester.db.failover import build_database

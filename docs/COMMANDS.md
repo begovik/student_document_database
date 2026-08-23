@@ -1,5 +1,15 @@
 # Список CLI-команд Harvester
 
+## Активація віртуального середовища
+
+```bash
+source /opt/harvester/venv/bin/activate
+```
+
+Після активації команди `harvester`, `python`, `pip` тощо використовують віртуальне середовище. Щоб вийти — `deactivate`.
+
+---
+
 ## 1. Основний CLI — `harvester`
 
 Запуск додатка: `harvester start`
