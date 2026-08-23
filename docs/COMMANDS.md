@@ -240,3 +240,69 @@ catalogs/
    ```bash
    python scripts/extract_from_catalog.py catalogs/catalog_YYYYMMDD_HHMMSS
    ```
+
+---
+
+## 8. Моніторинг хостингу (фонова робота)
+
+Команди для перевірки стану сервісу на VPS, де Harvester працює як systemd-сервіс.
+
+### Керування сервісом
+
+```bash
+# Статус
+sudo systemctl status harvester
+
+# Зупинити / запустити / перезапустити
+sudo systemctl stop harvester
+sudo systemctl start harvester
+sudo systemctl restart harvester
+
+# Live-логи
+sudo journalctl -u harvester -f
+
+# Логи за період
+sudo journalctl -u harvester --since "1 hour ago"
+
+# Тільки помилки
+sudo journalctl -u harvester -p err
+```
+
+### Стан БД
+
+```bash
+# Статус (режим, outbox, дзеркало)
+sudo -u harvester bash -c 'cd /opt/harvester && .venv/bin/harvester db-status'
+
+# Діагностика
+sudo -u harvester bash -c 'cd /opt/harvester && .venv/bin/harvester doctor'
+
+# Кількість в outbox (дані, що очікують злиття в PG)
+sudo -u harvester python3 -c "
+import sqlite3
+c = sqlite3.connect('/opt/harvester/data/harvester.db').cursor()
+c.execute('SELECT count(*) FROM failover_outbox')
+print(f'Outbox: {c.fetchone()[0]}')
+"
+
+# Кількість документів у PG
+PGPASSWORD=<пароль> psql -h <VPS_IP> -U harvester -d harvester \
+  -c "SELECT count(*) FROM documents;"
+
+# Перевірка FK-порушень (має бути 0)
+PGPASSWORD=<пароль> psql -h <VPS_IP> -U harvester -d harvester \
+  -c "SELECT count(*) FROM document_refs WHERE document_id NOT IN (SELECT id FROM documents);"
+```
+
+### Що означають показники
+
+| Показник | Норма | Що означає |
+|---|---|---|
+| `Активна БД: remote (PostgreSQL)` | ОК | З'єднання з PG працює |
+| `Активна БД: local (SQLite)` | ⚠️ | PG недоступна, працює в offline |
+| `Дзеркало: синхронно` | ОК | Дані збігаються |
+| `Дзеркало: розбіжність` | ⚠️ | Потрібен `db-resync` |
+| `Outbox: 0` | ОК | Усі дані злиті в PG |
+| `Outbox: >0` | ⚠️ | Дані очікують злиття (нормально при старті) |
+| `FK-порушення: 0` | ОК | Цілісність даних |
+| `FK-порушення: >0` | 🔴 | Потрібне втручання |

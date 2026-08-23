@@ -247,28 +247,6 @@ sudo -u harvester bash -c 'cd /opt/harvester && .venv/bin/harvester db-resync --
 sudo systemctl start harvester
 ```
 
-### Моніторинг (фонова робота)
-
-```bash
-# Тільки помилки
-sudo journalctl -u harvester -p err
-
-# Стан БД
-sudo -u harvester bash -c 'cd /opt/harvester && .venv/bin/harvester db-status'
-
-# Діагностика
-sudo -u harvester bash -c 'cd /opt/harvester && .venv/bin/harvester doctor'
-
-# Кількість в outbox (local SQLite — дані, що очікують злиття в PG)
-sudo -u harvester python3 -c "import sqlite3; c=sqlite3.connect('/opt/harvester/data/harvester.db').cursor(); c.execute('SELECT count(*) FROM failover_outbox'); print(f'Outbox: {c.fetchone()[0]}')"
-
-# Кількість документів у PG
-PGPASSWORD=<пароль> psql -h <VPS_IP> -U harvester -d harvester -c "SELECT count(*) FROM documents;"
-
-# Перевірка FK-порушень (має бути 0)
-PGPASSWORD=<пароль> psql -h <VPS_IP> -U harvester -d harvester -c "SELECT count(*) FROM document_refs WHERE document_id NOT IN (SELECT id FROM documents);"
-```
-
 ## 9. Експлуатаційні команди
 
 ```bash
