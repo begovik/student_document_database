@@ -223,6 +223,30 @@ sudo journalctl -u harvester -f
 У логах при старті мають зʼявитися рядки `db_mode_remote` та
 `db_local_resynced` (синхронізація при старті виконана).
 
+### Керування сервісом
+
+| Дія | Команда |
+|---|---|
+| Статус | `sudo systemctl status harvester` |
+| Зупинити | `sudo systemctl stop harvester` |
+| Запустити | `sudo systemctl start harvester` |
+| Перезапустити | `sudo systemctl restart harvester` |
+| Live-логи | `sudo journalctl -u harvester -f` |
+| Логи за період | `sudo journalctl -u harvester --since "1 hour ago"` |
+| Вимкнути автозапуск | `sudo systemctl disable harvester` |
+| Увімкнути автозапуск | `sudo systemctl enable harvester` |
+
+Сервіс налаштований на автоперезапуск (`Restart=always`, `RestartSec=10`).
+Після перезавантаження сервера сервіс запускається автоматично.
+
+Щоб зупинити harvester перед виконанням `db-resync`:
+
+```bash
+sudo systemctl stop harvester
+sudo -u harvester bash -c 'cd /opt/harvester && .venv/bin/harvester db-resync --config config.yaml'
+sudo systemctl start harvester
+```
+
 ## 9. Експлуатаційні команди
 
 ```bash
