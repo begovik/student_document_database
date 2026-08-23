@@ -83,6 +83,7 @@ async def call_llm_for_selection(
         last_error: Exception | None = None
         used_model = None
 
+        # Фаза 1: Gemini
         for model in models:
             for gemini_key in gemini_keys:
                 try:
@@ -130,6 +131,61 @@ async def call_llm_for_selection(
                     await client.close()
                     last_error = e
                     logger.warning("llm_selection_attempt_failed", model=model, key=gemini_key[:8] + "...", error=str(e)[:100])
+                    await asyncio.sleep(config.min_interval_s)
+
+        # Фаза 2: Gemma (ті самі ключі, gemma_models + стиснення)
+        from harvester.classify.llm import rephrase_for_gemma
+
+        gemma_models = config.gemma_models or ["gemma-4-31b-it", "gemma-4-26b-it"]
+        truncated_prompt = rephrase_for_gemma(prompt, config.gemma_max_chars)
+
+        for model in gemma_models:
+            for gemini_key in gemini_keys:
+                try:
+                    used_model = model
+                    client = aiohttp.ClientSession()
+                    url = (
+                        f"{config.gemini_base_url}/models/{model}:generateContent"
+                        f"?key={gemini_key}"
+                    )
+                    payload = {
+                        "contents": [
+                            {
+                                "parts": [
+                                    {"text": truncated_prompt},
+                                ]
+                            }
+                        ],
+                        "generationConfig": {
+                            "temperature": config.temperature,
+                            "maxOutputTokens": config.max_tokens,
+                        },
+                    }
+                    async with client:
+                        resp = await client.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=config.timeout_s))
+                        if resp.status != 200:
+                            body = await resp.text()
+                            raise RuntimeError(f"Gemma API error {resp.status}: {body[:300]}")
+
+                        data = await resp.json()
+                        text = ""
+                        for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+                            text += part.get("text", "")
+                        if not text:
+                            raise RuntimeError("Порожня відповідь від LLM")
+
+                        result = parse_selection_response(text)
+                        if result:
+                            await client.close()
+                            logger.info("selection_success_gemma", topic=topic, model=model, count=result.suggested_count, selected=len(result.selected_ids))
+                            return result
+                        else:
+                            raise RuntimeError("Не вдалося парсити відповідь LLM")
+
+                except Exception as e:
+                    await client.close()
+                    last_error = e
+                    logger.warning("gemma_selection_attempt_failed", model=model, key=gemini_key[:8] + "...", error=str(e)[:100])
                     await asyncio.sleep(config.min_interval_s)
 
         logger.error("selection_all_attempts_failed", topic=topic, error=str(last_error)[:200])

@@ -327,6 +327,25 @@ async def call_llm_for_extraction(text: str, title: str) -> dict[str, Any] | Non
         except Exception as e:
             logger.warning("gemini_try_failed", error=str(e))
 
+    # Спробувати Gemma (ті самі ключі, але gemma_models + стиснення тексту)
+    for api_key in [settings.gemini_api_key, settings.gemini_api_key_2, settings.gemini_api_key_3]:
+        if not api_key:
+            continue
+        for model in llm_config.gemma_models:
+            try:
+                from harvester.classify.llm import rephrase_for_gemma
+
+                truncated_content = f"НАЗВА СТАТТІ: {title}\n\nТЕКСТ СТАТТІ:\n{rephrase_for_gemma(text, llm_config.gemma_max_chars)}"
+                gemma_messages = [
+                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                    {"role": "user", "content": truncated_content},
+                ]
+                result = await call_gemini(api_key, llm_config, gemma_messages, model_override=model)
+                if result is not None:
+                    return result
+            except Exception as e:
+                logger.warning("gemma_try_failed", model=model, error=str(e))
+
     # Спробувати OpenRouter
     if settings.open_router_api_key:
         try:
@@ -340,11 +359,11 @@ async def call_llm_for_extraction(text: str, title: str) -> dict[str, Any] | Non
     return None
 
 
-async def call_gemini(api_key: str, config, messages: list[dict]) -> dict[str, Any] | None:
+async def call_gemini(api_key: str, config, messages: list[dict], model_override: str | None = None) -> dict[str, Any] | None:
     """Викликати Google Gemini API для витягу цитат і сумаризації."""
     import aiohttp
 
-    model = config.gemini_models[0] if config.gemini_models else "gemini-2.0-flash"
+    model = model_override or (config.gemini_models[0] if config.gemini_models else "gemini-2.0-flash")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
 
     payload = {

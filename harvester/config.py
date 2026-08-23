@@ -138,7 +138,9 @@ class DatabaseConfig(BaseModel):
 class LLMConfig(BaseModel):
     enabled: bool = True
     gemini_models: list[str] = Field(default=["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"])
+    gemma_models: list[str] = Field(default=["gemma-4-31b-it", "gemma-4-26b-it"])
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    gemma_max_chars: int = Field(default=15000, ge=5000, le=100000)
     openrouter_model: str = "google/gemini-2.5-flash"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     timeout_s: float = Field(default=60.0, gt=0)

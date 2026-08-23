@@ -138,6 +138,7 @@ async def call_llm_for_fix(
 """
 
     last_error = None
+    # Фаза 1: Gemini
     for model in models:
         for gemini_key in gemini_keys:
             try:
@@ -153,6 +154,41 @@ async def call_llm_for_fix(
                     resp = await client.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=config.timeout_s))
                     if resp.status != 200:
                         raise RuntimeError(f"Gemini error {resp.status}")
+
+                    data = await resp.json()
+                    text = ""
+                    for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+                        text += part.get("text", "")
+
+                    match = re.search(r'\{[^}]*"action"[^}]*\}', text)
+                    if match:
+                        return json.loads(match.group())
+                    break
+            except Exception as e:
+                last_error = e
+                await asyncio.sleep(config.min_interval_s)
+
+    # Фаза 2: Gemma (ті самі ключі, gemma_models + стиснення)
+    from harvester.classify.llm import rephrase_for_gemma
+
+    gemma_models = config.gemma_models or ["gemma-4-31b-it", "gemma-4-26b-it"]
+    truncated_prompt = rephrase_for_gemma(prompt, config.gemma_max_chars)
+
+    for model in gemma_models:
+        for gemini_key in gemini_keys:
+            try:
+                async with aiohttp.ClientSession() as client:
+                    url = f"{config.gemini_base_url}/models/{model}:generateContent?key={gemini_key}"
+                    payload = {
+                        "contents": [{"parts": [{"text": truncated_prompt}]}],
+                        "generationConfig": {
+                            "temperature": config.temperature,
+                            "maxOutputTokens": config.max_tokens,
+                        },
+                    }
+                    resp = await client.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=config.timeout_s))
+                    if resp.status != 200:
+                        raise RuntimeError(f"Gemma error {resp.status}")
 
                     data = await resp.json()
                     text = ""

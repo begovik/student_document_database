@@ -30,27 +30,86 @@ class LLMResponse:
     duration_ms: int
 
 
+def rephrase_for_gemma(text: str, max_chars: int = 15000) -> str:
+    """Стискає текст для Gemma (16k контекст) зі збереженням сенсу.
+
+    Алгоритм:
+    1. Якщо текст вже коротший за max_chars — повертає як є.
+    2. Шукає межі речень (; . ! ?) щоб обрізати на логічній межі.
+    3. Зберігає початок (перші 60%) та кінець (останні 30%) тексту,
+       пропускаючи середину — так зберігаються і вступ, і висновки.
+    4. Додає позначку про стиснення.
+    """
+    if len(text) <= max_chars:
+        return text
+
+    reserve = 100
+    budget = max_chars - reserve
+
+    sentences = []
+    current: list[str] = []
+    for char in text:
+        current.append(char)
+        if char in ".!?\n" or (char == ";" and len(current) > 20):
+            sentences.append("".join(current))
+            current = []
+    if current:
+        sentences.append("".join(current))
+
+    if len(sentences) <= 3:
+        return text[:max_chars] + "\n[обрізано]"
+
+    head_budget = int(budget * 0.6)
+    tail_budget = int(budget * 0.3)
+
+    head_parts: list[str] = []
+    head_len = 0
+    for s in sentences:
+        if head_len + len(s) > head_budget:
+            break
+        head_parts.append(s)
+        head_len += len(s)
+
+    tail_parts: list[str] = []
+    tail_len = 0
+    for s in reversed(sentences):
+        if tail_len + len(s) > tail_budget:
+            break
+        tail_parts.append(s)
+        tail_len += len(s)
+    tail_parts.reverse()
+
+    skipped = len(sentences) - len(head_parts) - len(tail_parts)
+    head_text = "".join(head_parts)
+    tail_text = "".join(tail_parts)
+
+    result = f"{head_text}\n[пропущено {skipped} речень з {len(sentences)} — стиснуто для Gemma]\n{tail_text}"
+    return result[:max_chars]
+
+
 class LLMClient:
     """
-    Gemini з ротацією моделей та ключів.
-    
-    Логіка:
-    - Дві моделі: gemini-3.1-flash-lite, gemini-3.5-flash-lite
-    - Три ключі: GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3
-    - Якщо модель недоступна > 2 хвилин → денний ліміт → наступна модель
-    - Якщо обидві моделі вичерпали → наступний ключ
-    - Якщо всі ключі та моделі вичерпали → AllLimitsExhausted
+    Двофазний LLM-клієнт з ротацією моделей та ключів.
+
+    Фаза 1 — Gemini (gemini-3.1-flash-lite, gemini-3.5-flash-lite) × 3 ключі:
+      - контекст 250k, але обмежені денні ліміти
+    Фаза 2 — Gemma 4 (gemma-4-31b-it, gemini-4-26b-it) × 3 ключі:
+      - величезні денні ліміти, але контекст 16k → текст перефразовується
+    Фолбек — OpenRouter (google/gemini-2.5-flash)
     """
 
     def __init__(self):
         self.settings = get_settings()
         self._models = self.settings.llm.gemini_models
+        self._gemma_models = self.settings.llm.gemma_models
         self._keys = self.settings.gemini_keys
         self._model_idx = 0
         self._key_idx = 0
         self._last_call = 0.0
         self._lock = asyncio.Lock()
         self._daily_limit_exhausted: set[tuple[int, int]] = set()
+        self._gemma_limit_exhausted: set[tuple[int, int]] = set()
+        self._phase = "gemini"
         self._initialized = False
 
     @property
@@ -60,7 +119,7 @@ class LLMClient:
         )
 
     async def initialize(self) -> None:
-        """Перевіряє першу модель при запуску, пропускає вичерпані."""
+        """Перевіряє моделі при запуску, пропускає вичерпані."""
         if self._initialized:
             return
 
@@ -69,17 +128,20 @@ class LLMClient:
         if not self._keys:
             return
 
+        # Фаза 1: Gemini
         for key_idx in range(len(self._keys)):
             for model_idx in range(len(self._models)):
                 key = self._keys[(self._key_idx + key_idx) % len(self._keys)]
                 model = self._models[(self._model_idx + model_idx) % len(self._models)]
-                
+
                 available = await self._check_model_available(key, model)
                 if available:
                     self._key_idx = (self._key_idx + key_idx) % len(self._keys)
                     self._model_idx = (self._model_idx + model_idx) % len(self._models)
+                    self._phase = "gemini"
                     logger.info(
                         "llm_initialized",
+                        phase="gemini",
                         key_idx=self._key_idx,
                         model=self._models[self._model_idx],
                     )
@@ -87,6 +149,37 @@ class LLMClient:
                 else:
                     logger.warning(
                         "llm_model_exhausted_at_startup",
+                        phase="gemini",
+                        key_idx=(self._key_idx + key_idx) % len(self._keys),
+                        model=model,
+                    )
+
+        # Фаза 2: Gemma — Gemini вичерпані, пробуємо Gemma
+        logger.info("gemini_all_exhausted_at_startup", event="gemma_phase_started")
+        self._phase = "gemma"
+        self._key_idx = 0
+        self._model_idx = 0
+
+        for key_idx in range(len(self._keys)):
+            for model_idx in range(len(self._gemma_models)):
+                key = self._keys[(self._key_idx + key_idx) % len(self._keys)]
+                model = self._gemma_models[(self._model_idx + model_idx) % len(self._gemma_models)]
+
+                available = await self._check_model_available(key, model)
+                if available:
+                    self._key_idx = (self._key_idx + key_idx) % len(self._keys)
+                    self._model_idx = (self._model_idx + model_idx) % len(self._gemma_models)
+                    logger.info(
+                        "llm_initialized",
+                        phase="gemma",
+                        key_idx=self._key_idx,
+                        model=self._gemma_models[self._model_idx],
+                    )
+                    return
+                else:
+                    logger.warning(
+                        "llm_model_exhausted_at_startup",
+                        phase="gemma",
                         key_idx=(self._key_idx + key_idx) % len(self._keys),
                         model=model,
                     )
@@ -131,64 +224,34 @@ class LLMClient:
             raise LLMUnavailable("Немає Gemini ключів")
 
         errors: list[str] = []
-        start_key_idx = self._key_idx
-        start_model_idx = self._model_idx
-        checked_all = False
 
-        while not checked_all:
-            key = self._keys[self._key_idx]
-            model = self._models[self._model_idx]
+        # === Фаза 1: Gemini (gemini_models × keys) ===
+        if self._phase == "gemini":
+            gemini_ok = await self._run_phase(
+                prompt, self._models, self._daily_limit_exhausted, "gemini", errors
+            )
+            if gemini_ok is not None:
+                return gemini_ok
 
-            if (self._key_idx, self._model_idx) in self._daily_limit_exhausted:
-                self._advance()
-                if self._is_back_to_start(start_key_idx, start_model_idx):
-                    checked_all = True
-                continue
+            # Gemini вичерпаний — переходимо до Gemma
+            logger.info("gemini_all_exhausted", event="gemma_phase_started")
+            self._phase = "gemma"
+            self._key_idx = 0
+            self._model_idx = 0
 
-            try:
-                result = await self._call_gemini_with_wait(prompt, key, model)
-                return result
-            except GeminiQuotaExceeded as e:
-                logger.warning(
-                    "gemini_quota_exceeded",
-                    key_idx=self._key_idx,
-                    model=model,
-                    waiting_s=self.settings.llm.daily_limit_wait_s,
-                )
-                await asyncio.sleep(self.settings.llm.daily_limit_wait_s)
-                
-                available = await self._check_model_available(key, model)
-                if not available:
-                    logger.warning(
-                        "gemini_daily_limit_confirmed",
-                        key_idx=self._key_idx,
-                        model=model,
-                    )
-                    self._daily_limit_exhausted.add((self._key_idx, self._model_idx))
-                    errors.append(f"{model}[key{self._key_idx}]: daily limit")
-                    self._advance()
-                    if self._is_back_to_start(start_key_idx, start_model_idx):
-                        checked_all = True
-                else:
-                    logger.info("gemini_quota_recovered", key_idx=self._key_idx, model=model)
-            except GeminiRateLimited as e:
-                logger.warning("gemini_rate_limited", key_idx=self._key_idx, model=model)
-                errors.append(str(e))
-                await asyncio.sleep(2)
-            except GeminiAuthError as e:
-                logger.error("gemini_auth_error", key_idx=self._key_idx, model=model, error=str(e))
-                errors.append(str(e))
-                self._daily_limit_exhausted.add((self._key_idx, self._model_idx))
-                self._advance()
-                if self._is_back_to_start(start_key_idx, start_model_idx):
-                    checked_all = True
-            except Exception as e:
-                logger.error("gemini_error", key_idx=self._key_idx, model=model, error=str(e))
-                errors.append(str(e))
-                self._advance()
-                if self._is_back_to_start(start_key_idx, start_model_idx):
-                    checked_all = True
+        # === Фаза 2: Gemma (gemma_models × keys) ===
+        if self._phase == "gemma":
+            gemma_prompt = rephrase_for_gemma(prompt, self.settings.llm.gemma_max_chars)
+            gemma_ok = await self._run_phase(
+                gemma_prompt, self._gemma_models, self._gemma_limit_exhausted, "gemma", errors
+            )
+            if gemma_ok is not None:
+                return gemma_ok
 
+            # Gemma теж вичерпаний — OpenRouter
+            logger.info("gemma_all_exhausted", event="openrouter_fallback")
+
+        # === Фолбек: OpenRouter ===
         if self.settings.open_router_api_key:
             try:
                 return await self._call_openrouter(prompt)
@@ -202,10 +265,81 @@ class LLMClient:
         logger.critical("llm_all_limits_exhausted")
         raise AllLimitsExhausted("; ".join(errors) or "усі ключі та моделі вичерпані")
 
-    def _advance(self) -> None:
-        """Переходить до наступної моделі або ключа."""
+    async def _run_phase(
+        self,
+        prompt: str,
+        models: list[str],
+        exhausted: set[tuple[int, int]],
+        phase: str,
+        errors: list[str],
+    ) -> LLMResponse | None:
+        """Запускає цикл ротації моделей×ключів для однієї фази."""
+        start_key_idx = self._key_idx
+        start_model_idx = self._model_idx
+        checked_all = False
+
+        while not checked_all:
+            key = self._keys[self._key_idx]
+            model = models[self._model_idx]
+
+            if (self._key_idx, self._model_idx) in exhausted:
+                self._advance_phase(models)
+                if self._is_back_to_start(start_key_idx, start_model_idx):
+                    checked_all = True
+                continue
+
+            try:
+                result = await self._call_gemini_with_wait(prompt, key, model, phase)
+                return result
+            except GeminiQuotaExceeded:
+                logger.warning(
+                    "gemini_quota_exceeded",
+                    phase=phase,
+                    key_idx=self._key_idx,
+                    model=model,
+                    waiting_s=self.settings.llm.daily_limit_wait_s,
+                )
+                await asyncio.sleep(self.settings.llm.daily_limit_wait_s)
+
+                available = await self._check_model_available(key, model)
+                if not available:
+                    logger.warning(
+                        "gemini_daily_limit_confirmed",
+                        phase=phase,
+                        key_idx=self._key_idx,
+                        model=model,
+                    )
+                    exhausted.add((self._key_idx, self._model_idx))
+                    errors.append(f"{model}[key{self._key_idx}]: daily limit")
+                    self._advance_phase(models)
+                    if self._is_back_to_start(start_key_idx, start_model_idx):
+                        checked_all = True
+                else:
+                    logger.info("gemini_quota_recovered", phase=phase, key_idx=self._key_idx, model=model)
+            except GeminiRateLimited as e:
+                logger.warning("gemini_rate_limited", phase=phase, key_idx=self._key_idx, model=model)
+                errors.append(str(e))
+                await asyncio.sleep(2)
+            except GeminiAuthError as e:
+                logger.error("gemini_auth_error", phase=phase, key_idx=self._key_idx, model=model, error=str(e))
+                errors.append(str(e))
+                exhausted.add((self._key_idx, self._model_idx))
+                self._advance_phase(models)
+                if self._is_back_to_start(start_key_idx, start_model_idx):
+                    checked_all = True
+            except Exception as e:
+                logger.error("gemini_error", phase=phase, key_idx=self._key_idx, model=model, error=str(e))
+                errors.append(str(e))
+                self._advance_phase(models)
+                if self._is_back_to_start(start_key_idx, start_model_idx):
+                    checked_all = True
+
+        return None
+
+    def _advance_phase(self, models: list[str]) -> None:
+        """Переходить до наступної моделі або ключа в межах фази."""
         self._model_idx += 1
-        if self._model_idx >= len(self._models):
+        if self._model_idx >= len(models):
             self._model_idx = 0
             self._key_idx += 1
             if self._key_idx >= len(self._keys):
@@ -223,8 +357,8 @@ class LLMClient:
                 await asyncio.sleep(wait)
             self._last_call = time.monotonic()
 
-    async def _call_gemini_with_wait(self, prompt: str, api_key: str, model: str) -> LLMResponse:
-        """Викликає Gemini з очікуванням при rate limit."""
+    async def _call_gemini_with_wait(self, prompt: str, api_key: str, model: str, phase: str = "gemini") -> LLMResponse:
+        """Викликає Gemini/Gemma з очікуванням при rate limit."""
         cfg = self.settings.llm
         url = f"{cfg.gemini_base_url}/models/{model}:generateContent"
         started = time.monotonic()
@@ -251,9 +385,9 @@ class LLMClient:
             wait_time = time.monotonic() - wait_start
             if wait_time < cfg.daily_limit_wait_s:
                 remaining = cfg.daily_limit_wait_s - wait_time
-                logger.info("gemini_rate_limited_waiting", wait_s=remaining)
+                logger.info("gemini_rate_limited_waiting", phase=phase, wait_s=remaining)
                 await asyncio.sleep(remaining)
-                return await self._call_gemini_with_wait(prompt, api_key, model)
+                return await self._call_gemini_with_wait(prompt, api_key, model, phase)
             raise GeminiRateLimited(f"429: {resp.text[:200]}")
         if resp.status_code in (401, 403):
             raise GeminiAuthError(f"{resp.status_code}: {resp.text[:200]}")
@@ -265,10 +399,11 @@ class LLMClient:
         except (KeyError, IndexError, TypeError) as e:
             raise LLMUnavailable(f"несподівана відповідь Gemini: {e}") from e
 
-        logger.debug(
-            "llm_gemini_ok", model=model, duration_ms=duration_ms, chars=len(text)
+        log_fn = logger.debug if phase == "gemini" else logger.info
+        log_fn(
+            f"llm_{phase}_ok", model=model, duration_ms=duration_ms, chars=len(text)
         )
-        return LLMResponse(text=text, provider="gemini", model=model, duration_ms=duration_ms)
+        return LLMResponse(text=text, provider=phase, model=model, duration_ms=duration_ms)
 
     async def _call_openrouter(self, prompt: str) -> LLMResponse:
         cfg = self.settings.llm
