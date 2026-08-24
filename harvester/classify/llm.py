@@ -249,17 +249,17 @@ class LLMClient:
                 return gemma_ok
 
             # Gemma теж вичерпаний — OpenRouter
-            logger.info("gemma_all_exhausted", event="openrouter_fallback")
+            logger.info("gemma_all_exhausted", next="openrouter_fallback")
 
         # === Фолбек: OpenRouter ===
         if self.settings.open_router_api_key:
             try:
                 return await self._call_openrouter(prompt)
             except OpenRouterPaymentRequired as e:
-                logger.error("openrouter_payment_required", error=str(e))
+                logger.error("openrouter_payment_required", error_msg=str(e))
                 errors.append(str(e))
             except Exception as e:
-                logger.error("openrouter_error", error=str(e))
+                logger.error("openrouter_error", error_msg=str(e))
                 errors.append(str(e))
 
         logger.critical("llm_all_limits_exhausted")
@@ -321,14 +321,14 @@ class LLMClient:
                 errors.append(str(e))
                 await asyncio.sleep(2)
             except GeminiAuthError as e:
-                logger.error("gemini_auth_error", phase=phase, key_idx=self._key_idx, model=model, error=str(e))
+                logger.error("gemini_auth_error", phase=phase, key_idx=self._key_idx, model=model, error_msg=str(e))
                 errors.append(str(e))
                 exhausted.add((self._key_idx, self._model_idx))
                 self._advance_phase(models)
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
             except Exception as e:
-                logger.error("gemini_error", phase=phase, key_idx=self._key_idx, model=model, error=str(e))
+                logger.error("gemini_error", phase=phase, key_idx=self._key_idx, model=model, error_msg=str(e))
                 errors.append(str(e))
                 self._advance_phase(models)
                 if self._is_back_to_start(start_key_idx, start_model_idx):

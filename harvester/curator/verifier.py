@@ -309,7 +309,7 @@ async def verify_catalog(
         logger.error("catalog_not_found", path=catalog_json_path)
         return None
     except json.JSONDecodeError as e:
-        logger.error("catalog_invalid_json", path=catalog_json_path, error=str(e)[:100])
+        logger.error("catalog_invalid_json", path=catalog_json_path, error_msg=str(e)[:100])
         return None
 
     settings = get_settings()

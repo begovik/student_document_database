@@ -55,7 +55,7 @@ async def _prepare_cli(topic: str, limit: int | None, output: str, dry_run: bool
         if dry_run:
             print("📝 Dry-run: результат не збережено")
     except Exception as e:
-        logger.error("curator_prepare_failed", error=str(e)[:200])
+        logger.error("curator_prepare_failed", error_msg=str(e)[:200])
         print(f"❌ Помилка: {e}")
         raise typer.Exit(1)
 
@@ -92,6 +92,6 @@ async def _verify_cli(catalog: str, dry_run: bool):
         if dry_run:
             print("📝 Dry-run: результат не збережено")
     except Exception as e:
-        logger.error("curator_verify_failed", error=str(e)[:200])
+        logger.error("curator_verify_failed", error_msg=str(e)[:200])
         print(f"❌ Помилка: {e}")
         raise typer.Exit(1)

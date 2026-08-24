@@ -1,3 +1,6 @@
+import re
+from pathlib import Path
+
 import structlog
 
 from harvester.db.connection import Database
@@ -78,4 +81,103 @@ async def seed_queries(db: Database) -> int:
                 inserted += 1
 
     logger.info("queries_seeded", inserted=inserted, topics=len(TOPICS))
+    return inserted
+
+
+DISCIPLINE_CATALOG = Path(__file__).resolve().parents[2] / "docs" / "discipline_catalog.md"
+
+CATEGORY_CODES: dict[str, str] = {
+    "мистецтво": "art_media",
+    "мови": "philology",
+    "філософія": "soc_phil",
+    "педагогіка": "education",
+    "соціологія": "sociology",
+    "медицина": "med_bio_health",
+    "it": "it_tech",
+    "економіка": "econ_business",
+    "менеджмент": "mgmt_marketing",
+    "логістика": "logistics",
+    "готельно": "hospitality_tourism",
+}
+
+_DISCIPLINE_RE = re.compile(r"^\d+\.\s+(.+?)\s*$")
+
+
+def _category_code(header: str) -> str:
+    low = header.lower()
+    for key, code in CATEGORY_CODES.items():
+        if key in low:
+            return code
+    slug = re.sub(r"[^a-z0-9]+", "-", low).strip("-")[:40] or "misc"
+    return f"cat_{slug}"
+
+
+def _is_mostly_ascii(name: str) -> bool:
+    letters = [c for c in name if c.isalpha()]
+    if not letters:
+        return False
+    return sum(1 for c in letters if c.isascii()) / len(letters) >= 0.8
+
+
+def parse_discipline_catalog(path: Path = DISCIPLINE_CATALOG) -> list[tuple[str, str]]:
+    """Розібрати docs/discipline_catalog.md на пари (код_категорії, назва_дисципліни)."""
+    if not path.exists():
+        logger.warning("discipline_catalog_missing", path=str(path))
+        return []
+
+    result: list[tuple[str, str]] = []
+    category_code = "misc"
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line.startswith("## "):
+            category_code = _category_code(line[3:])
+            continue
+        match = _DISCIPLINE_RE.match(line)
+        if match:
+            name = re.sub(r"\s+", " ", match.group(1)).strip()
+            if name:
+                result.append((category_code, name))
+
+    logger.info("discipline_catalog_parsed", disciplines=len(result), path=str(path))
+    return result
+
+
+async def seed_discipline_queries(db: Database) -> int:
+    """Додати до search_queries запити за каталогом дисциплін (ідемпотентно).
+
+    Викликається при кожному старті сервісу: нові дисципліни в md-каталозі
+    породжують нові пошукові запити, наявні не дублюються.
+    """
+    repo = SearchQueriesRepository(db)
+    disciplines = parse_discipline_catalog()
+    if not disciplines:
+        return 0
+
+    inserted = 0
+    seen: set[str] = set()
+    for category_code, name in disciplines:
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        for template in TEMPLATES_UK:
+            qid = await repo.insert_if_new(
+                template.format(topic=name),
+                region="ua-uk",
+                topic_hint=category_code,
+            )
+            if qid:
+                inserted += 1
+        if _is_mostly_ascii(name):
+            for template in TEMPLATES_EN:
+                qid = await repo.insert_if_new(
+                    template.format(topic=name),
+                    region="us-en",
+                    topic_hint=category_code,
+                )
+                if qid:
+                    inserted += 1
+
+    logger.info(
+        "discipline_queries_seeded", disciplines=len(seen), inserted=inserted
+    )
     return inserted

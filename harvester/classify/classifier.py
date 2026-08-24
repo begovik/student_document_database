@@ -83,9 +83,9 @@ class Classifier:
             except AllLimitsExhausted:
                 raise
             except LLMUnavailable as e:
-                logger.warning("llm_unavailable_fallback_rules", doc_id=doc.get("id"), error=str(e))
+                logger.warning("llm_unavailable_fallback_rules", doc_id=doc.get("id"), error_msg=str(e))
             except Exception as e:
-                logger.error("llm_classify_error", doc_id=doc.get("id"), error=str(e))
+                logger.error("llm_classify_error", doc_id=doc.get("id"), error_msg=str(e))
 
         total = sum(scores.values())
         min_score = self.settings.classify.min_score

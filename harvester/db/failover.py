@@ -92,6 +92,11 @@ class FailoverDatabase(Database):
         self._tx_buf: list[tuple[Any, Any, Any, Any]] | None = None
         self.db_path = self.cfg.local_db_path
 
+    @property
+    def strict_remote(self) -> bool:
+        """Remote-only режим: без дзеркала та без failover на локальну БД."""
+        return self.cfg.mode == "remote"
+
     # ------------------------------------------------------------------ setup
     async def initialize(self, sync_mirror: bool = True) -> None:
         """Ініціалізує БД та, за замовчуванням, синхронізує дзеркало.
@@ -129,10 +134,16 @@ class FailoverDatabase(Database):
 
         self._remote_ever_ok = remote_ok
 
+        if self.strict_remote and not remote_ok:
+            raise RuntimeError(
+                f"mode=remote: віддалена БД недоступна ({self.cfg.host}); "
+                "локальний fallback вимкнено"
+            )
+
         if remote_ok:
             self._mode = "remote"
-            logger.info("db_mode_remote", host=self.cfg.host or "")
-            if sync_mirror:
+            logger.info("db_mode_remote", host=self.cfg.host or "", strict=self.strict_remote)
+            if sync_mirror and not self.strict_remote:
                 # Якщо попередній запуск завершився під час аварії — спершу злити outbox.
                 try:
                     pending = await self.pending_outbox_count()
@@ -248,6 +259,8 @@ class FailoverDatabase(Database):
                 try:
                     return await self._remote_retry("fetchone", sql, params)
                 except RemoteUnavailable:
+                    if self.strict_remote:
+                        raise
                     await self._downgrade()
             return await self.local.fetchone(sql, params)
 
@@ -259,6 +272,8 @@ class FailoverDatabase(Database):
                 try:
                     return await self._remote_retry("fetchall", sql, params)
                 except RemoteUnavailable:
+                    if self.strict_remote:
+                        raise
                     await self._downgrade()
             return await self.local.fetchall(sql, params)
 
@@ -330,6 +345,11 @@ class FailoverDatabase(Database):
                 try:
                     result = await self._remote_retry(op, sql, params)
                 except RemoteUnavailable:
+                    if self.strict_remote:
+                        logger.critical(
+                            "db_remote_unavailable_strict", host=self.cfg.host or "", op=op
+                        )
+                        raise
                     await self._downgrade()
                 else:
                     lid = None
@@ -337,10 +357,11 @@ class FailoverDatabase(Database):
                         lid = result if isinstance(result, int) else None
                     else:
                         lid = getattr(result, "lastrowid", None)
-                    if self._tx_buf is not None:
-                        self._tx_buf.append((op, sql, params, lid))
-                    else:
-                        await self._mirror_local(op, sql, params, lid=lid)
+                    if not self.strict_remote:
+                        if self._tx_buf is not None:
+                            self._tx_buf.append((op, sql, params, lid))
+                        else:
+                            await self._mirror_local(op, sql, params, lid=lid)
                     return result
 
             # Local-mode (або щойно перемкнено після невдачі remote).
@@ -535,6 +556,9 @@ class FailoverDatabase(Database):
             try:
                 return await self._exec_on(self.remote, op, sql, params)
             except Exception as e:
+                # Порушення констрейнтів не зникнуть від повторів — кидаємо одразу.
+                if self._is_unique_violation(e) or self._is_fk_violation(e):
+                    raise
                 last_err = e
                 logger.warning(
                     "db_remote_retry",
@@ -548,6 +572,9 @@ class FailoverDatabase(Database):
 
     async def _downgrade(self) -> None:
         if self._mode == "remote":
+            if self.strict_remote:
+                logger.critical("db_remote_unavailable_strict", host=self.cfg.host or "")
+                return
             self._mode = "local"
             self._cancel_mirror_loop()
             logger.critical("db_failover_started", host=self.cfg.host or "")

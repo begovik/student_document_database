@@ -130,7 +130,7 @@ async def call_llm_for_selection(
                 except Exception as e:
                     await client.close()
                     last_error = e
-                    logger.warning("llm_selection_attempt_failed", model=model, key=gemini_key[:8] + "...", error=str(e)[:100])
+                    logger.warning("llm_selection_attempt_failed", model=model, key=gemini_key[:8] + "...", error_msg=str(e)[:100])
                     await asyncio.sleep(config.min_interval_s)
 
         # Фаза 2: Gemma (ті самі ключі, gemma_models + стиснення)
@@ -185,7 +185,7 @@ async def call_llm_for_selection(
                 except Exception as e:
                     await client.close()
                     last_error = e
-                    logger.warning("gemma_selection_attempt_failed", model=model, key=gemini_key[:8] + "...", error=str(e)[:100])
+                    logger.warning("gemma_selection_attempt_failed", model=model, key=gemini_key[:8] + "...", error_msg=str(e)[:100])
                     await asyncio.sleep(config.min_interval_s)
 
         logger.error("selection_all_attempts_failed", topic=topic, error=str(last_error)[:200])
@@ -193,7 +193,7 @@ async def call_llm_for_selection(
 
     except Exception as e:
         last_error = e
-        logger.error("selection_unexpected_error", topic=topic, error=str(e)[:200])
+        logger.error("selection_unexpected_error", topic=topic, error_msg=str(e)[:200])
         return None
 
 

@@ -284,7 +284,7 @@ async def process_document(job: ExtractionJob) -> ExtractionResult:
         )
 
     except Exception as e:
-        logger.error("extract_error", document_id=job.document_id, error=str(e))
+        logger.error("extract_error", document_id=job.document_id, error_msg=str(e))
         if tmp_pdf and tmp_pdf.exists():
             tmp_pdf.unlink()
         return ExtractionResult(
@@ -325,7 +325,7 @@ async def call_llm_for_extraction(text: str, title: str) -> dict[str, Any] | Non
             if result is not None:
                 return result
         except Exception as e:
-            logger.warning("gemini_try_failed", error=str(e))
+            logger.warning("gemini_try_failed", error_msg=str(e))
 
     # Спробувати Gemma (ті самі ключі, але gemma_models + стиснення тексту)
     for api_key in [settings.gemini_api_key, settings.gemini_api_key_2, settings.gemini_api_key_3]:
@@ -344,7 +344,7 @@ async def call_llm_for_extraction(text: str, title: str) -> dict[str, Any] | Non
                 if result is not None:
                     return result
             except Exception as e:
-                logger.warning("gemma_try_failed", model=model, error=str(e))
+                logger.warning("gemma_try_failed", model=model, error_msg=str(e))
 
     # Спробувати OpenRouter
     if settings.open_router_api_key:
@@ -353,7 +353,7 @@ async def call_llm_for_extraction(text: str, title: str) -> dict[str, Any] | Non
             if result is not None:
                 return result
         except Exception as e:
-            logger.warning("openrouter_try_failed", error=str(e))
+            logger.warning("openrouter_try_failed", error_msg=str(e))
 
     logger.error("llm_all_retries_failed")
     return None
@@ -408,7 +408,7 @@ async def call_gemini(api_key: str, config, messages: list[dict], model_override
         logger.warning("llm_response_invalid_format", response=content_text[:200])
         return None
     except (KeyError, IndexError, json.JSONDecodeError) as e:
-        logger.warning("llm_response_parse_error", error=str(e), response=str(data)[:500])
+        logger.warning("llm_response_parse_error", error_msg=str(e), response=str(data)[:500])
         return None
 
 
@@ -454,5 +454,5 @@ async def call_openrouter(api_key: str, config, messages: list[dict]) -> dict[st
         logger.warning("llm_response_invalid_format", response=content_text[:200])
         return None
     except (KeyError, IndexError, json.JSONDecodeError) as e:
-        logger.warning("llm_response_parse_error", error=str(e), response=str(data)[:500])
+        logger.warning("llm_response_parse_error", error_msg=str(e), response=str(data)[:500])
         return None

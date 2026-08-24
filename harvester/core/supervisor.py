@@ -56,14 +56,15 @@ class Supervisor:
     async def _bootstrap(self) -> None:
         """Початкове наповнення: теми, пошукові запити, OpenAlex-ітератори."""
         from harvester.classify.taxonomy import seed_topics
-        from harvester.discovery.querygen import seed_queries
         from harvester.discovery.openalex import create_openalex_iterators
+        from harvester.discovery.querygen import seed_discipline_queries, seed_queries
         from harvester.net.blacklist import BlacklistService, seed_blacklist
 
         BlacklistService.get().set_db(self.db)
         n_blacklist = await seed_blacklist(self.db)
         n_topics = await seed_topics(self.db)
         n_queries = await seed_queries(self.db)
+        n_discipline_queries = await seed_discipline_queries(self.db)
 
         pending_search = await self.scheduler.pending_count("search")
         if pending_search == 0:
@@ -92,6 +93,7 @@ class Supervisor:
             "bootstrap_done",
             topics_seeded=n_topics,
             queries_seeded=n_queries,
+            discipline_queries_seeded=n_discipline_queries,
             blacklist_seeded=n_blacklist,
             pending_search=pending_search,
             pending_api_iter=pending_oai,

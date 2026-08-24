@@ -2,7 +2,7 @@ contact:
   email: "you@example.org"
 
 database:
-  mode: "auto"
+  mode: "remote"
   host: "89.167.68.48"
   port: 5432
   name: "harvester"
