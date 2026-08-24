@@ -316,3 +316,79 @@ PGPASSWORD=<пароль> psql -h <VPS_IP> -U harvester -d harvester \
 | `Outbox: >0` | ⚠️ | Дані очікують злиття (нормально при старті) |
 | `FK-порушення: 0` | ОК | Цілісність даних |
 | `FK-порушення: >0` | 🔴 | Потрібне втручання |
+
+---
+
+## 9. Сповіщення на пошту
+
+Harvester автоматично надсилає email-сповіщення при помилках LLM-класифікації.
+
+### Як працює
+
+1. **Тригери** — сповіщення відправляються при:
+   - Помилці автентифікації Gemini (невалідний API-ключ)
+   - Помилці Gemini API (quota, rate limit, інші)
+   - Помилці OpenRouter (payment required, API errors)
+   - Вичерпанні всіх LLM-провайдерів (Gemini → Gemma → OpenRouter)
+
+2. **Rate limiting** — мінімум 5 хвилин між однаковими сповіщеннями (щоб не спамити)
+
+3. **Async відправка** — SMTP-з'єднання в окремому потоці, не блокує основну роботу
+
+### Налаштування
+
+Сповіщення автоматично увімкнюються коли в `.env` є:
+
+```env
+USER_EMAIL=your@gmail.com
+HARVESTER_SMTP_PASSWORD=xxxx-xxxx-xxxx-xxxx
+```
+
+**Важливо**: Для Gmail потрібен **App Password** (не звичайний пароль):
+1. Google Account → Security → 2-Step Verification → ON
+2. https://myaccount.google.com/apppasswords
+3. App: Mail → Device: Other → "Harvester" → Generate
+4. Вставити 16-значний пароль в `.env` без пробілів
+
+### Конфігурація (config.yaml)
+
+```yaml
+notify:
+  enabled: true
+  smtp_host: smtp.gmail.com
+  smtp_port: 587
+  smtp_starttls: true
+  smtp_user: your@gmail.com
+  smtp_password: ""  # береться з .env
+  from_email: your@gmail.com
+  to_email: your@gmail.com
+```
+
+### Тестування
+
+```bash
+# Тест відправки
+venv/bin/python -c "
+import asyncio
+from harvester.core.notify import send_notification
+asyncio.run(send_notification('Тест', 'Тіло листа', key='test'))
+"
+```
+
+### Приклад листа
+
+```
+Тема: [Harvester] LLM помилка: gemini/gemini-3.1-flash-lite
+
+Помилка LLM-класифікації в Harvester:
+
+Провайдер: gemini
+Модель: gemini-3.1-flash-lite
+Документ ID: 12345
+Помилка: 401 Unauthorized
+
+Час: 2026-08-24T19:15:00
+
+---
+Harvester автоматичне сповіщення
+```
