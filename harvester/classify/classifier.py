@@ -86,6 +86,12 @@ class Classifier:
                 logger.warning("llm_unavailable_fallback_rules", doc_id=doc.get("id"), error_msg=str(e))
             except Exception as e:
                 logger.error("llm_classify_error", doc_id=doc.get("id"), error_msg=str(e))
+                # Сповіщення на пошту про помилку LLM-класифікації
+                try:
+                    from harvester.core.notify import notify_llm_failure
+                    await notify_llm_failure("classify", "unknown", str(e), doc_id=doc.get("id"))
+                except Exception:
+                    pass
 
         total = sum(scores.values())
         min_score = self.settings.classify.min_score

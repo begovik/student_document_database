@@ -258,11 +258,29 @@ class LLMClient:
             except OpenRouterPaymentRequired as e:
                 logger.error("openrouter_payment_required", error_msg=str(e))
                 errors.append(str(e))
+                # Сповіщення на пошту про помилку OpenRouter
+                try:
+                    from harvester.core.notify import notify_llm_failure
+                    await notify_llm_failure("openrouter", self.settings.llm.openrouter_model, f"Payment required: {e}")
+                except Exception:
+                    pass
             except Exception as e:
                 logger.error("openrouter_error", error_msg=str(e))
                 errors.append(str(e))
+                # Сповіщення на пошту про помилку OpenRouter
+                try:
+                    from harvester.core.notify import notify_llm_failure
+                    await notify_llm_failure("openrouter", self.settings.llm.openrouter_model, str(e))
+                except Exception:
+                    pass
 
         logger.critical("llm_all_limits_exhausted")
+        # Сповіщення на пошту про вичерпання всіх LLM
+        try:
+            from harvester.core.notify import notify_llm_all_exhausted
+            await notify_llm_all_exhausted(errors)
+        except Exception:
+            pass  # Не блокуємо основний флоу
         raise AllLimitsExhausted("; ".join(errors) or "усі ключі та моделі вичерпані")
 
     async def _run_phase(
@@ -324,12 +342,24 @@ class LLMClient:
                 logger.error("gemini_auth_error", phase=phase, key_idx=self._key_idx, model=model, error_msg=str(e))
                 errors.append(str(e))
                 exhausted.add((self._key_idx, self._model_idx))
+                # Сповіщення на пошту про помилку автентифікації
+                try:
+                    from harvester.core.notify import notify_llm_failure
+                    await notify_llm_failure("gemini", model, f"Auth error: {e}")
+                except Exception:
+                    pass
                 self._advance_phase(models)
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
             except Exception as e:
                 logger.error("gemini_error", phase=phase, key_idx=self._key_idx, model=model, error_msg=str(e))
                 errors.append(str(e))
+                # Сповіщення на пошту про помилку Gemini
+                try:
+                    from harvester.core.notify import notify_llm_failure
+                    await notify_llm_failure("gemini", model, str(e))
+                except Exception:
+                    pass
                 self._advance_phase(models)
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True

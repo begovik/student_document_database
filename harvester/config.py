@@ -152,6 +152,18 @@ class LLMConfig(BaseModel):
     max_pages_for_extraction: int = Field(default=100, ge=10, le=1000)
 
 
+class NotifyConfig(BaseModel):
+    """Конфігурація сповіщень на пошту."""
+    enabled: bool = False
+    smtp_host: str = ""
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_starttls: bool = True
+    smtp_user: str = ""
+    smtp_password: str = ""
+    from_email: str = ""
+    to_email: str = ""
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="HARVESTER_",
@@ -176,6 +188,7 @@ class Settings(BaseSettings):
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    notify: NotifyConfig = Field(default_factory=NotifyConfig)
 
     s2_api_key: Annotated[str | None, Field(default=None)] = None
     core_api_key: Annotated[str | None, Field(default=None)] = None
@@ -185,6 +198,8 @@ class Settings(BaseSettings):
     open_router_api_key: Annotated[str | None, Field(default=None, validation_alias="OPEN_ROUTER_API_KEY")] = None
     pg_user: Annotated[str | None, Field(default=None, validation_alias=AliasChoices("HARVESTER_PG_USER", "PG_USER"))] = None
     pg_password: Annotated[str | None, Field(default=None, validation_alias=AliasChoices("HARVESTER_PG_PASSWORD", "PG_PASS"))] = None
+    user_email: Annotated[str | None, Field(default=None, validation_alias="USER_EMAIL")] = None
+    smtp_password: Annotated[str | None, Field(default=None, validation_alias="HARVESTER_SMTP_PASSWORD")] = None
 
     @property
     def gemini_keys(self) -> list[str]:
@@ -221,7 +236,21 @@ def load_config(config_path: str | Path | None = None) -> Settings:
         with open(config_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
 
-    return Settings(**data)
+    settings = Settings(**data)
+
+    # Заповнити NotifyConfig з user_email та smtp_password
+    if settings.user_email:
+        settings.notify.smtp_user = settings.notify.smtp_user or settings.user_email
+        settings.notify.from_email = settings.notify.from_email or settings.user_email
+        settings.notify.to_email = settings.notify.to_email or settings.user_email
+        # Автоматично увімкнути сповіщення якщо є email та SMTP пароль
+        if settings.smtp_password and not settings.notify.smtp_host:
+            settings.notify.smtp_host = "smtp.gmail.com"
+            settings.notify.enabled = True
+    if settings.smtp_password:
+        settings.notify.smtp_password = settings.smtp_password
+
+    return settings
 
 
 _settings: Settings | None = None
