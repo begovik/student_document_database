@@ -24,18 +24,19 @@ logger = structlog.get_logger()
 
 # Мінімальні вимоги до документа для відбору
 REQUIRED_STATUS = "verified"
+MIN_PAGE_COUNT = 3  # Відсіюємо 1-2 сторінкові фрагменти/анотації
 REQUIRED_FIELDS = {
     "title": "Назва має бути непорожньою",
     "authors": "Автори мають бути задані",
     "language": "Мова має бути визначена",
     "canonical_url": "Має бути визначений canonical_url",
-    "page_count": "Має бути визначена кількість сторінок",
+    "page_count": "Має бути визначена кількість сторінок (не менше 3)",
     "has_text_layer": "Має бути текстовий шар",
 }
 
 
 def is_document_complete(doc: dict[str, Any]) -> tuple[bool, str | None]:
-    """Перевірити, чи документ має повний набір даних."""
+    """Перевірити, чи документ має повний набір даних і є повноцінним цілісним джерелом."""
     if doc.get("status") != REQUIRED_STATUS:
         return False, f"status={doc.get('status')} (потрібно {REQUIRED_STATUS})"
 
@@ -44,9 +45,9 @@ def is_document_complete(doc: dict[str, Any]) -> tuple[bool, str | None]:
         if field == "has_text_layer":
             if value is None or int(value) != 1:
                 return False, f"{field}={value}"
-        elif field in ("page_count",):
-            if not value or int(value) <= 0:
-                return False, f"{field}={value}"
+        elif field == "page_count":
+            if not value or int(value) < MIN_PAGE_COUNT:
+                return False, f"page_count={value} (мінімум {MIN_PAGE_COUNT} сторінки для цілісного джерела)"
         elif value is None or value == "" or value == "None":
             return False, reason
 
@@ -158,7 +159,7 @@ async def get_candidates_for_topic(
               AND d.authors IS NOT NULL
               AND d.language IS NOT NULL
               AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
-              AND d.page_count > 0
+              AND d.page_count >= 3
               AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
               AND d.id IN (
                   SELECT dt2.document_id
@@ -189,7 +190,7 @@ async def get_candidates_for_topic(
               AND d.authors IS NOT NULL
               AND d.language IS NOT NULL
               AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
-              AND d.page_count > 0
+              AND d.page_count >= 3
               AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
               AND (
                   """ + " OR ".join(f"d.udc LIKE '{p}%'" for p in udc_prefixes) + """
@@ -217,7 +218,7 @@ async def get_candidates_for_topic(
               AND d.authors IS NOT NULL
               AND d.language IS NOT NULL
               AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
-              AND d.page_count > 0
+              AND d.page_count >= 3
               AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
               AND (d.extra IS NULL OR d.extra NOT LIKE '%"curator"%')
             ORDER BY dt.score DESC NULLS LAST, d.year DESC NULLS LAST

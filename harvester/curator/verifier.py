@@ -61,7 +61,7 @@ async def find_replacement_candidates(
           AND d.authors IS NOT NULL
           AND d.language IS NOT NULL
           AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
-          AND d.page_count > 0
+          AND d.page_count >= 3
           AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
           AND ({not_in_condition})
           AND ({topic_in_condition})
@@ -124,7 +124,7 @@ async def call_llm_for_fix(
 ДОСТУПНІ ЗАМІНИ:
 """
     for c in candidates:
-        prompt += f"""  {c['id']}. {c['title'][:80]} |автори: {str(c.get('authors', []))[:60]} |рік: {c['year'] or '?'} |тип: {c['doc_type']} |школа: {c['topic_score']:.2f}
+        prompt += f"""  {c['id']}. {c['title'][:80]} |автори: {str(c.get('authors', []))[:60]} |рік: {c['year'] or '?'} |стор: {c.get('page_count', '?')} |тип: {c['doc_type']} |школа: {c['topic_score']:.2f}
 """
 
     prompt += """
