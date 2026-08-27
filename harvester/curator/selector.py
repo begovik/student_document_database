@@ -61,6 +61,7 @@ async def call_llm_for_selection(
             title=c.get("title", "(без назви)")[:80],
             authors=c.get("authors", "(немає)")[:60],
             year=c.get("year", "?") or "?",
+            page_count=c.get("page_count", "?") or "?",
             doc_type=c.get("doc_type", "unknown"),
             topic_score=c.get("topic_score", 0.0),
         )
@@ -254,6 +255,7 @@ def format_candidates_text(
             title=c.get("title", "(без назви)")[:80],
             authors=c.get("authors", "(немає)")[:60],
             year=c.get("year", "?") or "?",
+            page_count=c.get("page_count", "?") or "?",
             doc_type=c.get("doc_type", "unknown"),
             topic_score=c.get("topic_score", 0.0),
         )
