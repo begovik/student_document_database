@@ -314,8 +314,11 @@ class VerifyWorker:
             )
             await self.stats.increment("verify", requests=1, errors=1)
 
-            if result.code in RETRYABLE_CODES and attempts < self.settings.verify.max_attempts:
-                delay = 60 * (2 ** attempts)
+            # Retry delays: 10 хв, 30 хв, потім — жодних ретраїв
+            RETRY_DELAYS = [600, 1800]
+
+            if result.code in RETRYABLE_CODES and attempts <= len(RETRY_DELAYS):
+                delay = RETRY_DELAYS[attempts - 1]
                 log.warning("verify_retry_scheduled", code=result.code, attempt=attempts, delay_s=delay)
                 await self.docs_repo.update_status(doc_id, "queued")
                 await self.scheduler.complete_task(task_id)
@@ -338,12 +341,15 @@ class VerifyWorker:
 class ClassifyWorker:
     """Бере classify-задачі, класифікує документи (правила + УДК + LLM)."""
 
-    def __init__(self, worker_id: int, settings: Settings, db: Database, scheduler: Scheduler):
+    def __init__(self, worker_id: int, settings: Settings, db: Database, scheduler: Scheduler,
+                 classify_key: str | None = None, classify_model: str | None = None):
         self.worker_id = worker_id
         self.db = db
         self.scheduler = scheduler
         self.events = EventLogger(db)
-        self.classifier = Classifier(db)
+        keys = [classify_key] if classify_key else None
+        models = [classify_model] if classify_model else None
+        self.classifier = Classifier(db, keys=keys, models=models, gemma_only=bool(classify_key))
         self._running = True
 
     async def run(self) -> None:
@@ -390,7 +396,16 @@ class ClassifyWorker:
         try:
             result = await self.classifier.classify_document(doc_dict)
             await self.classifier.save_classification(doc_id, result)
-        except AllLimitsExhausted:
+        except AllLimitsExhausted as e:
+            # Якщо помилка transient (500/503) — не зупиняємо воркер
+            error_str = str(e)
+            is_transient = any(code in error_str for code in ["500", "502", "503", "504"])
+            if is_transient:
+                logger.warning("classify_transient_error", worker=f"classify-{self.worker_id}",
+                             error_msg=error_str[:200])
+                await asyncio.sleep(10)
+                await self.scheduler.complete_task(task_id)
+                return
             logger.critical("classify_worker_all_limits_exhausted", worker=f"classify-{self.worker_id}")
             await self.events.error("classify", "all_limits_exhausted", {"worker": f"classify-{self.worker_id}"})
             self._running = False

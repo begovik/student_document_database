@@ -1,4 +1,4 @@
-"""Модуль сповіщень на пошту з rate-limiting."""
+"""Модуль сповіщень на пошту з rate-limiting та накопиченням помилок."""
 
 import asyncio
 import smtplib
@@ -16,6 +16,13 @@ logger = structlog.get_logger()
 _RATE_LIMIT: dict[str, datetime] = {}
 _RATE_LIMIT_INTERVAL = timedelta(minutes=5)
 
+# Накопичення помилок: key -> (count, first_seen, last_seen)
+_ERROR_ACCUMULATOR: dict[str, tuple[int, datetime, datetime]] = {}
+# Поріг для відправки сповіщення (кількість повторень)
+_ERROR_THRESHOLD = 3
+# Вікно накопичення (якщо помилка не повторювалась протягом цього часу — скидаємо лічильник)
+_ERROR_WINDOW = timedelta(minutes=10)
+
 
 def _should_send(key: str) -> bool:
     """Перевіряє чи можна відправити сповіщення (rate limiting)."""
@@ -25,6 +32,39 @@ def _should_send(key: str) -> bool:
         return False
     _RATE_LIMIT[key] = now
     return True
+
+
+def _accumulate_error(key: str) -> tuple[bool, int]:
+    """Накопичує помилку та повертає (чи потрібно відправляти, кількість).
+
+    Якщо помилка повторюється >= _ERROR_THRESHOLD разів протягом _ERROR_WINDOW —
+    повертає True і скидає лічильник.
+    """
+    now = datetime.utcnow()
+    entry = _ERROR_ACCUMULATOR.get(key)
+
+    if entry is None:
+        # Перша поява помилки
+        _ERROR_ACCUMULATOR[key] = (1, now, now)
+        return False, 1
+
+    count, first_seen, last_seen = entry
+
+    # Якщо вікно минуло — скидаємо лічильник
+    if now - last_seen > _ERROR_WINDOW:
+        _ERROR_ACCUMULATOR[key] = (1, now, now)
+        return False, 1
+
+    # Накопичуємо
+    count += 1
+    _ERROR_ACCUMULATOR[key] = (count, first_seen, now)
+
+    if count >= _ERROR_THRESHOLD:
+        # Скидаємо лічильник після досягнення порогу
+        del _ERROR_ACCUMULATOR[key]
+        return True, count
+
+    return False, count
 
 
 async def send_notification(subject: str, body: str, key: str | None = None) -> bool:
@@ -97,9 +137,17 @@ def _send_sync(settings, subject: str, body: str) -> bool:
 
 
 async def notify_llm_failure(provider: str, model: str, error: str, doc_id: int | None = None) -> None:
-    """Сповіщення про помилку LLM-класифікації."""
-    subject = f"LLM помилка: {provider}/{model}"
-    body = f"""Помилка LLM-класифікації в Harvester:
+    """Сповіщення про помилку LLM-класифікації (з накопиченням)."""
+    # Накопичуємо помилку — відправляємо лише після N повторень
+    error_key = f"llm_error_{provider}_{model}"
+    should_send, count = _accumulate_error(error_key)
+
+    if not should_send:
+        logger.debug("llm_error_accumulated", provider=provider, model=model, count=count, threshold=_ERROR_THRESHOLD)
+        return
+
+    subject = f"LLM помилка ({count}×): {provider}/{model}"
+    body = f"""Помилка LLM-класифікації в Harvester (повторилася {count} разів):
 
 Провайдер: {provider}
 Модель: {model}
@@ -131,7 +179,7 @@ Harvester автоматичне сповіщення"""
 
 
 async def notify_critical(component: str, message: str, error: str | None = None) -> None:
-    """Сповіщення про критичні помилки."""
+    """Сповіщення про критичні помилки (відразу, без накопичення)."""
     subject = f"Критична помилка: {component}"
     body = f"""Критична помилка в Harvester:
 

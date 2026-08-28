@@ -92,5 +92,6 @@ harvester/
 | `harvester init-db` | Initialize schema |
 | `harvester db-status` | Database connection state |
 | `harvester db-resync` | Force resync local mirror |
+| `harvester add-queries --topic "..." --count 600` | Add search queries for new topic |
 | `harvester extract run` | LLM quotation extraction |
 | `harvester curator prepare` | LLM-curated catalog |

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import httpx
 import structlog
 
+from harvester.classify.ratelimit import ModelRateLimiter, DailyLimitExhausted
 from harvester.config import get_settings
 
 logger = structlog.get_logger()
@@ -98,19 +99,28 @@ class LLMClient:
     Фолбек — OpenRouter (google/gemini-2.5-flash)
     """
 
-    def __init__(self):
+    def __init__(self, keys: list[str] | None = None, models: list[str] | None = None,
+                 gemma_only: bool = False):
         self.settings = get_settings()
-        self._models = self.settings.llm.gemini_models
-        self._gemma_models = self.settings.llm.gemma_models
-        self._keys = self.settings.gemini_keys
+        self._models = [] if gemma_only else (models or self.settings.llm.gemini_models)
+        self._gemma_models = models or self.settings.llm.gemma_models
+        self._keys = keys or self.settings.gemini_keys
+        self._gemma_only = gemma_only
         self._model_idx = 0
         self._key_idx = 0
         self._last_call = 0.0
         self._lock = asyncio.Lock()
         self._daily_limit_exhausted: set[tuple[int, int]] = set()
         self._gemma_limit_exhausted: set[tuple[int, int]] = set()
-        self._phase = "gemini"
+        self._phase = "gemma" if gemma_only else "gemini"
         self._initialized = False
+        self._rate_limiter = ModelRateLimiter(
+            gemini_rpm=self.settings.llm.gemini_rpm,
+            gemini_rpd=self.settings.llm.gemini_rpd,
+            gemma_rpm=self.settings.llm.gemma_rpm,
+            gemma_rpd=self.settings.llm.gemma_rpd,
+            gemma_tpm=self.settings.llm.gemma_tpm,
+        )
 
     @property
     def enabled(self) -> bool:
@@ -155,7 +165,7 @@ class LLMClient:
                     )
 
         # Фаза 2: Gemma — Gemini вичерпані, пробуємо Gemma
-        logger.info("gemini_all_exhausted_at_startup", event="gemma_phase_started")
+        logger.info("gemini_all_exhausted_at_startup", phase="gemma")
         self._phase = "gemma"
         self._key_idx = 0
         self._model_idx = 0
@@ -216,63 +226,17 @@ class LLMClient:
         await self._throttle()
 
         if not self._keys:
-            if self.settings.open_router_api_key:
-                try:
-                    return await self._call_openrouter(prompt)
-                except Exception as e:
-                    raise LLMUnavailable(f"openrouter error: {e}")
-            raise LLMUnavailable("Немає Gemini ключів")
+            raise LLMUnavailable("Немає Gemma ключів")
 
         errors: list[str] = []
 
-        # === Фаза 1: Gemini (gemini_models × keys) ===
-        if self._phase == "gemini":
-            gemini_ok = await self._run_phase(
-                prompt, self._models, self._daily_limit_exhausted, "gemini", errors
-            )
-            if gemini_ok is not None:
-                return gemini_ok
-
-            # Gemini вичерпаний — переходимо до Gemma
-            logger.info("gemini_all_exhausted", event="gemma_phase_started")
-            self._phase = "gemma"
-            self._key_idx = 0
-            self._model_idx = 0
-
         # === Фаза 2: Gemma (gemma_models × keys) ===
-        if self._phase == "gemma":
-            gemma_prompt = rephrase_for_gemma(prompt, self.settings.llm.gemma_max_chars)
-            gemma_ok = await self._run_phase(
-                gemma_prompt, self._gemma_models, self._gemma_limit_exhausted, "gemma", errors
-            )
-            if gemma_ok is not None:
-                return gemma_ok
-
-            # Gemma теж вичерпаний — OpenRouter
-            logger.info("gemma_all_exhausted", next="openrouter_fallback")
-
-        # === Фолбек: OpenRouter ===
-        if self.settings.open_router_api_key:
-            try:
-                return await self._call_openrouter(prompt)
-            except OpenRouterPaymentRequired as e:
-                logger.error("openrouter_payment_required", error_msg=str(e))
-                errors.append(str(e))
-                # Сповіщення на пошту про помилку OpenRouter
-                try:
-                    from harvester.core.notify import notify_llm_failure
-                    await notify_llm_failure("openrouter", self.settings.llm.openrouter_model, f"Payment required: {e}")
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.error("openrouter_error", error_msg=str(e))
-                errors.append(str(e))
-                # Сповіщення на пошту про помилку OpenRouter
-                try:
-                    from harvester.core.notify import notify_llm_failure
-                    await notify_llm_failure("openrouter", self.settings.llm.openrouter_model, str(e))
-                except Exception:
-                    pass
+        gemma_prompt = rephrase_for_gemma(prompt, self.settings.llm.gemma_max_chars)
+        gemma_ok = await self._run_phase(
+            gemma_prompt, self._gemma_models, self._gemma_limit_exhausted, "gemma", errors
+        )
+        if gemma_ok is not None:
+            return gemma_ok
 
         logger.critical("llm_all_limits_exhausted")
         # Сповіщення на пошту про вичерпання всіх LLM
@@ -280,7 +244,7 @@ class LLMClient:
             from harvester.core.notify import notify_llm_all_exhausted
             await notify_llm_all_exhausted(errors)
         except Exception:
-            pass  # Не блокуємо основний флоу
+            pass
         raise AllLimitsExhausted("; ".join(errors) or "усі ключі та моделі вичерпані")
 
     async def _run_phase(
@@ -295,6 +259,10 @@ class LLMClient:
         start_key_idx = self._key_idx
         start_model_idx = self._model_idx
         checked_all = False
+        # Лічильник тимчасових помилок для поточної комбінації (key,model)
+        MAX_TRANSIENT_RETRIES = 3
+        transient_retries: int = 0
+        transient_backoff = [3, 6, 12]
 
         while not checked_all:
             key = self._keys[self._key_idx]
@@ -309,6 +277,14 @@ class LLMClient:
             try:
                 result = await self._call_gemini_with_wait(prompt, key, model, phase)
                 return result
+            except DailyLimitExhausted:
+                logger.warning("daily_limit_exhausted", phase=phase, key_idx=self._key_idx, model=model)
+                exhausted.add((self._key_idx, self._model_idx))
+                errors.append(f"{model}[key{self._key_idx}]: daily limit (rate limiter)")
+                self._advance_phase(models)
+                transient_retries = 0
+                if self._is_back_to_start(start_key_idx, start_model_idx):
+                    checked_all = True
             except GeminiQuotaExceeded:
                 logger.warning(
                     "gemini_quota_exceeded",
@@ -330,6 +306,7 @@ class LLMClient:
                     exhausted.add((self._key_idx, self._model_idx))
                     errors.append(f"{model}[key{self._key_idx}]: daily limit")
                     self._advance_phase(models)
+                    transient_retries = 0
                     if self._is_back_to_start(start_key_idx, start_model_idx):
                         checked_all = True
                 else:
@@ -342,25 +319,53 @@ class LLMClient:
                 logger.error("gemini_auth_error", phase=phase, key_idx=self._key_idx, model=model, error_msg=str(e))
                 errors.append(str(e))
                 exhausted.add((self._key_idx, self._model_idx))
-                # Сповіщення на пошту про помилку автентифікації
                 try:
                     from harvester.core.notify import notify_llm_failure
-                    await notify_llm_failure("gemini", model, f"Auth error: {e}")
+                    await notify_llm_failure("gemma", model, f"Auth error: {e}")
                 except Exception:
                     pass
                 self._advance_phase(models)
+                transient_retries = 0
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
             except Exception as e:
-                logger.error("gemini_error", phase=phase, key_idx=self._key_idx, model=model, error_msg=str(e))
-                errors.append(str(e))
-                # Сповіщення на пошту про помилку Gemini
+                error_type = type(e).__name__
+                error_msg = str(e) or f"[{error_type}] без повідомлення"
+                # Витягуємо HTTP status code з повідомлення
+                status_code = ""
+                for code in ["500", "502", "503", "504", "503"]:
+                    if f"'{code}'" in error_msg or f'"code": {code}' in error_msg:
+                        status_code = code
+                        break
+
+                is_transient = (status_code in ("500", "502", "503", "504") or
+                               "timeout" in error_msg.lower() or
+                               "ReadError" in error_type or
+                               "ConnectError" in error_type or
+                               "RemoteProtocolError" in error_type or
+                               "HTTPStatusError" in error_type or
+                               "PoolTimeout" in error_type)
+
+                if is_transient and transient_retries < MAX_TRANSIENT_RETRIES:
+                    wait = transient_backoff[min(transient_retries, len(transient_backoff) - 1)]
+                    transient_retries += 1
+                    logger.warning("gemini_transient_error", phase=phase, key_idx=self._key_idx,
+                                   model=model, error_msg=error_msg[:150], attempt=transient_retries,
+                                   wait_s=wait)
+                    await asyncio.sleep(wait)
+                    continue  # Повторюємо той самий запит
+
+                logger.error("gemini_error", phase=phase, key_idx=self._key_idx, model=model,
+                            error_msg=error_msg, error_type=error_type)
+                errors.append(error_msg)
+                # Критична помилка — відправити на пошту
                 try:
                     from harvester.core.notify import notify_llm_failure
-                    await notify_llm_failure("gemini", model, str(e))
+                    await notify_llm_failure("gemma", model, f"[{error_type}] {error_msg[:200]}", error_type=error_type)
                 except Exception:
                     pass
                 self._advance_phase(models)
+                transient_retries = 0
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
 
@@ -394,6 +399,9 @@ class LLMClient:
         started = time.monotonic()
         wait_start = started
 
+        # Per-model rate limiting (RPM, RPD, TPM)
+        await self._rate_limiter.acquire(model, phase)
+
         async with httpx.AsyncClient(timeout=cfg.timeout_s) as client:
             resp = await client.post(
                 url,
@@ -425,68 +433,31 @@ class LLMClient:
 
         data = resp.json()
         try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            parts = data["candidates"][0]["content"]["parts"]
+            # Шукаємо частину без thought=True (фактична відповідь, а не роздуми)
+            text = ""
+            for part in parts:
+                if not part.get("thought", False):
+                    text = part.get("text", "")
+                    break
+            # Якщо не знайшли — беремо останню частину
+            if not text:
+                text = parts[-1].get("text", "")
         except (KeyError, IndexError, TypeError) as e:
             raise LLMUnavailable(f"несподівана відповідь Gemini: {e}") from e
 
+        # Підрахунок токенів з usageMetadata
+        usage = data.get("usageMetadata", {})
+        total_tokens = usage.get("totalTokenCount", 0)
+        if total_tokens:
+            self._rate_limiter.record_tokens(model, total_tokens)
+
         log_fn = logger.debug if phase == "gemini" else logger.info
         log_fn(
-            f"llm_{phase}_ok", model=model, duration_ms=duration_ms, chars=len(text)
-        )
-        return LLMResponse(text=text, provider=phase, model=model, duration_ms=duration_ms)
-
-    async def _call_openrouter(self, prompt: str) -> LLMResponse:
-        cfg = self.settings.llm
-        started = time.monotonic()
-
-        async with httpx.AsyncClient(timeout=cfg.timeout_s) as client:
-            resp = await client.post(
-                f"{cfg.openrouter_base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.settings.open_router_api_key}"},
-                json={
-                    "model": cfg.openrouter_model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": cfg.temperature,
-                    "max_tokens": cfg.max_tokens,
-                },
-            )
-
-        duration_ms = int((time.monotonic() - started) * 1000)
-
-        if resp.status_code == 429:
-            raise LLMUnavailable("openrouter 429")
-        if resp.status_code == 402:
-            raise OpenRouterPaymentRequired(f"402: {resp.text[:200]}")
-        resp.raise_for_status()
-
-        data = resp.json()
-        try:
-            text = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as e:
-            raise LLMUnavailable(f"несподівана відповідь OpenRouter: {e}") from e
-
-        logger.debug(
-            "llm_openrouter_ok",
-            model=cfg.openrouter_model,
+            f"llm_{phase}_ok",
+            model=model,
             duration_ms=duration_ms,
             chars=len(text),
+            tokens=total_tokens,
         )
-        return LLMResponse(
-            text=text, provider="openrouter", model=cfg.openrouter_model, duration_ms=duration_ms
-        )
-
-
-class GeminiRateLimited(Exception):
-    pass
-
-
-class GeminiQuotaExceeded(Exception):
-    pass
-
-
-class GeminiAuthError(Exception):
-    pass
-
-
-class OpenRouterPaymentRequired(Exception):
-    pass
+        return LLMResponse(text=text, provider=phase, model=model, duration_ms=duration_ms)

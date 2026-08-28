@@ -85,6 +85,7 @@ def status():
 
             doc_stats = await docs_repo.count_by_status()
             lang_stats = await docs_repo.count_by_language()
+            classified_total, classified_docs = await docs_repo.count_classified()
             task_stats = await tasks_repo.count_by_status()
             task_by_type = await tasks_repo.count_by_type()
 
@@ -107,6 +108,8 @@ def status():
                 table.add_row(f"  · {st}", str(cnt))
             if lang_stats:
                 table.add_row("Мови (verified)", ", ".join(f"{k}:{v}" for k, v in sorted(lang_stats.items(), key=lambda x: -x[1])))
+            table.add_row("Класифікації (всього)", str(classified_total))
+            table.add_row("  · унікальних документів", str(classified_docs))
             table.add_row("Завдання (pending)", str(task_stats.get("pending", 0)))
             table.add_row("Завдання (running)", str(task_stats.get("running", 0)))
             for ttype, by_status in sorted(task_by_type.items()):
@@ -653,6 +656,246 @@ def queries(
             await db.close()
 
     asyncio.run(_queries())
+
+
+@app.command()
+def add_queries(
+    topic: str = typer.Option(
+        ...,
+        "--topic",
+        "-t",
+        help="Основна тема для пошуку (наприклад, 'технологія пошиття пальта')",
+    ),
+    count: int = typer.Option(
+        100,
+        "--count",
+        "-n",
+        min=1,
+        max=2000,
+        help="Кількість варіантів запитів для генерації",
+    ),
+    lang: str = typer.Option(
+        "both",
+        "--lang",
+        "-l",
+        help="Мова запитів: uk, en, both",
+    ),
+    priority: int = typer.Option(
+        10,
+        "--priority",
+        "-p",
+        min=1,
+        max=100,
+        help="Пріоритет запитів (вищий = раніше обробляється)",
+    ),
+):
+    """Додати пошукові запити для нової теми
+
+    Генерує варіації пошукових запитів з різними типами документів,
+    мовами та модифікаторами для максимального покриття.
+    """
+    from harvester.db.failover import build_database
+    from harvester.db.repositories import SearchQueriesRepository
+
+    # Основи теми
+    TOPICS_UK = [
+        topic,
+        f"проєктування {topic}",
+        f"розробка {topic}",
+        f"технологія {topic}",
+        f"конструювання {topic}",
+        f"моделювання {topic}",
+        f"виготовлення {topic}",
+        f"виробництво {topic}",
+        f"організація виробництва {topic}",
+        f"технічна підготовка виробництва {topic}",
+        f"технологічний процес {topic}",
+        f"технологічна документація {topic}",
+        f"маршрутна карта {topic}",
+        f"операційна карта {topic}",
+        f"нормування {topic}",
+        f"собівартість {topic}",
+        f"економічна ефективність {topic}",
+        f"оптимізація {topic}",
+        f"удосконалення {topic}",
+        f"автоматизація {topic}",
+    ]
+
+    TOPICS_EN = [
+        topic,
+        f"design of {topic}",
+        f"development of {topic}",
+        f"technology of {topic}",
+        f"construction of {topic}",
+        f"manufacturing of {topic}",
+        f"production of {topic}",
+        f"production organization of {topic}",
+        f"technical preparation of {topic}",
+        f"technological process of {topic}",
+        f"technological documentation of {topic}",
+        f"route sheet {topic}",
+        f"operation sheet {topic}",
+        f"cost estimation of {topic}",
+        f"economic efficiency of {topic}",
+        f"optimization of {topic}",
+        f"improvement of {topic}",
+        f"automation of {topic}",
+    ]
+
+    # Типи документів
+    DOC_TYPES_UK = [
+        "filetype:pdf",
+        "підручник filetype:pdf",
+        '"навчальний посібник" pdf',
+        "методичні вказівки pdf",
+        "методичні рекомендації pdf",
+        "конспект лекцій filetype:pdf",
+        "наукова стаття filetype:pdf",
+        "монографія filetype:pdf",
+        "дисертація filetype:pdf",
+        "автореферат filetype:pdf",
+        "практикум filetype:pdf",
+        "лабораторний практикум pdf",
+        "курсовий проєкт filetype:pdf",
+        "дипломний проєкт filetype:pdf",
+        "звіт filetype:pdf",
+        "патент filetype:pdf",
+        "ГОСТ filetype:pdf",
+        "ДСТУ filetype:pdf",
+        "технічні умови filetype:pdf",
+        "інструкція filetype:pdf",
+    ]
+
+    DOC_TYPES_EN = [
+        "filetype:pdf",
+        "textbook filetype:pdf",
+        '"lecture notes" pdf',
+        "methodical guidelines pdf",
+        "methodical recommendations pdf",
+        "scientific article filetype:pdf",
+        "monograph filetype:pdf",
+        "thesis filetype:pdf",
+        "dissertation filetype:pdf",
+        "abstract filetype:pdf",
+        "practical guide filetype:pdf",
+        "coursework filetype:pdf",
+        "report filetype:pdf",
+        "patent filetype:pdf",
+        "standard filetype:pdf",
+        "technical specification filetype:pdf",
+        "instruction filetype:pdf",
+    ]
+
+    # Додаткові модифікатори
+    MODIFIERS_UK = [
+        "",
+        "сучасні методи",
+        "інноваційні технології",
+        "САПР",
+        "комп'ютерне проєктування",
+        "3D моделювання",
+        "стандартизація",
+        "якість продукції",
+        "ефективність виробництва",
+        "безвідходна технологія",
+        "енергозбереження",
+        "матеріалознавство",
+        "обладнання",
+        "інструмент",
+        "фурнітура",
+        "розкрій матеріалу",
+        "лекала",
+        "викрійки",
+        "технологічна послідовність",
+        "час виготовлення",
+    ]
+
+    MODIFIERS_EN = [
+        "",
+        "modern methods",
+        "innovative technologies",
+        "CAD",
+        "computer aided design",
+        "3D modeling",
+        "standardization",
+        "product quality",
+        "production efficiency",
+        "zero waste technology",
+        "energy saving",
+        "material science",
+        "equipment",
+        "tools",
+        "accessories",
+        "fabric cutting",
+        "patterns",
+        "templates",
+        "technological sequence",
+        "manufacturing time",
+    ]
+
+    async def _add_queries():
+        settings = get_settings()
+        db = build_database(settings)
+        await db.initialize(sync_mirror=False)
+
+        try:
+            repo = SearchQueriesRepository(db)
+            added = 0
+            skipped = 0
+
+            queries_to_add = []
+
+            if lang in ("uk", "both"):
+                for base in TOPICS_UK:
+                    for doc_type in DOC_TYPES_UK:
+                        for modifier in MODIFIERS_UK:
+                            if modifier:
+                                query_text = f"{base} {modifier} {doc_type}"
+                            else:
+                                query_text = f"{base} {doc_type}"
+                            queries_to_add.append((query_text, "ua-uk", topic, priority))
+
+                            if len(queries_to_add) >= count:
+                                break
+                        if len(queries_to_add) >= count:
+                            break
+                    if len(queries_to_add) >= count:
+                        break
+
+            if lang in ("en", "both") and len(queries_to_add) < count:
+                for base in TOPICS_EN:
+                    for doc_type in DOC_TYPES_EN:
+                        for modifier in MODIFIERS_EN:
+                            if modifier:
+                                query_text = f"{base} {modifier} {doc_type}"
+                            else:
+                                query_text = f"{base} {doc_type}"
+                            queries_to_add.append((query_text, "us-en", topic, priority))
+
+                            if len(queries_to_add) >= count:
+                                break
+                        if len(queries_to_add) >= count:
+                            break
+                    if len(queries_to_add) >= count:
+                        break
+
+            # Додаємо запити
+            for query_text, region, topic_hint, prio in queries_to_add:
+                qid = await repo.insert_if_new(query_text, region=region, topic_hint=topic_hint, priority=prio)
+                if qid:
+                    added += 1
+                else:
+                    skipped += 1
+
+            rprint(f"[green]✓ Додано запитів: {added}[/green]")
+            if skipped:
+                rprint(f"[yellow]Пропущено (дублікати): {skipped}[/yellow]")
+            rprint(f"[cyan]Всього згенеровано: {len(queries_to_add)}[/cyan]")
+
+        finally:
+            await db.close()
+
+    asyncio.run(_add_queries())
 
 
 @app.command()

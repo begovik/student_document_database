@@ -38,6 +38,7 @@ extract_app = typer.Typer(
 def run(
     topic: str | None = typer.Option(None, "--topic", "-t", help="Фільтрувати по назві теми (часткова підстрока)"),
     topic_code: str | None = typer.Option(None, "--topic-code", "-c", help="Фільтрувати по коду теми (наприклад, 'trade', '076')"),
+    keyword: str | None = typer.Option(None, "--keyword", "-k", help="Фільтрувати по ключовому слову в заголовку (часткова підстрока)"),
     limit: int = typer.Option(30, "--limit", "-n", help="Максимальна кількість документів для обробки"),
     batch: int = typer.Option(5, "--batch", "-b", help="Кількість одночасних завдань"),
     dry_run: bool = typer.Option(False, "--dry-run", "-d", help="Не зберігати результати, лише показати що було б зроблено"),
@@ -57,12 +58,13 @@ def run(
         harvester extract run --retry-failed
         harvester extract run --dry-run
     """
-    asyncio.run(main(topic, topic_code, limit, batch, dry_run, retry_failed, skip_extracted, catalog_dir))
+    asyncio.run(main(topic, topic_code, keyword, limit, batch, dry_run, retry_failed, skip_extracted, catalog_dir))
 
 
 async def main(
     topic: str | None,
     topic_code: str | None,
+    keyword: str | None,
     limit: int,
     batch: int,
     dry_run: bool,
@@ -78,7 +80,7 @@ async def main(
     try:
         # 1. Отримати список документів для обробки
         docs = await get_documents_to_process(
-            db, topic=topic, topic_code=topic_code,
+            db, topic=topic, topic_code=topic_code, keyword=keyword,
             limit=limit, retry_failed=retry_failed,
             skip_extracted=skip_extracted,
         )
@@ -107,7 +109,7 @@ async def main(
             jobs.append(ExtractionJob(
                 document_id=d["id"],
                 canonical_url=d["canonical_url"],
-                title=d["title"] or "",
+                title=d["title"] or d.get("title_hint") or "",
                 pdf_path=pdf_path,
             ))
 
@@ -163,15 +165,19 @@ async def main(
                         print(f"    [{q.get('page', '?')}p] ({q.get('type', 'unknown')}) {q.get('text', '')[:100]}...")
                 if r.summary:
                     s = r.summary
-                    print(f"  Сумаризація:")
-                    print(f"    Огляд: {s.get('overview', '')[:150]}")
-                    print(f"    Ідеї: {', '.join(s.get('key_ideas', [])[:5])}")
-                    if s.get('methodology') and s['methodology'] != 'н/зв':
-                        print(f"    Методологія: {s['methodology'][:150]}")
-                    if s.get('findings') and s['findings'] != 'н/зв':
-                        print(f"    Результати: {s['findings'][:150]}")
-                    if s.get('conclusions') and s['conclusions'] != 'н/зв':
-                        print(f"    Висновки: {s['conclusions'][:150]}")
+                    sections = s.get("sections", [])
+                    if sections:
+                        print(f"  Сумаризація ({len(sections)} розділів):")
+                        for i, sec in enumerate(sections[:5], 1):
+                            print(f"    [{i}] {sec.get('title', 'Розділ')} (ст.{sec.get('page', '?')})")
+                            print(f"        {sec.get('overview', '')[:120]}")
+                            ideas = sec.get('key_ideas', [])
+                            if ideas:
+                                print(f"        Ідеї: {', '.join(ideas[:3])}")
+                    else:
+                        # Старий формат (сумісність)
+                        print(f"  Сумаризація:")
+                        print(f"    Огляд: {s.get('overview', '')[:150]}")
 
     finally:
         await db.close()
@@ -181,11 +187,29 @@ async def get_documents_to_process(
     db,
     topic: str | None = None,
     topic_code: str | None = None,
+    keyword: str | None = None,
     limit: int = 30,
     retry_failed: bool = False,
     skip_extracted: bool = True,
 ) -> list[dict[str, Any]]:
     """Отримати список документів для обробки."""
+    # Якщо вказано keyword — шукаємо по заголовку або title_hint
+    if keyword:
+        query = """
+            SELECT d.id, d.title, d.title_hint, d.canonical_url, d.authors, d.year, d.udc, d.language, d.doc_type, d.verified_at
+            FROM documents d
+            LEFT JOIN extractions e ON e.document_id = d.id
+            WHERE d.status = 'verified'
+              AND d.canonical_url IS NOT NULL
+              AND d.canonical_url != ''
+              AND (d.title LIKE ? OR d.title_hint LIKE ?)
+              AND (? = 0 OR e.id IS NULL OR e.quotations IS NULL OR e.quotations = '[]')
+            ORDER BY d.verified_at DESC NULLS LAST, d.id DESC
+            LIMIT ?
+        """
+        rows = await db.fetchall(query, (f"%{keyword}%", f"%{keyword}%", 0 if skip_extracted else 1, limit * 2,))
+        return list(rows)[:limit]
+
     if retry_failed:
         query = """
             SELECT d.id, d.title, d.canonical_url, d.authors, d.year, d.udc, d.language, d.doc_type, d.verified_at
