@@ -1,0 +1,28 @@
+# Правила фільтрації документів для каталогів
+# Використання:
+#   harvester curator prepare "Тема" --profile strict
+#   harvester curator prepare "Тема" --profile softier
+
+profiles:
+  # Жорсткий профіль (за замовчуванням)
+  # Мінімум 3 сторінки, повна структура, якісні метадані
+  strict:
+    description: "Жорсткі фільтри для повноцінних структурованих документів"
+    min_page_count: 3
+    require_references: false
+    require_structured_sections: false
+    require_title_page: false
+    llm_completeness_level: "strict"
+
+  # М'який профіль
+  # Приймає документи від 1 сторінки, базова структура
+  softier:
+    description: "М'які фільтри — приймає короткі документи якщо вони якісні"
+    min_page_count: 1
+    require_references: false
+    require_structured_sections: false
+    require_title_page: false
+    llm_completeness_level: "basic"
+
+# Поточний профіль (перевизначається через --profile або HARVESTER_PROFILE)
+active_profile: "strict"

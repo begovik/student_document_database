@@ -9,11 +9,11 @@ from typing import Any
 
 import structlog
 
-from harvester.config import get_settings
+from harvester.config import get_settings, get_filter_rules, FilterRules
 from harvester.curator.prompts import (
     CANDIDATE_LINE,
-    PROMPT_SELECT_DOCUMENTS,
     PROMPT_SELECT_END,
+    get_selection_prompt,
 )
 
 logger = structlog.get_logger()
@@ -43,6 +43,7 @@ class SelectionResult:
 async def call_llm_for_selection(
     topic: str,
     candidates: list[dict[str, Any]],
+    rules: FilterRules | None = None,
 ) -> SelectionResult | None:
     """Викликати LLM для відбору документів.
 
@@ -52,9 +53,15 @@ async def call_llm_for_selection(
     if not settings.llm.enabled:
         logger.warning("llm_disabled_skip_selection")
         return None
-
+    
+    if rules is None:
+        rules = get_filter_rules()
+    
+    # Отримати промпт залежно від рівня строгості
+    prompt_template = get_selection_prompt(rules.llm_completeness_level)
+    
     # Створити текст промпта
-    prompt = PROMPT_SELECT_DOCUMENTS.format(topic=topic, count=len(candidates))
+    prompt = prompt_template.format(topic=topic, count=len(candidates))
     for c in candidates:
         prompt += CANDIDATE_LINE.format(
             id=c["id"],

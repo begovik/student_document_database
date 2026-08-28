@@ -12,7 +12,7 @@ from typing import Any
 
 import structlog
 
-from harvester.config import get_settings
+from harvester.config import get_settings, get_filter_rules, FilterRules
 from harvester.db.failover import build_database
 from harvester.curator.availability import check_availability
 
@@ -24,8 +24,13 @@ async def find_replacement_candidates(
     original_doc: dict[str, Any],
     selected_ids: set[int],
     limit: int = 10,
+    rules: FilterRules | None = None,
 ) -> list[dict[str, Any]]:
     """Знайти кандидатів на заміну серед наявних в БД."""
+    if rules is None:
+        rules = get_filter_rules()
+    
+    min_page_count = rules.min_page_count
     from harvester.db.repositories import DocumentsRepository
 
     topic_ids = []
@@ -61,7 +66,7 @@ async def find_replacement_candidates(
           AND d.authors IS NOT NULL
           AND d.language IS NOT NULL
           AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
-          AND d.page_count >= 3
+          AND d.page_count >= {min_page_count}
           AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
           AND ({not_in_condition})
           AND ({topic_in_condition})

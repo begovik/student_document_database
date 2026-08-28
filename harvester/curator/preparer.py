@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 import structlog
 
-from harvester.config import get_settings
+from harvester.config import get_settings, get_filter_rules, FilterRules
 from harvester.db.failover import build_database
 from harvester.db.repositories import DocumentsRepository, TopicsRepository
 from harvester.curator.availability import check_availability
@@ -24,7 +24,6 @@ logger = structlog.get_logger()
 
 # Мінімальні вимоги до документа для відбору
 REQUIRED_STATUS = "verified"
-MIN_PAGE_COUNT = 3  # Відсіюємо 1-2 сторінкові фрагменти/анотації
 REQUIRED_FIELDS = {
     "title": "Назва має бути непорожньою",
     "authors": "Автори мають бути задані",
@@ -35,8 +34,21 @@ REQUIRED_FIELDS = {
 }
 
 
-def is_document_complete(doc: dict[str, Any]) -> tuple[bool, str | None]:
+def is_document_complete(doc: dict[str, Any], rules: FilterRules | None = None) -> tuple[bool, str | None]:
     """Перевірити, чи документ має повний набір даних і є повноцінним цілісним джерелом."""
+    if rules is None:
+        rules = get_filter_rules()
+    
+    min_page_count = rules.min_page_count
+    
+    REQUIRED_FIELDS = {
+        "title": "Назва має бути непорожньою",
+        "authors": "Автори мають бути задані",
+        "language": "Мова має бути визначена",
+        "canonical_url": "Має бути визначений canonical_url",
+        "page_count": f"Має бути визначена кількість сторінок (не менше {min_page_count})",
+        "has_text_layer": "Має бути текстовий шар",
+    }
     if doc.get("status") != REQUIRED_STATUS:
         return False, f"status={doc.get('status')} (потрібно {REQUIRED_STATUS})"
 
@@ -46,8 +58,8 @@ def is_document_complete(doc: dict[str, Any]) -> tuple[bool, str | None]:
             if value is None or int(value) != 1:
                 return False, f"{field}={value}"
         elif field == "page_count":
-            if not value or int(value) < MIN_PAGE_COUNT:
-                return False, f"page_count={value} (мінімум {MIN_PAGE_COUNT} сторінки для цілісного джерела)"
+            if not value or int(value) < min_page_count:
+                return False, f"page_count={value} (мінімум {min_page_count} сторінки для цілісного джерела)"
         elif value is None or value == "" or value == "None":
             return False, reason
 
@@ -138,13 +150,18 @@ async def get_candidates_for_topic(
     topic_id: int | None = None,
     udc_prefixes: list[str] | None = None,
     limit: int = 200,
+    rules: FilterRules | None = None,
 ) -> list[dict[str, Any]]:
     """Отримати кандидатів для теми з БД."""
+    if rules is None:
+        rules = get_filter_rules()
+    
+    min_page_count = rules.min_page_count
     repo = DocumentsRepository(db)
 
     if topic_id:
         rows = await repo.db.fetchall(
-            """
+            f"""
             SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
                    d.canonical_url, d.language, d.udc, d.page_count, d.has_text_layer,
                    d.size_bytes, d.sha256, d.status, d.extra,
@@ -159,7 +176,7 @@ async def get_candidates_for_topic(
               AND d.authors IS NOT NULL
               AND d.language IS NOT NULL
               AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
-              AND d.page_count >= 3
+              AND d.page_count >= {min_page_count}
               AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
               AND d.id IN (
                   SELECT dt2.document_id
@@ -174,8 +191,9 @@ async def get_candidates_for_topic(
             (topic_id, limit),
         )
     elif udc_prefixes:
+        udc_conditions = " OR ".join(f"d.udc LIKE '{p}%'" for p in udc_prefixes)
         rows = await repo.db.fetchall(
-            """
+            f"""
             SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
                    d.canonical_url, d.language, d.udc, d.page_count, d.has_text_layer,
                    d.size_bytes, d.sha256, d.status, d.extra,
@@ -190,10 +208,10 @@ async def get_candidates_for_topic(
               AND d.authors IS NOT NULL
               AND d.language IS NOT NULL
               AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
-              AND d.page_count >= 3
+              AND d.page_count >= {min_page_count}
               AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
               AND (
-                  """ + " OR ".join(f"d.udc LIKE '{p}%'" for p in udc_prefixes) + """
+                  {udc_conditions}
               )
               AND (d.extra IS NULL OR d.extra NOT LIKE '%"curator"%')
             ORDER BY dt.score DESC NULLS LAST, d.year DESC NULLS LAST
@@ -203,7 +221,7 @@ async def get_candidates_for_topic(
         )
     else:
         rows = await repo.db.fetchall(
-            """
+            f"""
             SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
                    d.canonical_url, d.language, d.udc, d.page_count, d.has_text_layer,
                    d.size_bytes, d.sha256, d.status, d.extra,
@@ -218,7 +236,7 @@ async def get_candidates_for_topic(
               AND d.authors IS NOT NULL
               AND d.language IS NOT NULL
               AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
-              AND d.page_count >= 3
+              AND d.page_count >= {min_page_count}
               AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
               AND (d.extra IS NULL OR d.extra NOT LIKE '%"curator"%')
             ORDER BY dt.score DESC NULLS LAST, d.year DESC NULLS LAST
@@ -265,6 +283,7 @@ async def find_replacement(
     selected_ids: set[int],
     topic_id: int | None = None,
     udc_prefixes: list[str] | None = None,
+    rules: FilterRules | None = None,
 ) -> dict[str, Any] | None:
     """Знайти заміну для недоступного документа."""
     candidates = await get_candidates_for_topic(
@@ -273,6 +292,7 @@ async def find_replacement(
         topic_id=topic_id,
         udc_prefixes=udc_prefixes,
         limit=50,
+        rules=rules,
     )
 
     available = [
@@ -428,6 +448,7 @@ async def prepare_catalog(
     output_dir: str = "catalogs",
     limit: int | None = None,
     dry_run: bool = False,
+    profile: str = "strict",
 ) -> PrepareResult | None:
     """Підготувати каталог документів для теми.
 
@@ -442,6 +463,7 @@ async def prepare_catalog(
     Returns PrepareResult або None за помилки.
     """
     settings = get_settings()
+    rules = get_filter_rules(profile)
     db = build_database(settings)
     await db.initialize(sync_mirror=False)
 
@@ -492,12 +514,13 @@ async def prepare_catalog(
             topic_id=topic_id,
             udc_prefixes=udc_prefixes,
             limit=200,
+            rules=rules,
         )
 
         complete_candidates = []
         incomplete_count = 0
         for c in candidates:
-            ok, reason = is_document_complete(c)
+            ok, reason = is_document_complete(c, rules)
             if ok:
                 complete_candidates.append(c)
             else:
@@ -510,7 +533,7 @@ async def prepare_catalog(
             return None
 
         # 3. LLM-відбір
-        selection = await call_llm_for_selection(topic_name_uk, complete_candidates)
+        selection = await call_llm_for_selection(topic_name_uk, complete_candidates, rules=rules)
         if selection is None:
             # Якщо LLM недоступний — обираємо перші complete_candidates
             logger.warning("llm_selection_failed_fallback_to_first", count=len(complete_candidates))
@@ -551,6 +574,7 @@ async def prepare_catalog(
                 selected_ids - {doc["id"]},
                 topic_id=topic_id,
                 udc_prefixes=udc_prefixes,
+                rules=rules,
             )
             if replacement:
                 available.append(replacement)

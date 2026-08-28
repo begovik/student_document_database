@@ -267,3 +267,60 @@ def reload_settings(config_path: str | Path | None = None) -> Settings:
     global _settings
     _settings = load_config(config_path)
     return _settings
+
+
+# === Правила фільтрації документів ===
+
+class FilterRules(BaseModel):
+    """Правила фільтрації документів для каталогів."""
+    description: str = ""
+    min_page_count: int = Field(default=1, ge=1, le=100)
+    require_references: bool = False
+    require_structured_sections: bool = False
+    require_title_page: bool = False
+    llm_completeness_level: str = Field(default="basic", pattern=r"^(basic|strict)$")
+
+
+_rules_cache: dict[str, FilterRules] | None = None
+_rules_config: dict[str, Any] | None = None
+
+
+def _load_rules_config() -> dict[str, Any]:
+    """Завантажити конфігурацію правил з rules.yaml."""
+    global _rules_config
+    if _rules_config is None:
+        rules_path = Path(__file__).parent / "config" / "rules.yaml"
+        if rules_path.exists():
+            with open(rules_path, "r", encoding="utf-8") as f:
+                _rules_config = yaml.safe_load(f) or {}
+        else:
+            _rules_config = {"profiles": {}, "active_profile": "strict"}
+    return _rules_config
+
+
+def get_filter_rules(profile: str | None = None) -> FilterRules:
+    """Отримати правила фільтрації для вказаного профілю."""
+    global _rules_cache
+    if _rules_cache is None:
+        _rules_cache = {}
+        config = _load_rules_config()
+        profiles = config.get("profiles", {})
+        for name, data in profiles.items():
+            _rules_cache[name] = FilterRules(**data)
+
+    if profile is None:
+        config = _load_rules_config()
+        profile = config.get("active_profile", "strict")
+
+    if profile not in _rules_cache:
+        available = list(_rules_cache.keys())
+        raise ValueError(f"Невідомий профіль '{profile}'. Доступні: {available}")
+
+    return _rules_cache[profile]
+
+
+def reload_rules() -> None:
+    """Перезавантажити правила з файлу."""
+    global _rules_cache, _rules_config
+    _rules_cache = None
+    _rules_config = None

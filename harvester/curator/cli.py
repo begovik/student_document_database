@@ -25,6 +25,7 @@ def prepare(
     limit: int | None = typer.Option(None, "--limit", "-n", help="Максимальна кількість документів (LLM може обрати менше)"),
     output: str = typer.Option("catalogs", "--output-dir", "-o", help="Директорія для збереження каталогу"),
     dry_run: bool = typer.Option(False, "--dry-run", "-d", help="Не зберігати результат, лише показати що було б зроблено"),
+    profile: str = typer.Option("strict", "--profile", "-p", help="Профіль фільтрації: strict (жорсткий) або softier (м'який)"),
 ):
     """Підготувати каталог документів для заданої теми.
 
@@ -40,13 +41,15 @@ def prepare(
         harvester curator prepare "Підприємництво, торгівля та біржова діяльність"
         harvester curator prepare "Економіка" --limit 50
         harvester curator prepare "Інформатика" --dry-run
+        harvester curator prepare "Технологія виробництва одягу" --profile strict
+        harvester curator prepare "Технологія виробництва одягу" --profile softier
     """
-    asyncio.run(_prepare_cli(topic, limit, output, dry_run))
+    asyncio.run(_prepare_cli(topic, limit, output, dry_run, profile))
 
 
-async def _prepare_cli(topic: str, limit: int | None, output: str, dry_run: bool):
+async def _prepare_cli(topic: str, limit: int | None, output: str, dry_run: bool, profile: str):
     try:
-        result = await prepare_catalog(topic, output_dir=output, limit=limit, dry_run=dry_run)
+        result = await prepare_catalog(topic, output_dir=output, limit=limit, dry_run=dry_run, profile=profile)
         if result is None:
             print("❌ Не вдалося підготувати каталог (жодних кандидатів не знайдено)")
             return
