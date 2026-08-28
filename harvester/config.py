@@ -275,9 +275,16 @@ class FilterRules(BaseModel):
     """Правила фільтрації документів для каталогів."""
     description: str = ""
     min_page_count: int = Field(default=1, ge=1, le=100)
+    min_chars_per_page: int = Field(default=500, ge=0, le=10000)
     require_references: bool = False
+    require_conclusion: bool = False
+    require_introduction: bool = False
     require_structured_sections: bool = False
     require_title_page: bool = False
+    max_toc_ratio: float = Field(default=0.30, ge=0.0, le=1.0)
+    reject_ppt: bool = False
+    reject_annotations: bool = False
+    reject_theses_fragments: bool = False
     llm_completeness_level: str = Field(default="basic", pattern=r"^(basic|strict)$")
 
 

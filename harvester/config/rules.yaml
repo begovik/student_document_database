@@ -9,9 +9,16 @@ profiles:
   strict:
     description: "Жорсткі фільтри для повноцінних структурованих документів"
     min_page_count: 3
-    require_references: false
-    require_structured_sections: false
-    require_title_page: false
+    min_chars_per_page: 1500  # Мінімальна щільність тексту (знаків на сторінку)
+    require_references: true  # Потрібен розділ "Література/References"
+    require_conclusion: false  # Потрібні висновки
+    require_introduction: false  # Потрібен вступ
+    require_structured_sections: false  # Потрібні розділи з номерами
+    require_title_page: false  # Потрібен титульний аркуш
+    max_toc_ratio: 0.15  # Максимальна частка змісту в документі (зміст не повинен перевищувати 15% тексту)
+    reject_ppt: true  # Відкидати презентації PowerPoint
+    reject_annotations: false  # Відкидати анотації/реферати
+    reject_theses_fragments: false  # Відкидати фрагменти дипломних
     llm_completeness_level: "strict"
 
   # М'який профіль
@@ -19,9 +26,16 @@ profiles:
   softier:
     description: "М'які фільтри — приймає короткі документи якщо вони якісні"
     min_page_count: 1
+    min_chars_per_page: 500  # Мінімальна щільність тексту
     require_references: false
+    require_conclusion: false
+    require_introduction: false
     require_structured_sections: false
     require_title_page: false
+    max_toc_ratio: 0.30  # М'якіший поріг для змісту
+    reject_ppt: false
+    reject_annotations: false
+    reject_theses_fragments: false
     llm_completeness_level: "basic"
 
 # Поточний профіль (перевизначається через --profile або HARVESTER_PROFILE)

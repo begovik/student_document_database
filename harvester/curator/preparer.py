@@ -36,10 +36,13 @@ REQUIRED_FIELDS = {
 
 def is_document_complete(doc: dict[str, Any], rules: FilterRules | None = None) -> tuple[bool, str | None]:
     """Перевірити, чи документ має повний набір даних і є повноцінним цілісним джерелом."""
+    import re
+    
     if rules is None:
         rules = get_filter_rules()
     
     min_page_count = rules.min_page_count
+    min_chars_per_page = rules.min_chars_per_page
     
     REQUIRED_FIELDS = {
         "title": "Назва має бути непорожньою",
@@ -73,7 +76,6 @@ def is_document_complete(doc: dict[str, Any], rules: FilterRules | None = None) 
     if "microsoft word" in title_lower:
         return False, "title містить 'Microsoft Word'"
     # Перевірка що title містить хоча б 2 слова з літер
-    import re
     words = re.findall(r'[a-zA-Zа-яА-ЯіІєЇїЄєҐёЁ]{2,}', title)
     if len(words) < 2:
         return False, f"title не містить слів (знайдено {len(words)})"
@@ -131,6 +133,32 @@ def is_document_complete(doc: dict[str, Any], rules: FilterRules | None = None) 
         except (json.JSONDecodeError, TypeError):
             pass
 
+    # === НОВІ ПЕРЕВІРКИ ЗА ПРАВИЛАМИ ===
+    
+    # Перевірка щільності тексту (мінімум 1500 знаків на сторінку)
+    text_length = doc.get("text_length", 0) or 0
+    page_count = doc.get("page_count", 1) or 1
+    if text_length > 0 and page_count > 0:
+        chars_per_page = text_length / page_count
+        if chars_per_page < min_chars_per_page:
+            return False, f"низька щільність тексту ({chars_per_page:.0f} знаків/стор, мінімум {min_chars_per_page})"
+    
+    # Відкидання презентацій PowerPoint
+    if rules.reject_ppt:
+        extra_data = doc.get("extra")
+        if extra_data and isinstance(extra_data, str):
+            try:
+                extra = json.loads(extra_data)
+                producer = extra.get("producer", "")
+                if "powerpoint" in producer.lower() or "ppt" in producer.lower():
+                    return False, "презентація PowerPoint"
+            except (json.JSONDecodeError, TypeError):
+                pass
+        # Додаткова перевірка за назвою
+        title_lower = doc.get("title", "").lower()
+        if "презентація" in title_lower or "presentation" in title_lower:
+            return False, "презентація за назвою"
+    
     return True, None
 
 
