@@ -191,7 +191,7 @@ def extract_references_from_text(text: str) -> list[BibliographyEntry]:
     # Знаходимо початок розділу літератури
     ref_start = -1
     for pattern in ref_section_patterns:
-        match = re.search(pattern, full_text if 'full_text' in dir() else text, re.IGNORECASE)
+        match = re.search(pattern, text, re.IGNORECASE)
         if match:
             ref_start = match.end()
             break
@@ -277,6 +277,83 @@ def deduplicate_references(references: list[BibliographyEntry]) -> list[Bibliogr
             unique.append(ref)
     
     return unique
+
+
+RUSSIAN_TLDS = (".ru", ".su", ".рф", ".xn--p1ai")
+RUSSIAN_PUBLISHERS_HINTS = [
+    "издательство",
+    "наука",
+    "высшая школа",
+    "просвещение",
+    "москва",
+    "санкт-петербург",
+    "россия",
+    "российский",
+    "ленинград",
+]
+SOVIET_PUBLISHERS_RU_HINTS = [
+    "наука",
+    "мысль",
+    "высшая школа",
+    "просвещение",
+    "мир",
+    "политиздат",
+]
+
+
+def is_russian_entry(entry: BibliographyEntry) -> tuple[bool, str | None]:
+    """Перевірити чи запис літератури є російським/радянським і підлягає фільтрації."""
+    text = f"{entry.raw_text} {entry.source} {entry.url}".lower()
+
+    # 1. Перевірка TLD у URL
+    if entry.url:
+        try:
+            import tldextract
+
+            ext = tldextract.extract(entry.url)
+            suffix = f".{ext.suffix}".lower() if ext.suffix else ""
+            domain = f"{ext.domain}.{ext.suffix}".lower() if ext.domain and ext.suffix else entry.url.lower()
+            if suffix in RUSSIAN_TLDS or domain.endswith((".ru", ".su")) or ".рф" in entry.url.lower():
+                return True, f"російський домен TLD {suffix or domain}"
+        except Exception:  # noqa: BLE001
+            if any(tld in entry.url.lower() for tld in RUSSIAN_TLDS):
+                return True, "російський домен у URL"
+
+    # 2. Перевірка видавництв/міст СРСР у джерелі
+    for hint in RUSSIAN_PUBLISHERS_HINTS:
+        if hint in text and (
+            re.search(r"\b(19[0-8]\d|1990)\b", entry.raw_text) or "издательство" in text
+        ):
+            return True, f"радянське/російське видавництво '{hint}'"
+
+    # 3. Мовна перевірка: кирилиця без українських літер + наявність російських літер
+    # Українські специфічні: і, ї, є, ґ
+    has_ukr = any(c in entry.raw_text for c in "іїєґІЇЄҐ")
+    has_ru_specific = any(c in entry.raw_text for c in "ыэъёЫЭЪЁ")
+    # Якщо є кирилиця, немає українських, є російські специфічні - ймовірно російська
+    if re.search(r"[а-яА-Я]{10,}", entry.raw_text) and not has_ukr and has_ru_specific:
+        return True, "російська мова (відсутні іїєґ, є ыэъё)"
+
+    # 4. Евристика: текст російською якщо містить "Издательство" або "г. Москва"
+    if re.search(r"\bИздательство\b|\bг\.\s*Москва\b|\bг\.\s*СПб\b", entry.raw_text):
+        return True, "російське видавництво/місто у бібліографії"
+
+    return False, None
+
+
+def filter_russian_entries(
+    references: list[BibliographyEntry],
+) -> tuple[list[BibliographyEntry], list[tuple[BibliographyEntry, str]]]:
+    """Відфільтрувати російські джерела. Повертає (залишені, відфільтровані з причиною)."""
+    kept: list[BibliographyEntry] = []
+    filtered: list[tuple[BibliographyEntry, str]] = []
+    for entry in references:
+        is_ru, reason = is_russian_entry(entry)
+        if is_ru:
+            filtered.append((entry, reason or "російське джерело"))
+        else:
+            kept.append(entry)
+    return kept, filtered
 
 
 def format_references_list(references: list[BibliographyEntry]) -> str:

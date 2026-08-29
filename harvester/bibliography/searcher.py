@@ -60,30 +60,49 @@ class BibliographySearcher:
         """Знайти одне посилання."""
         result = SearchResult(reference=ref)
         
-        # 1. Спочатку шукаємо в БД (якщо є DOI або URL)
-        if db and ref.doi:
-            db_result = await self._search_in_database(db, doi=ref.doi)
+        # 1. Спочатку шукаємо в БД (DOI, URL, назва+автор)
+        if db:
+            # Спроба за DOI / URL / назвою одним запитом
+            db_result = await self._search_in_database(
+                db,
+                doi=ref.doi or None,
+                url=ref.url or None,
+                title=ref.title or None,
+                authors=ref.authors or None,
+            )
             if db_result:
-                result.found = True
-                result.in_database = True
-                result.document_id = db_result["id"]
-                result.source_url = db_result.get("canonical_url", "")
-                result.source_type = "db_document"
-                result.accessibility = "accessible"
-                result.relevance_score = 1.0
-                return result
-        
-        if db and ref.url:
-            db_result = await self._search_in_database(db, url=ref.url)
-            if db_result:
-                result.found = True
-                result.in_database = True
-                result.document_id = db_result["id"]
-                result.source_url = db_result.get("canonical_url", "")
-                result.source_type = "db_document"
-                result.accessibility = "accessible"
-                result.relevance_score = 1.0
-                return result
+                # Перевірка: чи не є знайдений документ російським (фільтр RU)
+                try:
+                    from harvester.net.guards import is_domain_blocked
+
+                    if await is_domain_blocked(db_result.get("canonical_url", "")):
+                        logger.info("db_result_blocked_domain", url=db_result.get("canonical_url"))
+                    else:
+                        # Мовна перевірка назви
+                        if ref.raw_text:
+                            from harvester.verify.langid import detect_language
+
+                            lang = await detect_language(ref.raw_text[:2000])
+                            if lang.language == "ru" and lang.confidence >= 0.8:
+                                logger.info("db_result_russian_filtered", title=ref.title[:40])
+                            else:
+                                result.found = True
+                                result.in_database = True
+                                result.document_id = db_result["id"]
+                                result.source_url = db_result.get("canonical_url", "")
+                                result.source_type = "db_document"
+                                result.accessibility = "accessible"
+                                result.relevance_score = 1.0
+                                return result
+                except Exception:
+                    result.found = True
+                    result.in_database = True
+                    result.document_id = db_result["id"]
+                    result.source_url = db_result.get("canonical_url", "")
+                    result.source_type = "db_document"
+                    result.accessibility = "accessible"
+                    result.relevance_score = 1.0
+                    return result
         
         # 2. Шукаємо в інтернеті
         if ref.doi:
@@ -115,8 +134,10 @@ class BibliographySearcher:
         db,
         doi: str | None = None,
         url: str | None = None,
+        title: str | None = None,
+        authors: list[str] | None = None,
     ) -> dict | None:
-        """Шукати документ в БД за DOI або URL."""
+        """Шукати документ в БД за DOI, URL або назвою."""
         try:
             if doi:
                 rows = await db.fetchall(
@@ -125,17 +146,50 @@ class BibliographySearcher:
                 )
                 if rows:
                     return dict(rows[0])
-            
+
             if url:
+                # Точне співпадіння
                 rows = await db.fetchall(
                     "SELECT id, canonical_url, title FROM documents WHERE canonical_url = ? AND status = 'verified'",
                     (url,)
                 )
                 if rows:
                     return dict(rows[0])
+                # Нормалізований URL (без параметрів)
+                from harvester.dedup.urlnorm import normalize_url
+
+                try:
+                    norm = normalize_url(url)
+                    rows = await db.fetchall(
+                        "SELECT id, canonical_url, title FROM documents WHERE canonical_url = ? AND status = 'verified'",
+                        (norm,),
+                    )
+                    if rows:
+                        return dict(rows[0])
+                except Exception:
+                    pass
+
+            if title and len(title.strip()) >= 10:
+                # Пошук за підстрокою назви (перші 80 символів, без лапок)
+                clean = re.sub(r"[«»\"']", "", title).strip()[:80]
+                # Прибираємо дуже короткі слова
+                if len(clean) >= 10:
+                    rows = await db.fetchall(
+                        "SELECT id, canonical_url, title FROM documents WHERE status='verified' AND title LIKE ? LIMIT 3",
+                        (f"%{clean[:60]}%",),
+                    )
+                    if rows:
+                        # Додаткова перевірка: якщо автор співпадає - підвищуємо впевненість
+                        if authors:
+                            for r in rows:
+                                db_title = (r["title"] or "").lower()
+                                if clean.lower()[:30] in db_title or db_title[:30] in clean.lower():
+                                    return dict(r)
+                        else:
+                            return dict(rows[0])
         except Exception as e:
             logger.warning("db_search_error", error=str(e))
-        
+
         return None
     
     async def _search_by_doi(self, doi: str) -> dict | None:
@@ -178,35 +232,65 @@ class BibliographySearcher:
         authors: list[str] | None = None,
         year: str | None = None,
     ) -> dict | None:
-        """Шукати документ за назвою."""
+        """Шукати документ за назвою. З фільтром RU та перевіркою доступності."""
         from harvester.discovery.ddgs_search import DDGSSearchChannel
-        
+        from harvester.net.guards import is_url_allowed
+
         # Формуємо запит
         query_parts = [title]
         if authors:
             query_parts.append(authors[0].split()[0])  # Прізвище першого автора
         if year:
             query_parts.append(year)
-        
+
         query = " ".join(query_parts) + " filetype:pdf"
-        
+
         search_channel = DDGSSearchChannel()
-        
+
         try:
             results = []
             async for candidate in search_channel.discover({"query_text": query, "max_results": 5}):
+                url = candidate.url
+                # Фільтр RU / заблокованих доменів - жорстко відкидаємо
+                allowed, reason = await is_url_allowed(url)
+                if not allowed:
+                    logger.info("search_result_filtered", url=url, reason=reason)
+                    continue
+                # Додаткова перевірка мови заголовка кандидата (швидка евристика)
+                cand_title = (candidate.title or "") + " " + (candidate.url or "")
+                if any(x in cand_title.lower() for x in [".ru", ".su", "xn--p1ai"]) and "москва" in cand_title.lower():
+                    continue
                 results.append({
-                    "url": candidate.url,
+                    "url": url,
                     "title": candidate.title,
                     "type": "online_pdf",
                     "relevance": 0.6,
                     "accessibility": "unknown",
                 })
-            
+
             if results:
-                # Повертаємо найкращий результат
-                return results[0]
+                # Перевірка доступності першого результату (HEAD)
+                best = results[0]
+                try:
+                    import httpx
+
+                    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                        resp = await client.head(best["url"], headers={"User-Agent": get_settings().http.user_agent})
+                        if resp.status_code in (200, 206):
+                            ct = resp.headers.get("content-type", "")
+                            if "pdf" in ct.lower() or best["url"].lower().endswith(".pdf"):
+                                best["accessibility"] = "accessible"
+                            else:
+                                best["type"] = "online_abstract"
+                                best["accessibility"] = "accessible"
+                        elif resp.status_code in (403, 404, 451):
+                            best["accessibility"] = "restricted"
+                        else:
+                            best["accessibility"] = "unknown"
+                except Exception:
+                    best["accessibility"] = "unknown"
+                return best
         except Exception as e:
             logger.warning("title_search_error", title=title[:50], error=str(e))
-        
+
         return None

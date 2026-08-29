@@ -461,3 +461,18 @@ class LLMClient:
             tokens=total_tokens,
         )
         return LLMResponse(text=text, provider=phase, model=model, duration_ms=duration_ms)
+
+class GeminiRateLimited(Exception):
+    pass
+
+
+class GeminiQuotaExceeded(Exception):
+    pass
+
+
+class GeminiAuthError(Exception):
+    pass
+
+
+class OpenRouterPaymentRequired(Exception):
+    pass
