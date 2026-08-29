@@ -112,17 +112,36 @@ class Supervisor:
             self._worker_objs.append(worker)
             self._workers.append(self._spawn(f"verify-{i}", worker.run()))
 
-        for i in range(w.classify):
-            worker = ClassifyWorker(i, self.settings, self.db, self.scheduler)
-            self._worker_objs.append(worker)
-            self._workers.append(self._spawn(f"classify-{i}", worker.run()))
-
-        logger.info(
-            "workers_started",
-            discovery=w.discovery,
-            verify=w.verify,
-            classify=w.classify,
-        )
+        # Classify воркери: один ключ × одна модель = один воркер
+        classify_keys = self.settings.classify_keys
+        classify_models = self.settings.llm.gemma_models
+        if classify_keys:
+            worker_id = 0
+            for key in classify_keys:
+                for model in classify_models:
+                    worker = ClassifyWorker(worker_id, self.settings, self.db, self.scheduler,
+                                           classify_key=key, classify_model=model)
+                    self._worker_objs.append(worker)
+                    self._workers.append(self._spawn(f"classify-{worker_id}", worker.run()))
+                    worker_id += 1
+            logger.info(
+                "workers_started",
+                discovery=w.discovery,
+                verify=w.verify,
+                classify=worker_id,
+                classify_mode="gemma_per_key_model",
+            )
+        else:
+            for i in range(w.classify):
+                worker = ClassifyWorker(i, self.settings, self.db, self.scheduler)
+                self._worker_objs.append(worker)
+                self._workers.append(self._spawn(f"classify-{i}", worker.run()))
+            logger.info(
+                "workers_started",
+                discovery=w.discovery,
+                verify=w.verify,
+                classify=w.classify,
+            )
 
     def _spawn(self, name: str, coro) -> asyncio.Task:
         """Воркер із охоронцем: фатальні помилки логуються, а не зникають мовчки."""
@@ -198,16 +217,16 @@ class Supervisor:
 
     async def _check_llm_exhausted(self) -> bool:
         """Перевіряє, чи всі LLM ліміти вичерпані."""
-        from harvester.classify.llm import AllLimitsExhausted
-        try:
-            from harvester.classify.classifier import Classifier
-            classifier = Classifier(self.db)
-            if classifier.llm.enabled and classifier.llm._initialized:
-                if len(classifier.llm._daily_limit_exhausted) >= len(classifier.llm._keys) * len(classifier.llm._models):
-                    return True
-        except Exception:
-            pass
-        return False
+        # У gemma_per_key_model режимі — кожен воркер сам керує ключем
+        # Перевіряємо чи хоча б один воркер ще працює
+        classify_alive = any(
+            w._running for w in self._worker_objs
+            if isinstance(w, ClassifyWorker)
+        )
+        # Якщо хоча б один воркер працює — не зупиняємося
+        if classify_alive:
+            return False
+        return True
 
     async def _handle_signal(self, sig: signal.Signals) -> None:
         logger.info("signal_received", signal=sig.name)

@@ -189,6 +189,12 @@ class DocumentsRepository:
         )
         return {row["lang"]: row["count"] for row in rows}
 
+    async def count_classified(self) -> tuple[int, int]:
+        """Повертає (кількість класифікацій, кількість унікальних документів з темами)."""
+        total = await self.db.fetchone("SELECT COUNT(*) as c FROM document_topics")
+        unique = await self.db.fetchone("SELECT COUNT(DISTINCT document_id) as c FROM document_topics")
+        return (total["c"] if total else 0, unique["c"] if unique else 0)
+
 
 class DocumentRefsRepository:
     def __init__(self, db: Database):
@@ -543,13 +549,14 @@ class SearchQueriesRepository:
         self.db = db
 
     async def insert_if_new(
-        self, text: str, engine: str = "ddgs", region: str = "ua-uk", topic_hint: str | None = None
+        self, text: str, engine: str = "ddgs", region: str = "ua-uk",
+        topic_hint: str | None = None, priority: int = 10
     ) -> int | None:
         sql = """
-        INSERT OR IGNORE INTO search_queries (text, engine, region, topic_hint)
-        VALUES (?, ?, ?, ?)
+        INSERT OR IGNORE INTO search_queries (text, engine, region, topic_hint, priority)
+        VALUES (?, ?, ?, ?, ?)
         """
-        cursor = await self.db.execute(sql, (text, engine, region, topic_hint))
+        cursor = await self.db.execute(sql, (text, engine, region, topic_hint, priority))
         if cursor.rowcount == 0:
             return None
         return cursor.lastrowid
@@ -559,13 +566,13 @@ class SearchQueriesRepository:
         return row["c"] if row else 0
 
     async def pick_lru(self) -> dict | None:
-        """Найдавніше використаний активний запит без cooldown (LRU)."""
+        """Найвищий пріоритет, з-поміж них — найдавніше використаний."""
         now = datetime.utcnow().isoformat()
         row = await self.db.fetchone(
             """
             SELECT * FROM search_queries
             WHERE status = 'active' AND (cooldown_until IS NULL OR cooldown_until <= ?)
-            ORDER BY last_run_at IS NOT NULL ASC, last_run_at ASC, id ASC
+            ORDER BY priority DESC, last_run_at IS NOT NULL ASC, last_run_at ASC, id ASC
             LIMIT 1
             """,
             (now,),

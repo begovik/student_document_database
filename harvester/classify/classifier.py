@@ -37,10 +37,11 @@ CLASSIFY_PROMPT = """Ти — класифікатор наукових доку
 class Classifier:
     """Зважені сигнали: S1 УДК (0.45), S3 ключові слова (0.15), S5 LLM (Gemini) — якщо доступний."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, keys: list[str] | None = None, models: list[str] | None = None,
+                 gemma_only: bool = False):
         self.db = db
         self.settings = get_settings()
-        self.llm = LLMClient()
+        self.llm = LLMClient(keys=keys, models=models, gemma_only=gemma_only)
 
     async def classify_document(self, doc: dict) -> dict:
         topics = await load_topics(self.db)
@@ -119,11 +120,24 @@ class Classifier:
 
         resp = await self.llm.complete(prompt)
         raw = resp.text.strip()
+        # Видаляємо markdown блоки ```json ... ``` або ``` ... ```
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw
             raw = raw.rsplit("```", 1)[0]
+        # Шукаємо JSON об'єкт у тексті (може бути після thinking)
+        json_start = raw.find("{")
+        json_end = raw.rfind("}") + 1
+        if json_start >= 0 and json_end > json_start:
+            raw = raw[json_start:json_end]
 
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as e:
+            # Помилка парсингу JSON — повертаємо пусту відповідь замість крашу
+            logger.warning("llm_json_parse_error", doc_id=doc.get("id"),
+                          model=resp.model, error_msg=str(e)[:100], raw_preview=raw[:200])
+            return {"topics": [], "confidence": 0.0}
+
         logger.info(
             "llm_classified",
             doc_id=doc.get("id"),

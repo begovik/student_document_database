@@ -138,7 +138,7 @@ class DatabaseConfig(BaseModel):
 class LLMConfig(BaseModel):
     enabled: bool = True
     gemini_models: list[str] = Field(default=["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"])
-    gemma_models: list[str] = Field(default=["gemma-4-31b-it", "gemma-4-26b-it"])
+    gemma_models: list[str] = Field(default=["gemma-4-31b-it", "gemma-4-26b-a4b-it"])
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     gemma_max_chars: int = Field(default=15000, ge=5000, le=100000)
     openrouter_model: str = "google/gemini-2.5-flash"
@@ -148,6 +148,12 @@ class LLMConfig(BaseModel):
     temperature: float = Field(default=0.1, ge=0.0, le=2.0)
     min_interval_s: float = Field(default=1.5, ge=0.0)
     daily_limit_wait_s: float = Field(default=120.0, gt=0)
+    # Per-model rate limits
+    gemini_rpm: int = Field(default=15, ge=1, description="Gemini: запитів за хвилину")
+    gemini_rpd: int = Field(default=500, ge=1, description="Gemini: запитів за день")
+    gemma_rpm: int = Field(default=50, ge=1, description="Gemma: запитів за хвилину")
+    gemma_rpd: int = Field(default=14000, ge=1, description="Gemma: запитів за день")
+    gemma_tpm: int = Field(default=16000, ge=1000, description="Gemma: токенів за хвилину")
     max_text_chars_for_llm: int = Field(default=80000, ge=10000, le=500000)
     max_pages_for_extraction: int = Field(default=100, ge=10, le=1000)
 
@@ -196,6 +202,12 @@ class Settings(BaseSettings):
     gemini_api_key_2: Annotated[str | None, Field(default=None, validation_alias="GEMINI_API_KEY_2")] = None
     gemini_api_key_3: Annotated[str | None, Field(default=None, validation_alias="GEMINI_API_KEY_3")] = None
     open_router_api_key: Annotated[str | None, Field(default=None, validation_alias="OPEN_ROUTER_API_KEY")] = None
+
+    # Окремі ключі для класифікації (Gemma тільки)
+    classify_api_key_1: Annotated[str | None, Field(default=None, validation_alias="GEMINI_DOC_VERIFIER_KEY_1")] = None
+    classify_api_key_2: Annotated[str | None, Field(default=None, validation_alias="GEMINI_DOC_VERIFIER_KEY_2")] = None
+    classify_api_key_3: Annotated[str | None, Field(default=None, validation_alias="GEMINI_DOC_VERIFIER_KEY_3")] = None
+    classify_api_key_4: Annotated[str | None, Field(default=None, validation_alias="GEMINI_DOC_VERIFIER_KEY_4")] = None
     pg_user: Annotated[str | None, Field(default=None, validation_alias=AliasChoices("HARVESTER_PG_USER", "PG_USER"))] = None
     pg_password: Annotated[str | None, Field(default=None, validation_alias=AliasChoices("HARVESTER_PG_PASSWORD", "PG_PASS"))] = None
     user_email: Annotated[str | None, Field(default=None, validation_alias="USER_EMAIL")] = None
@@ -204,6 +216,11 @@ class Settings(BaseSettings):
     @property
     def gemini_keys(self) -> list[str]:
         return [k for k in (self.gemini_api_key, self.gemini_api_key_2, self.gemini_api_key_3) if k]
+
+    @property
+    def classify_keys(self) -> list[str]:
+        return [k for k in (self.classify_api_key_1, self.classify_api_key_2,
+                            self.classify_api_key_3, self.classify_api_key_4) if k]
 
     @field_validator("contact")
     @classmethod
