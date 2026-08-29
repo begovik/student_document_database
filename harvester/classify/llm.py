@@ -238,6 +238,17 @@ class LLMClient:
         if gemma_ok is not None:
             return gemma_ok
 
+        # Розрізняємо справжнє вичерпання лімітів та тимчасові 5xx
+        has_daily_limit = any("daily limit" in e.lower() for e in errors)
+        has_transient = any(
+            any(code in e for code in ["500", "502", "503", "504", "timeout", "ReadError", "ConnectError", "RemoteProtocolError"])
+            for e in errors
+        )
+        # Якщо немає daily limit, а є лише transient 5xx/timeout — це не AllLimitsExhausted
+        if has_transient and not has_daily_limit:
+            logger.warning("llm_transient_unavailable", errors=errors)
+            raise LLMUnavailable("; ".join(errors) or "тимчасова недоступність LLM (5xx/timeout)")
+
         logger.critical("llm_all_limits_exhausted")
         # Сповіщення на пошту про вичерпання всіх LLM
         try:
