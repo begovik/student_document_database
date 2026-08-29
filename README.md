@@ -60,8 +60,10 @@ sudo journalctl -u harvester -f
 ### CLI команди
 
 ```bash
-# Стан сервісу
+# Стан сервісу та БД
 harvester status
+harvester db-status
+harvester db-size
 
 # Статистика по каналах
 harvester stats --period 24h
@@ -70,6 +72,11 @@ harvester stats --period 7d --json
 # Експорт верифікованих документів
 harvester export --output docs.csv --format csv --lang uk
 harvester export --output docs.jsonl --format jsonl
+
+# Кураторство каталогів та витяг
+harvester curator prepare "Підприємництво, торгівля та біржова діяльність"
+harvester curator verify catalogs/catalog_20260828_102049
+harvester extract run --topic "Економіка"
 
 # Оптимізація БД
 harvester vacuum
