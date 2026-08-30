@@ -239,6 +239,11 @@ class LLMClient:
             return gemma_ok
 
         # Розрізняємо справжнє вичерпання лімітів та тимчасові 5xx
+        if not errors:
+            # Жодної спроби не було (всі комбінації вже в exhausted) — не спамимо листом
+            logger.warning("llm_no_attempts_all_exhausted", exhausted=len(exhausted))
+            raise LLMUnavailable("немає доступних комбінацій ключ/модель — можливо всі в exhausted")
+
         has_daily_limit = any("daily limit" in e.lower() for e in errors)
         has_transient = any(
             any(code in e for code in ["500", "502", "503", "504", "timeout", "ReadError", "ConnectError", "RemoteProtocolError"])
