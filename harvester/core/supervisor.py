@@ -143,6 +143,19 @@ class Supervisor:
                 classify=w.classify,
             )
 
+        # Verifier воркери — 24/7 перевірка джерел за strict-правилами (Gemini 3.1 Flash Lite)
+        if w.verifier > 0 and self.settings.verifier.enabled:
+            try:
+                from harvester.verifier.worker import VerifierWorker
+
+                for i in range(w.verifier):
+                    v_worker = VerifierWorker(i)
+                    self._worker_objs.append(v_worker)
+                    self._workers.append(self._spawn(f"verifier-{i}", v_worker.run()))
+                logger.info("verifier_workers_started", count=w.verifier)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("verifier_worker_start_failed", error=str(e)[:200])
+
     def _spawn(self, name: str, coro) -> asyncio.Task:
         """Воркер із охоронцем: фатальні помилки логуються, а не зникають мовчки."""
 

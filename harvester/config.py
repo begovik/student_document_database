@@ -22,6 +22,7 @@ class WorkersConfig(BaseModel):
     discovery: int = Field(default=3, ge=1, le=16)
     scanner: int = Field(default=1, ge=1, le=8)
     classify: int = Field(default=1, ge=1, le=4)
+    verifier: int = Field(default=1, ge=0, le=4)
 
 
 class HttpConfig(BaseModel):
@@ -99,6 +100,16 @@ class ScannerConfig(BaseModel):
     max_pages_per_source: int = Field(default=300, ge=1, le=10000)
     max_depth: int = Field(default=2, ge=1, le=5)
     sitemap_max_urls: int = Field(default=50000, ge=100, le=1000000)
+
+
+class VerifierConfig(BaseModel):
+    enabled: bool = True
+    batch_size: int = Field(default=20, ge=1, le=100)
+    interval_s: int = Field(default=60, ge=5, le=3600)
+    recheck_days: int = Field(default=7, ge=1, le=365)
+    llm_enabled: bool = True
+    llm_model: str = "gemini-3.1-flash-lite"
+    llm_max_chars: int = Field(default=15000, ge=1000, le=100000)
 
 
 class RetentionConfig(BaseModel):
@@ -191,6 +202,7 @@ class Settings(BaseSettings):
     classify: ClassifyConfig = Field(default_factory=ClassifyConfig)
     reverify: ReverifyConfig = Field(default_factory=ReverifyConfig)
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
+    verifier: VerifierConfig = Field(default_factory=VerifierConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
