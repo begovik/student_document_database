@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import structlog
 
@@ -16,7 +16,7 @@ logger = structlog.get_logger()
 
 
 def _tomorrow_midnight_utc() -> datetime:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     return tomorrow
 
@@ -45,7 +45,7 @@ class VerifierWorker:
         try:
             await self.llm.initialize()
         except AllLimitsExhausted:
-            sleep_s = ( _tomorrow_midnight_utc() - datetime.now(timezone.utc)).total_seconds()
+            sleep_s = ( _tomorrow_midnight_utc() - datetime.now(UTC)).total_seconds()
             log.critical("verifier_all_keys_exhausted_sleep", sleep_s=int(sleep_s))
             await asyncio.sleep(max(sleep_s, 60))
             return await self.run()
@@ -108,14 +108,22 @@ class VerifierWorker:
 
                         # 4. LLM-верифікація (дорого) — тільки якщо пройшли 1-2
                         llm_verdict, llm_comment, llm_conf = "skip", "", 0.0
+                        llm_extracted_title: str | None = None
+                        llm_extracted_authors: list[str] | None = None
                         llm_model = "gemini-3.1-flash-lite"
                         llm_key_idx = self.llm._key_idx
                         if passed:
                             try:
                                 from harvester.verifier.llm_verifier import verify_with_llm
 
-                                llm_verdict, llm_comment, llm_conf = await verify_with_llm(doc, self.llm)
-                                log_doc.info("verifier_llm_ok", verdict=llm_verdict, comment=llm_comment[:100])
+                                llm_verdict, llm_comment, llm_conf, llm_extracted_title, llm_extracted_authors = await verify_with_llm(doc, self.llm)
+                                log_doc.info(
+                                    "verifier_llm_ok",
+                                    verdict=llm_verdict,
+                                    comment=llm_comment[:100],
+                                    extracted_title=llm_extracted_title[:60] if llm_extracted_title else None,
+                                    extracted_authors=llm_extracted_authors,
+                                )
                                 if llm_verdict == "fail":
                                     passed = False
                                     failed_rules.append(f"llm:{llm_comment[:80]}")
@@ -125,7 +133,7 @@ class VerifierWorker:
                                     log_doc.warning("verifier_llm_error_ignored", error=llm_comment[:100])
                             except AllLimitsExhausted:
                                 # Всі 4 ключі вичерпані — спати до 00:00 UTC
-                                sleep_s = (_tomorrow_midnight_utc() - datetime.now(timezone.utc)).total_seconds()
+                                sleep_s = (_tomorrow_midnight_utc() - datetime.now(UTC)).total_seconds()
                                 log.critical("verifier_all_keys_exhausted_sleep", sleep_s=int(sleep_s), doc_id=doc_id)
                                 await asyncio.sleep(max(sleep_s, 60))
                                 # Очистити exhausted сети щоб зранку почати заново
@@ -136,6 +144,15 @@ class VerifierWorker:
                             except Exception as e:  # noqa: BLE001
                                 log_doc.warning("verifier_llm_error", error=str(e)[:150])
                                 llm_verdict, llm_comment = "error", str(e)[:200]
+
+                        # 4b. LLM-витяг назви/авторів — порівняння та оновлення (якщо LLM повернув)
+                        # Логіка: якщо в БД немає або сміття — записати; якщо неспівпадіння — замінити/доповнити
+                        try:
+                            await self._maybe_update_title_authors(
+                                doc, llm_extracted_title, llm_extracted_authors, log_doc, db
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            log_doc.warning("verifier_title_authors_update_failed", error=str(e)[:150])
 
                         # Запис результату
                         status = "pass" if passed else "fail"
@@ -165,12 +182,142 @@ class VerifierWorker:
 
                 except asyncio.CancelledError:
                     break
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     log.error("verifier_worker_error", error=str(e), exc_info=True)
                     await asyncio.sleep(10)
         finally:
             await db.close()
             log.info("verifier_worker_stopped")
+
+    async def _maybe_update_title_authors(
+        self,
+        doc: dict,
+        llm_title: str | None,
+        llm_authors: list[str] | None,
+        log_doc,
+        db,
+    ) -> None:
+        """Порівняти LLM-витягнуті назву/авторів з БД і оновити якщо треба.
+
+        - Якщо в БД немає/порожньо/сміття — записати LLM-значення
+        - Якщо неспівпадіння — замінити (титул) або доповнити (автори)
+        """
+        import re as _re
+
+        doc_id = doc.get("id")
+        updates: dict[str, str] = {}
+
+        # --- Назва ---
+        if llm_title:
+            llm_title_norm = _re.sub(r"\s+", " ", llm_title.strip())
+            db_title = (doc.get("title") or "").strip()
+            db_title_norm = _re.sub(r"\s+", " ", db_title)
+
+            # Визначити чи DB-назва є сміттям
+            title_is_garbage = (
+                not db_title_norm
+                or len(db_title_norm) < 10
+                or "microsoft word" in db_title_norm.lower()
+                or db_title_norm.lower() in ("unknown", "untitled", "без назви")
+                or db_title_norm.lower().endswith((".pdf", ".doc", ".docx"))
+                or len(_re.findall(r"[a-zA-Zа-яА-ЯіІєЇїЄєҐёЁ]{2,}", db_title_norm)) < 2
+            )
+
+            # Порівняння без регістру/пробілів
+            titles_equal = db_title_norm.lower() == llm_title_norm.lower() if db_title_norm else False
+            titles_similar = (
+                llm_title_norm.lower() in db_title_norm.lower() or db_title_norm.lower() in llm_title_norm.lower()
+            ) if db_title_norm else False
+
+            should_update_title = False
+            reason = ""
+            if title_is_garbage:
+                should_update_title = True
+                reason = "в БД відсутня/ garbage — запис LLM-назви"
+            elif not titles_equal and not titles_similar and 5 <= len(llm_title_norm) <= 500:
+                # Явне неспівпадіння — заміняємо (LLM бачить титул з PDF)
+                should_update_title = True
+                reason = "неспівпадіння назв — заміна на LLM-версію"
+
+            if should_update_title:
+                updates["title"] = llm_title_norm
+                log_doc.info(
+                    "verifier_title_updated",
+                    old_title=db_title_norm[:80],
+                    new_title=llm_title_norm[:80],
+                    reason=reason,
+                )
+
+        # --- Автори ---
+        if llm_authors:
+            # Парсимо авторів з БД
+            db_authors_raw = doc.get("authors")
+            db_authors: list[str] = []
+            if isinstance(db_authors_raw, str):
+                try:
+                    import json as _j
+
+                    parsed = _j.loads(db_authors_raw)
+                    if isinstance(parsed, list):
+                        db_authors = [str(x).strip() for x in parsed if str(x).strip()]
+                    else:
+                        db_authors = [db_authors_raw.strip()] if db_authors_raw.strip() else []
+                except Exception:
+                    db_authors = [db_authors_raw.strip()] if db_authors_raw.strip() else []
+            elif isinstance(db_authors_raw, list):
+                db_authors = [str(x).strip() for x in db_authors_raw if str(x).strip()]
+
+            # Визначити чи DB-автори є сміттям
+            def _is_garbage_authors(authors: list[str]) -> bool:
+                if not authors:
+                    return True
+                if len(authors) == 1 and authors[0] in ("USER", "1", "Unknown", "service", "", "Admin", "Lena"):
+                    return True
+                if all(_re.match(r"^[А-ЩЬьюЯ]{1,3}\.[А-ЩЬьюЯ]{1,3}\.*$", a) for a in authors):
+                    return True
+                return False
+
+            authors_is_garbage = _is_garbage_authors(db_authors)
+
+            # Нормалізуємо для порівняння
+            db_set = {a.lower().strip() for a in db_authors}
+            llm_set = {a.lower().strip() for a in llm_authors if a.strip()}
+
+            should_update_authors = False
+            new_authors: list[str] = db_authors
+            reason_a = ""
+
+            if authors_is_garbage:
+                should_update_authors = True
+                new_authors = llm_authors
+                reason_a = "в БД відсутні/ garbage — запис LLM-авторів"
+            elif llm_set and llm_set != db_set:
+                # Доповнення: об'єднуємо унікальних
+                merged = db_authors.copy()
+                for a in llm_authors:
+                    if a.lower().strip() not in db_set:
+                        merged.append(a)
+                # Якщо є нові — оновлюємо (заміна+доповнення)
+                if len(merged) != len(db_authors):
+                    should_update_authors = True
+                    new_authors = merged[:10]  # обмеження
+                    reason_a = "неспівпадіння — доповнення списку авторів"
+
+            if should_update_authors:
+                updates["authors"] = json.dumps(new_authors, ensure_ascii=False)
+                log_doc.info(
+                    "verifier_authors_updated",
+                    old_authors=db_authors,
+                    new_authors=new_authors,
+                    reason=reason_a,
+                )
+
+        # Виконати UPDATE якщо є зміни
+        if updates:
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            params = list(updates.values()) + [doc_id]
+            await db.execute(f"UPDATE documents SET {set_clause} WHERE id = ?", tuple(params))
+            log_doc.info("verifier_metadata_updated", doc_id=doc_id, fields=list(updates.keys()))
 
     async def stop(self) -> None:
         self._running = False
