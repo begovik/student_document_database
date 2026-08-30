@@ -180,4 +180,52 @@ async def seed_discipline_queries(db: Database) -> int:
     logger.info(
         "discipline_queries_seeded", disciplines=len(seen), inserted=inserted
     )
+
+    # LLM-доповнення для бідних тем (де шаблонні запити дали 0 results_yield)
+    # Використовує Gemini 3.1/3.5 Flash Lite (GEMINI_API_KEY 1-3) з fallback на Gemma
+    try:
+        from harvester.discovery.querygen_llm import generate_queries_for_topic
+        from harvester.config import get_settings
+
+        settings = get_settings()
+        if settings.llm.enabled and settings.gemini_keys and inserted == 0:
+            # Шукаємо теми з низьким yield — кандидатів для LLM
+            low = await repo.db.fetchall(
+                "SELECT topic_hint, COUNT(*) as cnt, SUM(results_yield) as total_yield "
+                "FROM search_queries GROUP BY topic_hint HAVING total_yield = 0 LIMIT 5"
+            )
+            for row in low:
+                hint = row["topic_hint"]
+                # Знайти назву дисципліни за hint
+                name = next((n for c, n in disciplines if c == hint), hint)
+                existing = [r["text"] for r in await repo.db.fetchall(
+                    "SELECT text FROM search_queries WHERE topic_hint=? LIMIT 5", (hint,)
+                )]
+                llm_qs = await generate_queries_for_topic(name, existing_queries=[r["text"] for r in existing] if existing else None)
+                for q in llm_qs[:5]:
+                    qid = await repo.insert_if_new(q, region="ua-uk", topic_hint=hint)
+                    if qid:
+                        inserted += 1
+                if llm_qs:
+                    logger.info("discipline_llm_queries_added", topic_hint=hint, count=len(llm_qs))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("discipline_llm_seed_failed", error=str(e)[:150])
+
+    return inserted
+
+
+async def seed_llm_queries_for_topic(db: Database, topic_name: str, topic_hint: str | None = None, count: int = 8) -> int:
+    """Згенерувати LLM-запити для конкретної теми (викликається з add-queries або вручну)."""
+    from harvester.discovery.querygen_llm import generate_queries_for_topic
+
+    repo = SearchQueriesRepository(db)
+    existing_rows = await repo.db.fetchall("SELECT text FROM search_queries WHERE topic_hint=? LIMIT 10", (topic_hint or topic_name,))
+    existing = [r["text"] for r in existing_rows]
+    queries = await generate_queries_for_topic(topic_name, existing_queries=existing, count=count)
+    inserted = 0
+    for q in queries:
+        qid = await repo.insert_if_new(q, region="ua-uk", topic_hint=topic_hint or topic_name)
+        if qid:
+            inserted += 1
+    logger.info("llm_queries_seeded", topic=topic_name[:40], inserted=inserted)
     return inserted

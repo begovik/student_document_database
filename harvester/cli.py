@@ -690,6 +690,11 @@ def add_queries(
         max=100,
         help="Пріоритет запитів (вищий = раніше обробляється)",
     ),
+    use_llm: bool = typer.Option(
+        False,
+        "--llm",
+        help="Додатково згенерувати запити LLM-ом (Gemini 3.1/3.5 Flash Lite → Gemma fallback, GEMINI_API_KEY 1-3)",
+    ),
 ):
     """Додати пошукові запити для нової теми
 
@@ -880,6 +885,23 @@ def add_queries(
                             break
                     if len(queries_to_add) >= count:
                         break
+
+            # LLM-доповнення (якісні джерела з повним текстом) — Gemini 3.1/3.5 → Gemma
+            if use_llm:
+                try:
+                    from harvester.discovery.querygen_llm import generate_queries_for_topic
+
+                    existing_texts = [q[0] for q in queries_to_add[:5]]
+                    llm_needed = max(5, min(count // 10, 10))
+                    llm_qs = await generate_queries_for_topic(
+                        topic, existing_queries=existing_texts, count=llm_needed
+                    )
+                    for q in llm_qs:
+                        queries_to_add.append((q, "ua-uk", topic, priority + 5))
+                    if llm_qs:
+                        rprint(f"[green]✓ LLM згенеровано: {len(llm_qs)} (Gemini 3.1/3.5 → Gemma)[/green]")
+                except Exception as e:  # noqa: BLE001
+                    rprint(f"[yellow]⚠ LLM-генерація не вдалася: {e}[/yellow]")
 
             # Додаємо запити
             for query_text, region, topic_hint, prio in queries_to_add:
