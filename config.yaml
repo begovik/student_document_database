@@ -4,8 +4,8 @@ contact:
   email: "you@example.org"
 
 database:
-  mode: "remote"
-  host: "89.167.68.48"
+  mode: "auto"
+  host: ""
   port: 5432
   name: "harvester"
   user: "harvester"

@@ -267,6 +267,14 @@ def load_config(config_path: str | Path | None = None) -> Settings:
 
     settings = Settings(**data)
 
+    # VPS-режим: якщо в .env VPS=true — примусово remote БД (89.167.68.48)
+    # Дозволяє тримати config.yaml універсальним (mode: auto, host: "") для локальної розробки,
+    # а на хостингу перемикатися через .env без коміту хоста в репо
+    if os.getenv("VPS", "").lower() == "true":
+        settings.database.mode = "remote"
+        if not settings.database.host:
+            settings.database.host = "89.167.68.48"
+
     # Заповнити NotifyConfig з user_email та smtp_password
     if settings.user_email:
         settings.notify.smtp_user = settings.notify.smtp_user or settings.user_email

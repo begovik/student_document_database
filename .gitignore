@@ -46,3 +46,6 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+
+# Catalogs (згенеровані PDF-каталоги, не комітити)
+catalogs/
