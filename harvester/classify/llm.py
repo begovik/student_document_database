@@ -100,7 +100,8 @@ class LLMClient:
     """
 
     def __init__(self, keys: list[str] | None = None, models: list[str] | None = None,
-                 gemma_only: bool = False):
+                 gemma_only: bool = False, service: str = "LLM"):
+        self.service = service
         self.settings = get_settings()
         self._models = [] if gemma_only else (models or self.settings.llm.gemini_models)
         self._gemma_models = models or self.settings.llm.gemma_models
@@ -241,7 +242,8 @@ class LLMClient:
         # Розрізняємо справжнє вичерпання лімітів та тимчасові 5xx
         if not errors:
             # Жодної спроби не було (всі комбінації вже в exhausted) — не спамимо листом
-            logger.warning("llm_no_attempts_all_exhausted", exhausted=len(exhausted))
+            exhausted_len = len(self._gemma_limit_exhausted) + len(self._daily_limit_exhausted)
+            logger.warning("llm_no_attempts_all_exhausted", exhausted=exhausted_len)
             raise LLMUnavailable("немає доступних комбінацій ключ/модель — можливо всі в exhausted")
 
         has_daily_limit = any("daily limit" in e.lower() for e in errors)
@@ -258,7 +260,7 @@ class LLMClient:
         # Сповіщення на пошту про вичерпання всіх LLM
         try:
             from harvester.core.notify import notify_llm_all_exhausted
-            await notify_llm_all_exhausted(errors)
+            await notify_llm_all_exhausted(errors, service=self.service)
         except Exception:
             pass
         raise AllLimitsExhausted("; ".join(errors) or "усі ключі та моделі вичерпані")
@@ -337,7 +339,7 @@ class LLMClient:
                 exhausted.add((self._key_idx, self._model_idx))
                 try:
                     from harvester.core.notify import notify_llm_failure
-                    await notify_llm_failure("gemma", model, f"Auth error: {e}")
+                    await notify_llm_failure("gemma", model, f"Auth error: {e}", service=self.service)
                 except Exception:
                     pass
                 self._advance_phase(models)
@@ -377,7 +379,7 @@ class LLMClient:
                 # Критична помилка — відправити на пошту
                 try:
                     from harvester.core.notify import notify_llm_failure
-                    await notify_llm_failure("gemma", model, f"[{error_type}] {error_msg[:200]}", error_type=error_type)
+                    await notify_llm_failure("gemma", model, f"[{error_type}] {error_msg[:200]}", error_type=error_type, service=self.service)
                 except Exception:
                     pass
                 self._advance_phase(models)

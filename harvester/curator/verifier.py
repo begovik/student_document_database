@@ -18,6 +18,8 @@ from harvester.curator.availability import check_availability
 
 logger = structlog.get_logger()
 
+CATALOG_FILE_MODE = 0o644
+
 
 async def find_replacement_candidates(
     db,
@@ -221,10 +223,55 @@ async def save_catalog_atomically(path: str, data: dict[str, Any]) -> None:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
         os.replace(tmp_path, path)
+        os.chmod(path, CATALOG_FILE_MODE)
     except BaseException:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
+
+
+def _has_catalog_extraction_data(doc: dict[str, Any]) -> bool:
+    quotations = doc.get("quotations")
+    if isinstance(quotations, list):
+        has_quotes = any(
+            isinstance(quotation, dict) and str(quotation.get("text", "")).strip()
+            for quotation in quotations
+        )
+    else:
+        has_quotes = False
+
+    summary = doc.get("summary")
+    has_summary = False
+    if isinstance(summary, dict):
+        sections = summary.get("sections")
+        if isinstance(sections, list):
+            for section in sections:
+                if not isinstance(section, dict):
+                    continue
+                title = str(section.get("title", "")).strip()
+                overview = str(section.get("overview", "")).strip()
+                methodology = str(section.get("methodology", "")).strip()
+                findings = str(section.get("findings", "")).strip()
+                conclusions = str(section.get("conclusions", "")).strip()
+                key_ideas = section.get("key_ideas", [])
+                has_ideas = isinstance(key_ideas, list) and any(str(idea).strip() for idea in key_ideas)
+                if any(
+                    value and value not in {"н/зв", "Розділ", "Загальна сумаризація"}
+                    for value in (title, overview, methodology, findings, conclusions)
+                ) or has_ideas:
+                    has_summary = True
+                    break
+
+    return has_quotes or has_summary
+
+
+def _catalog_validation_error(doc: dict[str, Any]) -> str | None:
+    error = doc.get("error")
+    if error:
+        return str(error)
+    if not _has_catalog_extraction_data(doc):
+        return "відсутні quotations і summary"
+    return None
 
 
 async def mark_unavailable_in_db(db, doc_id: int, reason: str, replacement_id: int | None = None, catalog_name: str | None = None):
@@ -327,8 +374,17 @@ async def verify_catalog(
             logger.info("catalog_empty", path=catalog_path)
             return None
 
-        # Знайти документи з помилками
-        error_docs = [(i, d) for i, d in enumerate(documents) if d.get("error")]
+        # Знайти документи з помилками або порожнім витягом
+        changed = False
+        error_docs = []
+        for i, d in enumerate(documents):
+            original_error = d.get("error")
+            validation_error = _catalog_validation_error(d)
+            if validation_error:
+                if not original_error:
+                    d["error"] = validation_error
+                    changed = True
+                error_docs.append((i, d, validation_error, not original_error))
 
         if not error_docs:
             logger.info("catalog_no_errors", path=catalog_path, total=len(documents))
@@ -343,10 +399,15 @@ async def verify_catalog(
         retried = 0
         errors = 0
 
-        for idx, (orig_idx, doc) in enumerate(error_docs):
+        for idx, (orig_idx, doc, error, validation_only) in enumerate(error_docs):
             doc_id = doc.get("id")
-            error = doc.get("error", "")
             logger.info("processing_error", index=idx + 1, total=len(error_docs), doc_id=doc_id, error=error[:100])
+
+            if validation_only:
+                skipped += 1
+                errors += 1
+                logger.warning("catalog_validation_error", doc_id=doc_id, error=error)
+                continue
 
             doc_for_lookup = {
                 "id": doc_id,
@@ -396,6 +457,7 @@ async def verify_catalog(
                         }
 
                         documents[orig_idx] = new_doc
+                        changed = True
                         global_selected_ids.add(replacement["id"])
                         global_selected_ids.discard(doc_id)
 
@@ -444,7 +506,10 @@ async def verify_catalog(
         else:
             # Файловий формат: catalog.json -> catalog_fixed.json
             new_path = catalog_path.replace(".json", "_fixed.json")
-        await save_catalog_atomically(new_path, catalog)
+        if changed or fixed or replaced or skipped or retried or errors:
+            await save_catalog_atomically(new_path, catalog)
+        else:
+            new_path = catalog_json_path
 
         logger.info("curator_verify_complete", path=new_path, fixed=fixed, replaced=replaced, skipped=skipped, errors=errors)
         return VerifyResult(

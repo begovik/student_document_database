@@ -57,12 +57,17 @@ class Supervisor:
         """Початкове наповнення: теми, пошукові запити, OpenAlex-ітератори."""
         from harvester.classify.taxonomy import seed_topics
         from harvester.discovery.openalex import create_openalex_iterators
-        from harvester.discovery.querygen import seed_discipline_queries, seed_queries
+        from harvester.discovery.querygen import (
+            seed_discipline_queries,
+            seed_discipline_topics,
+            seed_queries,
+        )
         from harvester.net.blacklist import BlacklistService, seed_blacklist
 
         BlacklistService.get().set_db(self.db)
         n_blacklist = await seed_blacklist(self.db)
         n_topics = await seed_topics(self.db)
+        n_discipline_topics = await seed_discipline_topics(self.db)
         n_queries = await seed_queries(self.db)
         n_discipline_queries = await seed_discipline_queries(self.db)
 
@@ -92,6 +97,7 @@ class Supervisor:
         logger.info(
             "bootstrap_done",
             topics_seeded=n_topics,
+            discipline_topics_seeded=n_discipline_topics,
             queries_seeded=n_queries,
             discipline_queries_seeded=n_discipline_queries,
             blacklist_seeded=n_blacklist,
@@ -155,6 +161,19 @@ class Supervisor:
                 logger.info("verifier_workers_started", count=w.verifier)
             except Exception as e:  # noqa: BLE001
                 logger.warning("verifier_worker_start_failed", error=str(e)[:200])
+
+        # DisciplineAssign воркери — 24/7 присвоювання дисциплін каталогу (Gemini 3.5 Flash Lite)
+        if w.discipline_assign > 0 and self.settings.discipline_assign.enabled:
+            try:
+                from harvester.classify.discipline_assigner import DisciplineAssigner
+
+                for i in range(w.discipline_assign):
+                    a_worker = DisciplineAssigner(i)
+                    self._worker_objs.append(a_worker)
+                    self._workers.append(self._spawn(f"discipline-assign-{i}", a_worker.run()))
+                logger.info("discipline_assign_workers_started", count=w.discipline_assign)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("discipline_assign_worker_start_failed", error=str(e)[:200])
 
     def _spawn(self, name: str, coro) -> asyncio.Task:
         """Воркер із охоронцем: фатальні помилки логуються, а не зникають мовчки."""

@@ -979,7 +979,7 @@ def find(
     """
     from harvester.db.failover import build_database
     from harvester.db.repositories import DocumentsRepository
-    from harvester.classify.taxonomy import load_topics
+    from harvester.classify.taxonomy import load_disciplines
 
     async def _find():
         settings = get_settings()
@@ -989,8 +989,8 @@ def find(
         try:
             docs_repo = DocumentsRepository(db)
 
-            # Спробувати знайти топік по назві
-            topics = await load_topics(db)
+            # Спробувати знайти топік по назві (широкі теми + дисципліни каталогу)
+            topics = await load_disciplines(db)
             topic_code = None
             for t in topics:
                 if topic.lower() in t["name_uk"].lower() or topic.lower() in t["name_en"].lower():

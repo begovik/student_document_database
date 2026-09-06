@@ -12,6 +12,9 @@ from pathlib import Path
 
 import httpx
 
+CATALOG_DIR_MODE = 0o755
+CATALOG_FILE_MODE = 0o644
+
 CATALOGS_DIR = Path("/opt/harvester/catalogs")
 TOPIC = "Проєктування технологічного процесу пошиття чоловічого довгого прямого пальта"
 PG_HOST = "89.167.68.48"
@@ -216,13 +219,39 @@ async def build_catalog():
     print("Отримання документів з БД...")
     docs = fetch_documents()
     print(f"Знайдено {len(docs)} документів")
-    
+
+    # Фільтруємо та впорядковуємо за якістю (лише повноцінні джерела)
+    try:
+        from harvester.verify.quality import DocumentQualityAnalyzer
+
+        analyzer = DocumentQualityAnalyzer()
+        before = len(docs)
+        docs = analyzer.rank(docs)
+        print(f"Після аналізу якості: {before} → {len(docs)}")
+        for r in docs:
+            qr = r["_quality"]
+            print(
+                f"  #{r['id']} score={qr.score:.1f} "
+                f"type={r['doc_type'] or 'other'} сторінок={r.get('page_count')} "
+                f"{(r.get('title') or '')[:60]}"
+            )
+        if not docs:
+            print("Немає документів, що відповідають жорстким фільтрам якості.")
+            return
+    except ImportError:
+        print("Попередження: не вдалося імпортувати DocumentQualityAnalyzer — пропускаємо фільтр")
+
+    # Дозволяємо обрати менше документів, щоб не вставляти низькоякісні
+    docs = docs[:30]
+
     # Створити каталог
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     catalog_name = f"catalog_{timestamp}"
     catalog_dir = CATALOGS_DIR / catalog_name
     resources_dir = catalog_dir / "resources"
     resources_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(catalog_dir, CATALOG_DIR_MODE)
+    os.chmod(resources_dir, CATALOG_DIR_MODE)
     
     print(f"Створено каталог: {catalog_dir}")
     
@@ -233,12 +262,14 @@ async def build_catalog():
         pdf_path = resources_dir / f"{doc['id']}.pdf"
         if pdf_path.exists():
             print(f"  [{i}/{len(docs)}] #{doc['id']} вже існує")
+            os.chmod(pdf_path, CATALOG_FILE_MODE)
             downloaded += 1
             continue
         
         print(f"  [{i}/{len(docs)}] Завантаження #{doc['id']}...")
         success = await download_pdf(doc["canonical_url"], pdf_path)
         if success:
+            os.chmod(pdf_path, CATALOG_FILE_MODE)
             downloaded += 1
             doc["pdf_path"] = f"resources/{doc['id']}.pdf"
         else:
@@ -250,19 +281,24 @@ async def build_catalog():
     
     print(f"\nЗавантажено: {downloaded}, Помилки: {failed}")
     
-    # Створити JSON каталогу
+    # Створити JSON каталогу (прибрати службові ключі аналізу якості)
+    clean_docs = [
+        {k: v for k, v in doc.items() if k not in ("_quality", "_quality_score")}
+        for doc in docs
+    ]
     catalog_data = {
         "topic": TOPIC,
         "created_at": datetime.now().isoformat(),
-        "total_documents": len(docs),
+        "total_documents": len(clean_docs),
         "replaced_count": 0,
         "resources_dir": "resources",
-        "documents": docs,
+        "documents": clean_docs,
     }
     
     json_path = catalog_dir / f"{catalog_name}.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(catalog_data, f, ensure_ascii=False, indent=2)
+    os.chmod(json_path, CATALOG_FILE_MODE)
     
     print(f"JSON збережено: {json_path}")
     print(f"\nКаталог створено: {catalog_dir}")

@@ -149,8 +149,10 @@ CREATE TABLE IF NOT EXISTS search_queries (
     results_yield INTEGER NOT NULL DEFAULT 0,
     last_run_at   TEXT,
     cooldown_until TEXT,
+    priority      INTEGER NOT NULL DEFAULT 10,
     UNIQUE(text, engine, region)
 );
+CREATE INDEX IF NOT EXISTS idx_search_queries_priority ON search_queries(priority DESC, last_run_at);
 
 -- ======================= ТЕМИ =========================
 CREATE TABLE IF NOT EXISTS topics (

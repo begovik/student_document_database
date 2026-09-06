@@ -23,6 +23,7 @@ class WorkersConfig(BaseModel):
     scanner: int = Field(default=1, ge=1, le=8)
     classify: int = Field(default=1, ge=1, le=4)
     verifier: int = Field(default=1, ge=0, le=4)
+    discipline_assign: int = Field(default=1, ge=0, le=4)
 
 
 class HttpConfig(BaseModel):
@@ -110,6 +111,19 @@ class VerifierConfig(BaseModel):
     llm_enabled: bool = True
     llm_model: str = "gemini-3.1-flash-lite"
     llm_max_chars: int = Field(default=15000, ge=1000, le=100000)
+
+
+class DisciplineAssignConfig(BaseModel):
+    """Цілодобове присвоювання дисциплін каталогу verified-документам."""
+
+    enabled: bool = True
+    batch_size: int = Field(default=20, ge=1, le=100)
+    interval_s: int = Field(default=60, ge=5, le=3600)
+    recheck_days: int = Field(default=90, ge=1, le=730)
+    model: str = "gemini-3.5-flash-lite"
+    max_disciplines: int = Field(default=3, ge=1, le=10)
+    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    max_text_chars: int = Field(default=15000, ge=1000, le=100000)
 
 
 class RetentionConfig(BaseModel):
@@ -203,6 +217,7 @@ class Settings(BaseSettings):
     reverify: ReverifyConfig = Field(default_factory=ReverifyConfig)
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     verifier: VerifierConfig = Field(default_factory=VerifierConfig)
+    discipline_assign: DisciplineAssignConfig = Field(default_factory=DisciplineAssignConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -224,6 +239,7 @@ class Settings(BaseSettings):
     pg_password: Annotated[str | None, Field(default=None, validation_alias=AliasChoices("HARVESTER_PG_PASSWORD", "PG_PASS"))] = None
     user_email: Annotated[str | None, Field(default=None, validation_alias="USER_EMAIL")] = None
     smtp_password: Annotated[str | None, Field(default=None, validation_alias="HARVESTER_SMTP_PASSWORD")] = None
+    vps: Annotated[bool, Field(default=False, validation_alias=AliasChoices("HARVESTER_VPS", "VPS"))] = False
 
     @property
     def gemini_keys(self) -> list[str]:
@@ -267,13 +283,16 @@ def load_config(config_path: str | Path | None = None) -> Settings:
 
     settings = Settings(**data)
 
-    # VPS-режим: якщо в .env VPS=true — примусово remote БД (89.167.68.48)
+    # VPS-режим: якщо в .env VPS=true — примусово remote БД
     # Дозволяє тримати config.yaml універсальним (mode: auto, host: "") для локальної розробки,
-    # а на хостингу перемикатися через .env без коміту хоста в репо
-    if os.getenv("VPS", "").lower() == "true":
+    # а на хостингу перемикатися через .env без коміту хоста в репо.
+    # На одному сервері додаток і PG — використовуємо 127.0.0.1 (швидше за 89.167.68.48,
+    # не залежить від зовнішньої мережі/файрволу; pg_hba дозволяє 127.0.0.1/32).
+    is_vps = settings.vps or os.getenv("VPS", "").lower() == "true"
+    if is_vps:
         settings.database.mode = "remote"
         if not settings.database.host:
-            settings.database.host = "89.167.68.48"
+            settings.database.host = "127.0.0.1"
 
     # Заповнити NotifyConfig з user_email та smtp_password
     if settings.user_email:

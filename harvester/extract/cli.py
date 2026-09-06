@@ -79,10 +79,15 @@ async def main(
 
     try:
         # 1. Отримати список документів для обробки
+        catalog_ids: list[int] | None = None
+        if catalog_dir and not topic and not topic_code and not keyword and not retry_failed:
+            catalog_ids = _catalog_document_ids(catalog_dir)
+
         docs = await get_documents_to_process(
             db, topic=topic, topic_code=topic_code, keyword=keyword,
             limit=limit, retry_failed=retry_failed,
             skip_extracted=skip_extracted,
+            catalog_ids=catalog_ids,
         )
 
         if not docs:
@@ -191,8 +196,21 @@ async def get_documents_to_process(
     limit: int = 30,
     retry_failed: bool = False,
     skip_extracted: bool = True,
+    catalog_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Отримати список документів для обробки."""
+    # Якщо задано каталог — обробляти саме його документи
+    if catalog_ids:
+        query = """
+            SELECT d.id, d.title, d.canonical_url, d.authors, d.year, d.udc, d.language, d.doc_type, d.verified_at
+            FROM documents d
+            WHERE d.id IN (%s)
+            ORDER BY d.id
+        """
+        in_clause = ",".join(str(i) for i in catalog_ids)
+        rows = await db.fetchall(query.replace("%s", in_clause))
+        return list(rows)[:limit]
+
     # Якщо вказано keyword — шукаємо по заголовку або title_hint
     if keyword:
         query = """
@@ -291,3 +309,18 @@ async def save_results(
             saved += 1
 
     return saved
+
+
+def _catalog_document_ids(catalog_dir: str) -> list[int]:
+    """Прочитати ID документів із JSON-каталогу (для обробки саме каталогу)."""
+    catalog_dir = Path(catalog_dir)
+    json_files = sorted(catalog_dir.glob("catalog_*.json"))
+    if not json_files:
+        logger.warning("catalog_json_not_found", catalog_dir=str(catalog_dir))
+        return []
+    with json_files[-1].open(encoding="utf-8") as f:
+        data = json.load(f)
+    documents = data.get("documents", data) if isinstance(data, dict) else data
+    ids = [int(doc["id"]) for doc in documents if doc.get("id")]
+    logger.info("catalog_documents_loaded", count=len(ids), path=str(json_files[-1]))
+    return ids

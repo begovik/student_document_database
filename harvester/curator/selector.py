@@ -44,6 +44,7 @@ async def call_llm_for_selection(
     topic: str,
     candidates: list[dict[str, Any]],
     rules: FilterRules | None = None,
+    min_count: int | None = None,
 ) -> SelectionResult | None:
     """Викликати LLM для відбору документів.
 
@@ -72,7 +73,7 @@ async def call_llm_for_selection(
             doc_type=c.get("doc_type", "unknown"),
             topic_score=c.get("topic_score", 0.0),
         )
-    prompt += PROMPT_SELECT_END
+    prompt += PROMPT_SELECT_END.replace("{min_count}", str(min_count or 10))
 
     # Виклик LLM
     try:
@@ -130,6 +131,7 @@ async def call_llm_for_selection(
                         result = parse_selection_response(text)
                         if result:
                             await client.close()
+                            result = enforce_min_count(result, candidates, min_count)
                             logger.info("selection_success", topic=topic, count=result.suggested_count, selected=len(result.selected_ids))
                             return result
                         else:
@@ -185,6 +187,7 @@ async def call_llm_for_selection(
                         result = parse_selection_response(text)
                         if result:
                             await client.close()
+                            result = enforce_min_count(result, candidates, min_count)
                             logger.info("selection_success_gemma", topic=topic, model=model, count=result.suggested_count, selected=len(result.selected_ids))
                             return result
                         else:
@@ -237,9 +240,6 @@ def parse_selection_response(text: str) -> SelectionResult | None:
         suggested_count = 50
     if len(selected_ids) > suggested_count:
         selected_ids = selected_ids[:suggested_count]
-    if len(selected_ids) == 0 and suggested_count <= len(list(candidates)):
-        # Якщо модель не вказала ID, але знала кількість — обираємо перші N
-        pass
 
     return SelectionResult(
         topic="",
@@ -247,6 +247,37 @@ def parse_selection_response(text: str) -> SelectionResult | None:
         suggested_count=suggested_count,
         selected_ids=selected_ids,
         reasoning=reasoning,
+    )
+
+
+def enforce_min_count(
+    result: SelectionResult,
+    candidates: list[dict[str, Any]],
+    min_count: int | None,
+) -> SelectionResult:
+    """Підняти кількість обраних документів до мінімуму, якщо кандидатів вистачає."""
+    if not min_count:
+        return result
+
+    selected_ids = list(result.selected_ids)
+    suggested_count = result.suggested_count
+
+    if suggested_count < min_count and len(candidates) >= min_count:
+        selected_set = set(selected_ids)
+        for c in candidates:
+            if len(selected_ids) >= min_count:
+                break
+            if c["id"] not in selected_set:
+                selected_ids.append(c["id"])
+                selected_set.add(c["id"])
+        suggested_count = min(min_count, len(candidates))
+
+    return SelectionResult(
+        topic=result.topic,
+        candidates_count=result.candidates_count or len(candidates),
+        suggested_count=suggested_count,
+        selected_ids=selected_ids,
+        reasoning=result.reasoning,
     )
 
 
@@ -266,5 +297,5 @@ def format_candidates_text(
             doc_type=c.get("doc_type", "unknown"),
             topic_score=c.get("topic_score", 0.0),
         )
-    prompt += PROMPT_SELECT_END
+    prompt += PROMPT_SELECT_END.replace("{min_count}", "10")
     return prompt

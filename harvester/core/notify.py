@@ -136,7 +136,7 @@ def _send_sync(settings, subject: str, body: str) -> bool:
         return False
 
 
-async def notify_llm_failure(provider: str, model: str, error: str, doc_id: int | None = None) -> None:
+async def notify_llm_failure(provider: str, model: str, error: str, doc_id: int | None = None, service: str = "LLM") -> None:
     """Сповіщення про помилку LLM-класифікації (з накопиченням)."""
     # Накопичуємо помилку — відправляємо лише після N повторень
     error_key = f"llm_error_{provider}_{model}"
@@ -146,9 +146,10 @@ async def notify_llm_failure(provider: str, model: str, error: str, doc_id: int 
         logger.debug("llm_error_accumulated", provider=provider, model=model, count=count, threshold=_ERROR_THRESHOLD)
         return
 
-    subject = f"LLM помилка ({count}×): {provider}/{model}"
+    subject = f"LLM помилка ({count}×): {provider}/{model} [{service}]"
     body = f"""Помилка LLM-класифікації в Harvester (повторилася {count} разів):
 
+Сервіс: {service}
 Провайдер: {provider}
 Модель: {model}
 Документ ID: {doc_id or 'невідомо'}
@@ -161,21 +162,22 @@ Harvester автоматичне сповіщення"""
     await send_notification(subject, body, key=f"llm_error_{provider}")
 
 
-async def notify_llm_all_exhausted(errors: list[str]) -> None:
+async def notify_llm_all_exhausted(errors: list[str], service: str = "LLM") -> None:
     """Сповіщення про вичерпання всіх LLM-провайдерів."""
-    subject = "LLM: усі провайдери вичерпані"
+    subject = f"LLM: усі провайдери вичерпані [{service}]"
     body = f"""Усі LLM-провайдери вичерпані в Harvester:
 
+Сервіс: {service}
 Помилки:
 {chr(10).join(f'  - {e}' for e in errors[:10])}
 
-Класифікація працює тільки на правилах (УДК + ключові слова).
+{service} працює тільки на правилах fallback.
 
 Час: {datetime.utcnow().isoformat()}
 
 ---
 Harvester автоматичне сповіщення"""
-    await send_notification(subject, body, key="llm_all_exhausted")
+    await send_notification(subject, body, key=f"llm_all_exhausted_{service}")
 
 
 async def notify_critical(component: str, message: str, error: str | None = None) -> None:

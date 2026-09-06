@@ -41,7 +41,7 @@ class Classifier:
                  gemma_only: bool = False):
         self.db = db
         self.settings = get_settings()
-        self.llm = LLMClient(keys=keys, models=models, gemma_only=gemma_only)
+        self.llm = LLMClient(keys=keys, models=models, gemma_only=gemma_only, service="Classify")
 
     async def classify_document(self, doc: dict) -> dict:
         topics = await load_topics(self.db)
@@ -90,7 +90,7 @@ class Classifier:
                 # Сповіщення на пошту про помилку LLM-класифікації
                 try:
                     from harvester.core.notify import notify_llm_failure
-                    await notify_llm_failure("classify", "unknown", str(e), doc_id=doc.get("id"))
+                    await notify_llm_failure("classify", "unknown", str(e), doc_id=doc.get("id"), service="Classify")
                 except Exception:
                     pass
 

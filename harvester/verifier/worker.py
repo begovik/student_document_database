@@ -31,7 +31,7 @@ class VerifierWorker:
         keys = self.settings.classify_keys
         if not keys:
             keys = self.settings.gemini_keys  # fallback якщо немає окремих
-        self.llm = LLMClient(keys=keys, models=["gemini-3.1-flash-lite"], gemma_only=False)
+        self.llm = LLMClient(keys=keys, models=["gemini-3.1-flash-lite"], gemma_only=False, service="Verifier")
         # Перевизначимо gemma_models щоб ротація йшла лише по одній моделі
         self.llm._gemma_models = ["gemini-3.1-flash-lite"]
         self.llm._models = ["gemini-3.1-flash-lite"]
@@ -52,6 +52,14 @@ class VerifierWorker:
 
         db = build_database(self.settings)
         await db.initialize(sync_mirror=False)
+
+        # Завантажити теми для тегів (25 тем)
+        try:
+            from harvester.classify.taxonomy import load_topics
+
+            all_topics = await load_topics(db)
+        except Exception:
+            all_topics = []
 
         try:
             while self._running:
@@ -110,13 +118,23 @@ class VerifierWorker:
                         llm_verdict, llm_comment, llm_conf = "skip", "", 0.0
                         llm_extracted_title: str | None = None
                         llm_extracted_authors: list[str] | None = None
+                        llm_tags: list[str] = []
+                        llm_doc_type: str = "other"
                         llm_model = "gemini-3.1-flash-lite"
                         llm_key_idx = self.llm._key_idx
                         if passed:
                             try:
                                 from harvester.verifier.llm_verifier import verify_with_llm
 
-                                llm_verdict, llm_comment, llm_conf, llm_extracted_title, llm_extracted_authors = await verify_with_llm(doc, self.llm)
+                                (
+                                    llm_verdict,
+                                    llm_comment,
+                                    llm_conf,
+                                    llm_extracted_title,
+                                    llm_extracted_authors,
+                                    llm_tags,
+                                    llm_doc_type,
+                                ) = await verify_with_llm(doc, self.llm, all_topics)
                                 log_doc.info(
                                     "verifier_llm_ok",
                                     verdict=llm_verdict,
@@ -145,14 +163,16 @@ class VerifierWorker:
                                 log_doc.warning("verifier_llm_error", error=str(e)[:150])
                                 llm_verdict, llm_comment = "error", str(e)[:200]
 
-                        # 4b. LLM-витяг назви/авторів — порівняння та оновлення (якщо LLM повернув)
-                        # Логіка: якщо в БД немає або сміття — записати; якщо неспівпадіння — замінити/доповнити
+                        # 4b. LLM-витяг назви/авторів/тегів/типу — порівняння та оновлення
                         try:
                             await self._maybe_update_title_authors(
                                 doc, llm_extracted_title, llm_extracted_authors, log_doc, db
                             )
+                            await self._maybe_update_tags_and_type(
+                                doc, llm_tags, llm_doc_type, all_topics, log_doc, db
+                            )
                         except Exception as e:  # noqa: BLE001
-                            log_doc.warning("verifier_title_authors_update_failed", error=str(e)[:150])
+                            log_doc.warning("verifier_metadata_update_failed", error=str(e)[:150])
 
                         # Запис результату
                         status = "pass" if passed else "fail"
@@ -318,6 +338,60 @@ class VerifierWorker:
             params = list(updates.values()) + [doc_id]
             await db.execute(f"UPDATE documents SET {set_clause} WHERE id = ?", tuple(params))
             log_doc.info("verifier_metadata_updated", doc_id=doc_id, fields=list(updates.keys()))
+
+    async def _maybe_update_tags_and_type(
+        self,
+        doc: dict,
+        llm_tags: list[str],
+        llm_doc_type: str,
+        all_topics: list[dict],
+        log_doc,
+        db,
+    ) -> None:
+        """Додати теги (topics) та виправити тип документа.
+
+        - Теги: 25 тем, один документ може мати 2+ тем. Додаємо відсутні, не видаляємо існуючі.
+        - Тип: article/book/textbook/methodical/thesis/dissertation/report/preprint/other
+        """
+        doc_id = doc.get("id")
+
+        # --- Теги ---
+        if llm_tags:
+            # Мапа code -> id
+            code_to_id = {t["code"]: t["id"] for t in all_topics}
+            # Існуючі теги документа
+            existing_rows = await db.fetchall(
+                "SELECT topic_id FROM document_topics WHERE document_id = ?", (doc_id,)
+            )
+            existing_ids = {r["topic_id"] for r in existing_rows}
+            # Визначити нові
+            to_add: list[int] = []
+            for code in llm_tags[:3]:  # до 3 тегів
+                tid = code_to_id.get(code)
+                if tid and tid not in existing_ids:
+                    to_add.append(tid)
+            if to_add:
+                for tid in to_add:
+                    try:
+                        await db.execute(
+                            "INSERT OR IGNORE INTO document_topics (document_id, topic_id, score, signals) VALUES (?, ?, ?, ?)",
+                            (doc_id, tid, 0.85, json.dumps({"verifier_llm": llm_doc_type}, ensure_ascii=False)),
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        log_doc.warning("verifier_tag_insert_failed", topic_id=tid, error=str(e)[:100])
+                log_doc.info("verifier_tags_added", doc_id=doc_id, added=to_add, llm_tags=llm_tags)
+
+        # --- Тип документа ---
+        if llm_doc_type and llm_doc_type != "other":
+            db_type = (doc.get("doc_type") or "other").lower()
+            # Нормалізуємо: магістерська -> thesis, реферат -> report, etc. LLM вже повертає DOC_TYPES
+            if llm_doc_type != db_type:
+                # Якщо в БД "other" або "article" за замовчуванням з pipeline — дозволяємо перезапис
+                # Якщо вже стоїть конкретний тип (thesis/book) — перезаписуємо лише якщо LLM впевнено (verdict pass)
+                should_update = db_type in ("other", "article", "preprint", "") or llm_doc_type in ("thesis", "dissertation", "book", "textbook", "methodical")
+                if should_update or db_type == "other":
+                    await db.execute("UPDATE documents SET doc_type = ? WHERE id = ?", (llm_doc_type, doc_id))
+                    log_doc.info("verifier_doc_type_updated", doc_id=doc_id, old_type=db_type, new_type=llm_doc_type)
 
     async def stop(self) -> None:
         self._running = False

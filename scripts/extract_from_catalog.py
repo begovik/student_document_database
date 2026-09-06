@@ -43,6 +43,7 @@ from harvester.extract.engine import ExtractionJob, ExtractionResult, process_do
 STANDARD_ERROR_TEXT = "Помилка витягу даних: деталі недоступні"
 NO_URL_ERROR_TEXT = "Помилка витягу: у документа відсутній canonical_url"
 CONCURRENCY = 3
+CATALOG_FILE_MODE = 0o644
 
 
 def resolve_catalog_path(user_path: str) -> tuple[str, Path | None]:
@@ -60,6 +61,24 @@ def resolve_catalog_path(user_path: str) -> tuple[str, Path | None]:
         return str(catalog_json), resources_dir if resources_dir.exists() else None
     else:
         return str(path), None
+
+
+def dedupe_documents(documents: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Прибрати дублікати документів за `id`, зберігаючи перший запис."""
+    seen: set[int] = set()
+    unique: list[dict[str, Any]] = []
+    dropped = 0
+    for doc in documents:
+        doc_id = doc.get("id")
+        if doc_id is None:
+            unique.append(doc)
+            continue
+        if doc_id in seen:
+            dropped += 1
+            continue
+        seen.add(doc_id)
+        unique.append(doc)
+    return unique, dropped
 
 
 async def load_extractions_from_db(repo: ExtractionsRepository) -> dict[int, dict[str, Any]]:
@@ -166,6 +185,7 @@ def save_catalog_atomic(catalog_path: str, catalog: dict[str, Any]) -> None:
             json.dump(catalog, f, ensure_ascii=False, indent=2)
             f.write("\n")
         os.replace(tmp_path, str(json_path))
+        os.chmod(str(json_path), CATALOG_FILE_MODE)
     except BaseException:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -193,6 +213,10 @@ async def main(
             catalog = json.load(f)
 
         docs = catalog.get("documents", [])
+        docs, dropped_duplicates = dedupe_documents(docs)
+        if dropped_duplicates:
+            print(f"⚠️  Вилучено дублікатів у каталозі: {dropped_duplicates}")
+            catalog["documents"] = docs
         if not docs:
             print("Каталог порожній або не має документів.")
             return

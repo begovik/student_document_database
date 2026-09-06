@@ -53,16 +53,38 @@ TEMPLATES_EN = [
 ]
 
 
+def _discipline_names() -> list[str]:
+    """Назви дисциплін з каталогу (нормалізовані нижнім регістром)."""
+    return [name.lower() for _, name in parse_discipline_catalog()]
+
+
 async def seed_queries(db: Database) -> int:
-    """Заповнити search_queries стартовим набором, якщо таблиця порожня."""
+    """Заповнити search_queries стартовим набором, якщо таблиця порожня.
+
+    Широкі теми, що вже покриті дисципліною з каталогу, пропускаються —
+    єдиним джерелом пошукових запитів є discipline_catalog.md.
+    """
     repo = SearchQueriesRepository(db)
     existing = await repo.count()
     if existing > 0:
         logger.info("queries_already_seeded", count=existing)
         return 0
 
+    disciplines = set(_discipline_names())
+
     inserted = 0
     for topic in TOPICS:
+        topic_name = topic["name_uk"].lower()
+        covered = (
+            topic_name in disciplines
+            or topic_name in {v.lower() for v in DISCIPLINE_TOPIC_ALIASES.values()}
+            or topic_name in {k.lower() for k in TOPIC_NAME_ALIASES}
+        )
+        if covered:
+            logger.info(
+                "topic_covered_by_discipline", code=topic["code"], name=topic["name_uk"]
+            )
+            continue
         for template in TEMPLATES_UK:
             qid = await repo.insert_if_new(
                 template.format(topic=topic["name_uk"]),
@@ -98,6 +120,19 @@ CATEGORY_CODES: dict[str, str] = {
     "менеджмент": "mgmt_marketing",
     "логістика": "logistics",
     "готельно": "hospitality_tourism",
+    "природничі": "natural_sciences",
+}
+
+# Теми, чия назва відрізняється від дисципліни каталогу, але повністю нею покрита.
+# Ключ — назва теми (topic name_uk), значення — назва дисципліни з discipline_catalog.md.
+DISCIPLINE_TOPIC_ALIASES: dict[str, str] = {
+    "Педагогіка та освіта": "Педагогіка",
+}
+
+# Назви тем у querygen.TOPICS, що відрізняються від назв дисциплін каталогу.
+TOPIC_NAME_ALIASES: dict[str, str] = {
+    "програмування": "Інформатика та ПЗ",
+    "машинне навчання": "Машинне навчання та ШІ",
 }
 
 _DISCIPLINE_RE = re.compile(r"^\d+\.\s+(.+?)\s*$")
@@ -140,6 +175,85 @@ def parse_discipline_catalog(path: Path = DISCIPLINE_CATALOG) -> list[tuple[str,
 
     logger.info("discipline_catalog_parsed", disciplines=len(result), path=str(path))
     return result
+
+
+# Транслітерація українських літер в ASCII для slug-кодів (без претензії на точні правила 2010)
+_UK_TRANSLIT: dict[str, str] = {
+    "а": "a", "б": "b", "в": "v", "г": "h", "ґ": "g", "д": "d", "е": "e", "є": "ye",
+    "ж": "zh", "з": "z", "и": "y", "і": "i", "ї": "yi", "й": "y", "к": "k", "л": "l",
+    "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ь": "", "ю": "yu", "я": "ya", "'": "", "ʼ": "", "’": "", "-": "-",
+}
+
+
+def _ascii_slug(name: str, max_len: int = 48) -> str:
+    """Створити короткий ASCII-code з назви дисципліни."""
+    s = name.lower().strip()
+    parts: list[str] = []
+    for ch in s:
+        parts.append(_UK_TRANSLIT.get(ch, ch if ch.isalnum() else "-"))
+    slug = "".join(parts)
+    # Стискаємо послідовності дефісів
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    # Викидаємо не ascii (наприклад цифри латинською лишимо; кириличні залишки приберу)
+    slug = re.sub(r"[^a-z0-9-]", "", slug)
+    return slug[:max_len].rstrip("-")
+
+
+async def seed_discipline_topics(db: Database) -> int:
+    """Засіяти дисципліни каталогу в таблицю `topics` (єдине джерело таксономії).
+
+    - Дисципліна, чия назва збігається з існуючим topic (name_uk, case-insensitive),
+      не створює новий рядок — вона "покриває" наявний topic (зберігається той самий id).
+    - Нова дисципліна створюється з кодом `dis_<slug>` і kind='discipline'.
+    - Ідемпотентно: дублікати за UNIQUE(code) ігноруються.
+    Повертає кількість створених рядків.
+    """
+    from harvester.classify.taxonomy import load_topics
+
+    disciplines = parse_discipline_catalog()
+    if not disciplines:
+        return 0
+
+    existing = {t["name_uk"].lower(): t for t in await load_topics(db)}
+    inserted = 0
+    seen: set[str] = set()
+    for category_code, name in disciplines:
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if key in existing:
+            logger.debug("discipline_topic_already_covers", name=name)
+            continue
+        alias_topic = next(
+            (t for t, d in DISCIPLINE_TOPIC_ALIASES.items() if d.lower() == key), None
+        )
+        if alias_topic and alias_topic.lower() in existing:
+            logger.debug("discipline_topic_alias_covers", name=name, topic=alias_topic)
+            continue
+        code = f"dis_{_ascii_slug(name)}"
+        cursor = await db.execute(
+            """
+            INSERT OR IGNORE INTO topics (code, name_uk, name_en, udc_prefixes, keywords_uk, keywords_en, kind)
+            VALUES (?, ?, '', '[]', '[]', '[]', 'discipline')
+            """,
+            (code, name),
+        )
+        if cursor and cursor.rowcount:
+            inserted += 1
+        else:
+            # Конфлікт коду чи name: можливе повторне засівання — перевіряємо наявність
+            row = await db.fetchone(
+                "SELECT id FROM topics WHERE code = ? OR lower(name_uk) = lower(?)",
+                (code, name),
+            )
+            if row is None:
+                logger.warning("discipline_topic_insert_conflict", name=name, code=code)
+
+    logger.info("discipline_topics_seeded", inserted=inserted, total=len(seen))
+    return inserted
 
 
 async def seed_discipline_queries(db: Database) -> int:
@@ -192,7 +306,7 @@ async def seed_discipline_queries(db: Database) -> int:
             # Шукаємо теми з низьким yield — кандидатів для LLM
             low = await repo.db.fetchall(
                 "SELECT topic_hint, COUNT(*) as cnt, SUM(results_yield) as total_yield "
-                "FROM search_queries GROUP BY topic_hint HAVING total_yield = 0 LIMIT 5"
+                "FROM search_queries GROUP BY topic_hint HAVING SUM(results_yield) = 0 LIMIT 5"
             )
             for row in low:
                 hint = row["topic_hint"]

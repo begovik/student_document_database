@@ -102,6 +102,39 @@ LLM_SYSTEM_PROMPT = """Ти — дослідник, який аналізує н
 MAX_TEXT_CHARS_FOR_LLM = 80000  # Deprecated: use settings.llm.max_text_chars_for_llm
 
 
+def _has_meaningful_quotations(quotations: Any) -> bool:
+    if not isinstance(quotations, list):
+        return False
+    for quotation in quotations:
+        if isinstance(quotation, dict) and str(quotation.get("text", "")).strip():
+            return True
+    return False
+
+
+def _has_meaningful_summary(summary: Any) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    sections = summary.get("sections")
+    if not isinstance(sections, list) or not sections:
+        return False
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        title = str(section.get("title", "")).strip()
+        overview = str(section.get("overview", "")).strip()
+        methodology = str(section.get("methodology", "")).strip()
+        findings = str(section.get("findings", "")).strip()
+        conclusions = str(section.get("conclusions", "")).strip()
+        key_ideas = section.get("key_ideas", [])
+        has_ideas = isinstance(key_ideas, list) and any(str(idea).strip() for idea in key_ideas)
+        if any(
+            value and value not in {"н/зв", "Розділ", "Загальна сумаризація"}
+            for value in (title, overview, methodology, findings, conclusions)
+        ) or has_ideas:
+            return True
+    return False
+
+
 @dataclass
 class ExtractionResult:
     """Результат витягу для одного документа."""
@@ -315,6 +348,15 @@ async def process_document(job: ExtractionJob) -> ExtractionResult:
                     "authors_mentioned": authors,
                 }
 
+        if not _has_meaningful_quotations(quotations) and not _has_meaningful_summary(summary):
+            return ExtractionResult(
+                document_id=job.document_id,
+                canonical_url=job.canonical_url,
+                success=False,
+                error="LLM не повернув цитат або сумаризації",
+                text_pages_extracted=text_pages_extracted,
+            )
+
         # Видалити тимчасовий файл
         if tmp_pdf and tmp_pdf.exists():
             tmp_pdf.unlink()
@@ -454,4 +496,3 @@ async def call_gemini(api_key: str, config, messages: list[dict], model_override
     except (KeyError, IndexError, json.JSONDecodeError) as e:
         logger.warning("llm_response_parse_error", error_msg=str(e), response=str(data)[:500])
         return None
-

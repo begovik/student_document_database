@@ -22,6 +22,9 @@ from harvester.curator.selector import SelectionResult, call_llm_for_selection
 
 logger = structlog.get_logger()
 
+CATALOG_DIR_MODE = 0o755
+CATALOG_FILE_MODE = 0o644
+
 # Мінімальні вимоги до документа для відбору
 REQUIRED_STATUS = "verified"
 REQUIRED_FIELDS = {
@@ -383,6 +386,7 @@ async def download_pdf_to_resources(
                 return None, reason
 
             pdf_path.write_bytes(data)
+            os.chmod(pdf_path, CATALOG_FILE_MODE)
             logger.info("pdf_downloaded_to_resources", url=url, document_id=document_id, path=str(pdf_path))
             return pdf_path, None
 
@@ -402,6 +406,7 @@ async def save_catalog_atomically(path: str, data: dict[str, Any]) -> None:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
         os.replace(tmp_path, path)
+        os.chmod(path, CATALOG_FILE_MODE)
     except BaseException:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -561,11 +566,12 @@ async def prepare_catalog(
             return None
 
         # 3. LLM-відбір
-        selection = await call_llm_for_selection(topic_name_uk, complete_candidates, rules=rules)
+        min_count = limit or 30
+        selection = await call_llm_for_selection(topic_name_uk, complete_candidates, rules=rules, min_count=min_count)
         if selection is None:
             # Якщо LLM недоступний — обираємо перші complete_candidates
             logger.warning("llm_selection_failed_fallback_to_first", count=len(complete_candidates))
-            suggested_count = min(30, len(complete_candidates))
+            suggested_count = min(min_count, len(complete_candidates))
             selection = SelectionResult(
                 topic=topic_name_uk,
                 candidates_count=len(complete_candidates),
@@ -607,6 +613,8 @@ async def prepare_catalog(
             if replacement:
                 available.append(replacement)
                 replaced.append((doc["id"], replacement["id"]))
+                selected_ids.add(replacement["id"])
+                selected_ids.discard(doc["id"])
                 logger.info("replacement_found", original=doc["id"], replacement=replacement["id"])
             else:
                 still_unavailable.append((doc["id"], reason))
@@ -632,6 +640,8 @@ async def prepare_catalog(
         catalog_json_path = os.path.join(catalog_path, f"{catalog_folder}.json")
         
         os.makedirs(resources_dir, exist_ok=True)
+        os.chmod(catalog_path, CATALOG_DIR_MODE)
+        os.chmod(resources_dir, CATALOG_DIR_MODE)
         logger.info("catalog_structure_created", catalog_path=catalog_path, resources_dir=resources_dir)
 
         # Завантажити PDF для обраних документів
@@ -720,6 +730,7 @@ async def prepare_catalog(
                 json.dump(catalog_data, f, ensure_ascii=False, indent=2)
                 f.write("\n")
             os.replace(tmp_json, catalog_json_path)
+            os.chmod(catalog_json_path, CATALOG_FILE_MODE)
             logger.info("catalog_written", path=catalog_json_path)
         except BaseException:
             if os.path.exists(tmp_json):
