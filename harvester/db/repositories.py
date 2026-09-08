@@ -558,6 +558,62 @@ class ChannelStatsRepository:
         return [dict(row) for row in rows]
 
 
+class VerifierRepository:
+    """Статистика по цілодобовій перевірці джерел (`verifier_results`)."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    async def daily_summary(self, days: int = 7) -> list[dict]:
+        """Поденна динаміка перевірок: статуси, участі LLM, перша/остання LLM-перевірка."""
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        rows = await self.db.fetchall(
+            """
+            SELECT substr(checked_at, 1, 10) AS day,
+                   COUNT(*) AS checked,
+                   SUM(CASE WHEN status = 'pass' THEN 1 ELSE 0 END) AS passed,
+                   SUM(CASE WHEN status = 'fail' THEN 1 ELSE 0 END) AS failed,
+                   SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
+                   SUM(CASE WHEN llm_status IN ('pass','fail') THEN 1 ELSE 0 END) AS llm_calls,
+                   SUM(CASE WHEN llm_status = 'pass' THEN 1 ELSE 0 END) AS llm_pass,
+                   SUM(CASE WHEN llm_status = 'fail' THEN 1 ELSE 0 END) AS llm_fail,
+                   MIN(CASE WHEN llm_status IN ('pass','fail') THEN checked_at END) AS first_llm,
+                   MAX(CASE WHEN llm_status IN ('pass','fail') THEN checked_at END) AS last_llm
+            FROM verifier_results
+            WHERE profile = 'strict' AND checked_at >= ?
+            GROUP BY substr(checked_at, 1, 10)
+            ORDER BY substr(checked_at, 1, 10)
+            """,
+            (since,),
+        )
+        return [dict(row) for row in rows]
+
+    async def overall_summary(self) -> dict:
+        """Підсумок по перевірках без розбивки по днях."""
+        row = await self.db.fetchone(
+            """
+            SELECT COUNT(*) AS checked,
+                   SUM(CASE WHEN status = 'pass' THEN 1 ELSE 0 END) AS passed,
+                   SUM(CASE WHEN status = 'fail' THEN 1 ELSE 0 END) AS failed,
+                   SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
+                   SUM(CASE WHEN llm_status IN ('pass','fail') THEN 1 ELSE 0 END) AS llm_calls,
+                   SUM(CASE WHEN llm_status = 'pass' THEN 1 ELSE 0 END) AS llm_pass,
+                   SUM(CASE WHEN llm_status = 'fail' THEN 1 ELSE 0 END) AS llm_fail
+            FROM verifier_results
+            WHERE profile = 'strict'
+            """
+        )
+        return dict(row) if row else {}
+
+    async def coverage(self) -> tuple[int, int]:
+        """(кількість verified, кількість verified з бодай однією перевіркою)."""
+        verified = await self.db.fetchone("SELECT COUNT(*) AS c FROM documents WHERE status = 'verified'")
+        checked = await self.db.fetchone(
+            "SELECT COUNT(DISTINCT document_id) AS c FROM verifier_results WHERE profile = 'strict'"
+        )
+        return (verified["c"] if verified else 0, checked["c"] if checked else 0)
+
+
 class SystemEventsRepository:
     def __init__(self, db: Database):
         self.db = db

@@ -22,12 +22,40 @@ source .venv/bin/activate
 |---|---|
 | `harvester start [--config PATH]` | Запустити сервіс у безперервному режимі 24/7 (supervisor, workers, discovery) |
 | `harvester status` | Показати поточний стан сервісу (heartbeat, живі воркери, лічильники) |
+| `harvester report [--days 7] [--json]` | Зведений звіт: стан системи + динаміка перевірки джерел (деталі нижче) |
 | `harvester doctor` | Самодіагностика системи (БД, outbox, дзеркало, конфігурація, email) |
 | `harvester stats [--period 24h\|7d\|30d] [--json]` | Статистика по каналах пошуку (запити, успіхи, помилки, нові документи) |
 | `harvester export --output FILE [--format csv\|jsonl] [--lang LANG] [--status STATUS]` | Експорт верифікованих документів з бази даних |
 | `harvester events [--limit N] [--level LEVEL]` | Перегляд системних подій (WARN, ERROR, CRITICAL) |
 | `harvester queries [--top N]` | Аналіз ефективності пошукових запитів та їх yield |
 | `harvester find --topic TOPIC [--limit N] [--lang LANG] [--type TYPE]` | Пошук джерел та літератури в існуючій базі за темою/УДК |
+
+### `harvester report`
+
+Зведений звіт: загальний стан Harvester + підсумок цілодобової перевірки джерел (verifier) + поденна динаміка перевірок за останні N днів.
+
+```bash
+harvester report [OPTIONS]
+```
+
+| Опція | Дефолт | Опис |
+|---|---|---|
+| `--days`, `-d` | `7` | Період поденної динаміки (в днях) |
+| `--json` | `False` | Вивід у форматі JSON (машинночитабельний) |
+
+**Секції текстового виводу:**
+1. **Загальний стан Harvester** — документи за статусами, мови (verified), кількість класифікацій, завдання pending/running, топ каналів.
+2. **Підсумок verifier** — всього перевірок (pass/fail/error), LLM-виклики (pass/fail), охоплення verified-документів у відсотках.
+3. **Перевірка джерел (verifier, N днів)** — по днях: перевірено, pass, fail, err, LLM-виклики, перший/останній час LLM-звернення (UTC).
+
+**JSON-вивід:**
+```bash
+harvester report --json | jq '.verifier.daily'
+harvester report --days 30 --json | jq '.documents_by_status'
+```
+Ключі: `db_mode`, `documents_by_status`, `languages`, `classification_total`, `classification_docs`, `tasks_by_status`, `tasks_by_type`, `channels`, `verifier.total`, `verifier.coverage`, `verifier.daily`.
+
+Джерело даних: `verifier_results` (профіль `strict`) + `documents` + `tasks` + `channel_stats` через `VerifierRepository` `harvester/db/repositories.py`.
 
 ---
 

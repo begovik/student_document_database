@@ -1,10 +1,13 @@
 import asyncio
 import csv
 import json
+import logging
 import sqlite3
 import sys
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
 import typer
 from rich import print as rprint
@@ -59,6 +62,41 @@ def _sqlite_fetchall(path: Path, sql: str, params: tuple | None = None) -> list[
 def _sqlite_fetchone(path: Path, sql: str, params: tuple | None = None):
     rows = _sqlite_fetchall(path, sql, params)
     return rows[0] if rows else None
+
+
+def _fmt_time(ts: str | None) -> str:
+    """'2026-09-08T09:24:04.253993' -> '09:24'."""
+    if not ts:
+        return "—"
+    return str(ts)[11:16]
+
+
+@contextmanager
+def _quiet_stdout_logs() -> Iterator[None]:
+    """Скеровує консольні лог-записи з stdout у stderr (для чистого JSON-виводу)."""
+    import structlog
+
+    root = logging.getLogger()
+    moved: list[logging.StreamHandler] = []
+    for handler in root.handlers:
+        if isinstance(handler, logging.StreamHandler) and handler.stream is sys.stdout:
+            handler.stream = sys.stderr
+            moved.append(handler)
+    try:
+        if not structlog.is_configured():
+            structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
+        yield
+    finally:
+        for handler in moved:
+            handler.stream = sys.stdout
+        if not structlog.is_configured():
+            structlog.reset_defaults()
+
+
+def _emit_json(payload: dict) -> None:
+    """Друкує JSON у stdout, вимкнувши лог-шум із цього ж потоку."""
+    with _quiet_stdout_logs():
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 @app.command()
@@ -162,6 +200,156 @@ def status():
             await db.close()
 
     asyncio.run(_status())
+
+
+@app.command()
+def report(
+    days: int = typer.Option(7, "--days", "-d", help="Період динаміки в днях (за замовчуванням 7)"),
+    json_output: bool = typer.Option(False, "--json", help="Вивід у форматі JSON"),
+):
+    """Зведений звіт: стан системи + динаміка перевірки джерел"""
+    from harvester.db.failover import build_database
+    from harvester.db.repositories import (
+        ChannelStatsRepository,
+        DocumentsRepository,
+        TasksRepository,
+        VerifierRepository,
+    )
+
+    async def _report():
+        settings = get_settings()
+        db = build_database(settings)
+
+        json_ctx = _quiet_stdout_logs() if json_output else nullcontext()
+
+        with json_ctx:
+            try:
+                await db.initialize(sync_mirror=False, read_only=True)
+
+                docs_repo = DocumentsRepository(db)
+                tasks_repo = TasksRepository(db)
+                chan_repo = ChannelStatsRepository(db)
+                verif_repo = VerifierRepository(db)
+    
+                doc_stats = await docs_repo.count_by_status()
+                lang_stats = await docs_repo.count_by_language()
+                classified_total, classified_docs = await docs_repo.count_classified()
+                task_stats = await tasks_repo.count_by_status()
+                task_by_type = await tasks_repo.count_by_type()
+                channel_stats = await chan_repo.get_summary(days * 24)
+                verif_daily = await verif_repo.daily_summary(days)
+                verif_total = await verif_repo.overall_summary()
+                verified_total, verified_checked = await verif_repo.coverage()
+    
+                db_mode = "local (SQLite)"
+                if db.mode == "remote":
+                    db_mode = "remote (PostgreSQL)"
+    
+                if json_output:
+                    print(
+                        json.dumps(
+                            {
+                                "generated_at": datetime.utcnow().isoformat(),
+                                "db_mode": db_mode,
+                                "documents_by_status": doc_stats,
+                                "languages": lang_stats,
+                                "classification_total": classified_total,
+                                "classification_docs": classified_docs,
+                                "tasks_by_status": task_stats,
+                                "tasks_by_type": task_by_type,
+                                "channels": channel_stats,
+                                "verifier": {
+                                    "total": verif_total,
+                                    "coverage": {
+                                        "verified_total": verified_total,
+                                        "verified_checked": verified_checked,
+                                    },
+                                    "daily": verif_daily,
+                                },
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    )
+                    return
+    
+                table1 = Table(title="Загальний стан Harvester")
+                table1.add_column("Параметр", style="cyan")
+                table1.add_column("Значення", style="green")
+                table1.add_row("База даних", db_mode)
+                table1.add_row("Документи (всього)", str(sum(doc_stats.values())))
+                for st, cnt in sorted(doc_stats.items(), key=lambda x: -x[1]):
+                    table1.add_row(f"  · {st}", str(cnt))
+                if lang_stats:
+                    table1.add_row(
+                        "Мови (verified)",
+                        ", ".join(f"{k}:{v}" for k, v in sorted(lang_stats.items(), key=lambda x: -x[1])),
+                    )
+                table1.add_row("Класифікації (всього)", str(classified_total))
+                table1.add_row("  · унікальних документів", str(classified_docs))
+                table1.add_row("Завдання (pending)", str(task_stats.get("pending", 0)))
+                table1.add_row("Завдання (running)", str(task_stats.get("running", 0)))
+                for ttype, by_status in sorted(task_by_type.items()):
+                    pending = by_status.get("pending", 0)
+                    running = by_status.get("running", 0)
+                    if pending or running:
+                        table1.add_row(f"  · {ttype}", f"p:{pending} r:{running}")
+    
+                table2 = Table(title=f"Перевірка джерел (verifier, {days} днів)")
+                table2.add_column("День", style="cyan", width=5)
+                table2.add_column("Перев.", justify="right")
+                table2.add_column("Pass", justify="right", style="green")
+                table2.add_column("Fail", justify="right", style="red")
+                table2.add_column("Err", justify="right")
+                table2.add_column("LLM", justify="right", style="bright_green")
+                table2.add_column("LLM+", justify="right", style="green")
+                table2.add_column("LLM-", justify="right", style="red")
+                table2.add_column("1-й LLM", style="yellow", width=5)
+                table2.add_column("ост.", style="yellow", width=5)
+    
+                for r in verif_daily:
+                    table2.add_row(
+                        str(r["day"])[5:],
+                        str(r["checked"] or 0),
+                        str(r["passed"] or 0),
+                        str(r["failed"] or 0),
+                        str(r["errors"] or 0),
+                        str(r["llm_calls"] or 0),
+                        str(r["llm_pass"] or 0),
+                        str(r["llm_fail"] or 0),
+                        _fmt_time(r.get("first_llm")),
+                        _fmt_time(r.get("last_llm")),
+                    )
+    
+                table3 = Table(title="Підсумок verifier")
+                table3.add_column("Параметр", style="cyan")
+                table3.add_column("Значення", style="green")
+                table3.add_row("Перевірок (всього)", str(verif_total.get("checked", 0) or 0))
+                table3.add_row("  · pass", str(verif_total.get("passed", 0) or 0))
+                table3.add_row("  · fail", str(verif_total.get("failed", 0) or 0))
+                table3.add_row("  · error", str(verif_total.get("errors", 0) or 0))
+                table3.add_row("LLM-викликів (всього)", str(verif_total.get("llm_calls", 0) or 0))
+                table3.add_row("  · pass", str(verif_total.get("llm_pass", 0) or 0))
+                table3.add_row("  · fail", str(verif_total.get("llm_fail", 0) or 0))
+                coverage_pct = (verified_checked / verified_total * 100) if verified_total else 0.0
+                table3.add_row("Охоплення verified-документів", f"{verified_checked} / {verified_total} ({coverage_pct:.1f}%)")
+    
+                if channel_stats:
+                    chan_rows = "\n".join(
+                        f"  · {s['channel']}: нових {s.get('items_new', 0)}, помилок {s.get('errors', 0)}"
+                        for s in channel_stats[:6]
+                    )
+                    table1.add_row("Канали (топ)", chan_rows)
+    
+                console.print(table1)
+                console.print("")
+                console.print(table3)
+                console.print("")
+                console.print(table2)
+            finally:
+                await db.close()
+
+    asyncio.run(_report())
 
 
 @app.command()

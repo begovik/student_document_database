@@ -1374,6 +1374,7 @@ real_sources_for_students/
 |---|---|
 | `harvester start [--config PATH]` | Запуск у foreground (для systemd) |
 | `harvester status` | Живий стан: heartbeat, аптайм, worker'и, черга, останні події |
+| `harvester report [--days N] [--json]` | Зведений звіт: стан системи + поденна динаміка verifier (розділ 17) |
 | `harvester stats [--json] [--period 24h\|7d\|30d]` | Зведення: документи за статусами/мовами/темами, канали (yield, помилки), топ-джерела |
 | `harvester export --format csv\|jsonl [--lang uk] [--topic code] [--status verified] [--out FILE]` | Експорт для суміжного проєкту |
 | `harvester sources list\|add URL\|pause ID\|resume ID\|import-seeds` | Керування джерелами |
@@ -1592,6 +1593,7 @@ catalogs/
 - **Логи:** `structlog` → JSON-рядки → stdout → **journald** (systemd); рівні: DEBUG (dev), INFO (prod), WARN, ERROR. Обов'язкові поля: `ts`, `level`, `component`, `event`, `doc_id`/`source_id`/`channel` (де доречно), `duration_ms`, `result_code`. Події рівня WARN+ дублюються в `system_events` (для CLI без доступу до journalctl).
 - **Метрики:** лічильники в пам'яті → погодинний flush у `channel_stats`: по кожному каналу — `requests`, `ok`, `errors`, `items_found`, `items_new`; окремо глобальні: черга за типами/пріоритетами, середня тривалість verify, частка reject за причинами.
 - **Здоров'я:** `harvester status` показує heartbeat-вік; якщо > 2 хв — процес вважається мертвим (для зовнішнього watchdog/моніторингу достатньо `systemctl is-active` + парсинг heartbeat).
+- **Зведена статистика:** `harvester report [--days N] [--json]` — стан системи (документи, мови, класифікації, завдання, канали) та **поденна динаміка verifier**: перевірено / pass / fail / err / LLM-виклики / перший-останній час LLM (UTC), підсумок по `verifier_results` (профіль `strict`) і охоплення verified-документів. Реалізація: `VerifierRepository` (`daily_summary`, `overall_summary`, `coverage`) у `harvester/db/repositories.py`, CLI-команда `report` у `harvester/cli.py`. Денна кількість LLM-викликів ~2000 (4 ключі × `gemini_rpd=500`) є індикатором вичерпання денних лімітів Gemini.
 - **Алертинг v1:** без зовнішніх інтеграцій; ERROR-події видно в `status`/`stats`. (Опційно у конфігурі: виклик довільної shell-команди при фатальних подіях — напр. відправка повідомлення.)
 
 ---
