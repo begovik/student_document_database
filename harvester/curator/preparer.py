@@ -162,39 +162,57 @@ def is_document_complete(doc: dict[str, Any], rules: FilterRules | None = None) 
 
     # === НОВІ ПЕРЕВІРКИ ЗА ПРАВИЛАМИ ===
     
-    # Перевірка щільності тексту (мінімум 1500 знаків на сторінку)
-    text_length = doc.get("text_length") or extra.get("text_length") or 0
+    # Довжина повного тексту (text_length) зберігається лише у документів,
+    # верифікованих новим пайплайном (verify/pipeline.py). Старі verified-документи
+    # поле не мають — для них оцінюємо наявність тексту за text_sample, а щільність
+    # на сторінку не перевіряємо (нема повної довжини тексту).
+    text_length = doc.get("text_length") or extra.get("text_length")
     try:
-        text_length = int(text_length)
+        text_length_value = int(text_length) if text_length not in (None, "") else 0
     except (TypeError, ValueError):
-        text_length = 0
+        text_length_value = 0
+    has_full_text_length = text_length_value > 0
     page_count = doc.get("page_count", 1) or 1
-    if text_length < max(min_chars_per_page, 500):
-        return False, f"недостатньо повного тексту ({text_length} знаків)"
-    if page_count > 0:
-        chars_per_page = text_length / page_count
-        if chars_per_page < min_chars_per_page:
-            return False, f"низька щільність тексту ({chars_per_page:.0f} знаків/стор, мінімум {min_chars_per_page})"
+
+    if has_full_text_length:
+        # Перевірка щільності тексту (мінімум min_chars_per_page знаків на сторінку)
+        if text_length_value < max(min_chars_per_page, 500):
+            return False, f"недостатньо повного тексту ({text_length_value} знаків)"
+        if page_count > 0:
+            chars_per_page = text_length_value / page_count
+            if chars_per_page < min_chars_per_page:
+                return False, f"низька щільність тексту ({chars_per_page:.0f} знаків/стор, мінімум {min_chars_per_page})"
+    else:
+        # Старі verified-документи без text_length: вимагаємо наявність тексту.
+        text_sample = doc.get("text_sample") or ""
+        sample_len = len(str(text_sample))
+        if sample_len < 500:
+            return False, f"недостатньо повного тексту ({sample_len} знаків)"
 
     structure = extra.get("structure") if isinstance(extra.get("structure"), dict) else {}
-    if rules.require_references and not structure.get("has_references"):
-        return False, "відсутній розділ літератури/references"
-    if rules.require_introduction and not structure.get("has_introduction"):
-        return False, "відсутній вступ/introduction"
-    if rules.require_conclusion and not structure.get("has_conclusion"):
-        return False, "відсутні висновки/conclusion"
-    if rules.require_structured_sections and not structure.get("structured_sections"):
-        return False, "відсутня структурована нумерація розділів"
-    if rules.require_title_page and not structure.get("has_title_page"):
-        return False, "відсутня титульна сторінка"
-    try:
-        toc_ratio = float(structure.get("toc_ratio") or 0.0)
-    except (TypeError, ValueError):
-        toc_ratio = 1.0
-    if toc_ratio > rules.max_toc_ratio:
-        return False, f"зміст займає {toc_ratio:.1%} тексту (ліміт {rules.max_toc_ratio:.1%})"
-    if rules.reject_annotations and structure.get("only_abstract"):
-        return False, "документ є лише анотацією/рефератом"
+    # Структурний аналіз (references/introduction/conclusion) доступний лише для
+    # документів, верифікованих новим пайплайном. Для старих записів перевірку
+    # пропускаємо — цілісність оцінює LLM-верифікатор.
+    has_structure_analysis = bool(structure)
+    if has_structure_analysis:
+        if rules.require_references and not structure.get("has_references"):
+            return False, "відсутній розділ літератури/references"
+        if rules.require_introduction and not structure.get("has_introduction"):
+            return False, "відсутній вступ/introduction"
+        if rules.require_conclusion and not structure.get("has_conclusion"):
+            return False, "відсутні висновки/conclusion"
+        if rules.require_structured_sections and not structure.get("structured_sections"):
+            return False, "відсутня структурована нумерація розділів"
+        if rules.require_title_page and not structure.get("has_title_page"):
+            return False, "відсутня титульна сторінка"
+        try:
+            toc_ratio = float(structure.get("toc_ratio") or 0.0)
+        except (TypeError, ValueError):
+            toc_ratio = 1.0
+        if toc_ratio > rules.max_toc_ratio:
+            return False, f"зміст займає {toc_ratio:.1%} тексту (ліміт {rules.max_toc_ratio:.1%})"
+        if rules.reject_annotations and structure.get("only_abstract"):
+            return False, "документ є лише анотацією/рефератом"
     if rules.reject_theses_fragments and str(doc.get("doc_type") or "").lower() in {
         "thesis",
         "dissertation",
