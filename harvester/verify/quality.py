@@ -14,7 +14,7 @@ from typing import Any
 from harvester.config import FilterRules, get_filter_rules
 
 # Мінімальні вимоги для «цілісного джерела» (жорсткі фільтри)
-MIN_PAGE_COUNT = 4
+MIN_PAGE_COUNT = 3
 MIN_TEXT_CHARS = 500
 
 # Тип документа → вага/бонус при оцінці якості (науковість джерела)
@@ -30,8 +30,8 @@ TYPE_BONUS: dict[str, float] = {
     "other": 5.0,          # невизначений — найменший бонус
 }
 
-# Типи, які НЕ є повноцінним джерелом (журнальні обкладинки, тези тощо)
-FRAGMENT_TYPES = {"other"}
+# Типи, які не належать до цільового корпусу повних джерел.
+NON_SOURCE_TYPES = {"abstract", "dissertation", "fragment", "presentation", "thesis", "toc"}
 
 
 @dataclass
@@ -77,6 +77,9 @@ def _text_len(doc: dict[str, Any]) -> int:
     if text_sample:
         parts.append(str(text_sample))
     extra = parse_extra(doc)
+    extra_length = _as_int(extra.get("text_length"))
+    if extra_length:
+        return extra_length
     body = extra.get("body")
     if body:
         parts.append(str(body))
@@ -109,7 +112,7 @@ class DocumentQualityAnalyzer:
     def __init__(self, rules: FilterRules | None = None):
         self.rules = rules or get_filter_rules("strict")
         self.min_page_count = max(MIN_PAGE_COUNT, _as_int(self.rules.min_page_count, MIN_PAGE_COUNT))
-        # мінімальна загальна довжина тексту (фіксована константа)
+        # Мінімальна загальна довжина тексту для відсікання фрагментів.
         self.min_text_chars = MIN_TEXT_CHARS
 
     def analyze(self, doc: dict[str, Any]) -> QualityResult:
@@ -129,7 +132,7 @@ class DocumentQualityAnalyzer:
             failures.append(f"page_count={page_count} < {self.min_page_count}")
 
         text_chars = details["text_chars"]
-        if text_chars and text_chars < self.min_text_chars:
+        if text_chars < self.min_text_chars:
             failures.append(f"text_chars={text_chars} < {self.min_text_chars}")
 
         if details["has_text_layer"] != 1:
@@ -139,6 +142,8 @@ class DocumentQualityAnalyzer:
         language = (details.get("language") or "").lower()
         if language == "ru":
             failures.append("russian_language")
+        elif language in {"", "unknown", "und", "none"}:
+            failures.append("language_unknown")
 
         # Презентації PowerPoint — не є повноцінним джерелом
         if self.rules.reject_ppt:
@@ -155,9 +160,8 @@ class DocumentQualityAnalyzer:
 
         # Сміттєві типи, які не є повноцінним джерелом
         doc_type = (details["doc_type"] or "other").lower()
-        if doc_type in FRAGMENT_TYPES and page_count >= self.min_page_count:
-            # Можемо пропустити тільки якщо достатньо сторінок; в іншому разі лічимо як фрагмент
-            pass
+        if doc_type in NON_SOURCE_TYPES:
+            failures.append(f"non_source_type={doc_type}")
 
         if failures:
             return QualityResult(passed=False, score=0.0, hard_failures=failures, details=details)

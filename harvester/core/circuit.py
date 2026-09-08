@@ -1,7 +1,7 @@
 import asyncio
 import time
+from collections.abc import Callable
 from enum import Enum
-from typing import Callable
 
 import structlog
 
@@ -28,6 +28,7 @@ class CircuitBreaker:
         self._failure_count = 0
         self._last_failure_time = 0.0
         self._current_timeout = recovery_timeout
+        self._half_open_probe = False
         self._lock = asyncio.Lock()
 
     @property
@@ -39,16 +40,21 @@ class CircuitBreaker:
             if self._state == CircuitState.OPEN:
                 if time.monotonic() - self._last_failure_time >= self._current_timeout:
                     self._state = CircuitState.HALF_OPEN
+                    self._half_open_probe = True
                     logger.debug("circuit_breaker_half_open")
                 else:
                     raise CircuitBreakerOpenError("Circuit breaker is open")
+            elif self._state == CircuitState.HALF_OPEN:
+                if self._half_open_probe:
+                    raise CircuitBreakerOpenError("Circuit breaker probe is already running")
+                self._half_open_probe = True
 
         try:
             result = await func(*args, **kwargs)
             async with self._lock:
                 await self._on_success()
             return result
-        except Exception as e:
+        except Exception:
             async with self._lock:
                 await self._on_failure()
             raise
@@ -59,8 +65,10 @@ class CircuitBreaker:
         self._state = CircuitState.CLOSED
         self._failure_count = 0
         self._current_timeout = self.recovery_timeout
+        self._half_open_probe = False
 
     async def _on_failure(self) -> None:
+        self._half_open_probe = False
         self._failure_count += 1
         self._last_failure_time = time.monotonic()
 
@@ -78,10 +86,11 @@ class CircuitBreaker:
             self._state = CircuitState.CLOSED
             self._failure_count = 0
             self._current_timeout = self.recovery_timeout
+            self._half_open_probe = False
 
 
 class CircuitBreakerOpenError(Exception):
-    pass
+    """Запит заблоковано відкритим circuit breaker."""
 
 
 class CircuitBreakerRegistry:

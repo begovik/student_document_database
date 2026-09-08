@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 from contextlib import asynccontextmanager
 from typing import Any
@@ -59,6 +60,7 @@ APP_TABLES = (
     "channel_stats",
     "system_events",
     "settings",
+    "verifier_results",
 )
 
 # Джерело id для рядків, створених у local-режимі: 2e9+ ніколи не конфліктує
@@ -89,7 +91,9 @@ class FailoverDatabase(Database):
         self._is_initialized = False
         self._remote_ever_ok = False
         self._local_drift = False
-        self._tx_buf: list[tuple[Any, Any, Any, Any]] | None = None
+        self._tx_state_var: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+            "failover_transaction_state", default=None
+        )
         self.db_path = self.cfg.local_db_path
 
     @property
@@ -98,24 +102,29 @@ class FailoverDatabase(Database):
         return self.cfg.mode == "remote"
 
     # ------------------------------------------------------------------ setup
-    async def initialize(self, sync_mirror: bool = True) -> None:
+    async def initialize(self, sync_mirror: bool = True, read_only: bool = False) -> None:
         """Ініціалізує БД та, за замовчуванням, синхронізує дзеркало.
 
         Робочий процес Harvester використовує `sync_mirror=True`. Сервісні
         read-only команди CLI можуть передати `False`, щоб не запускати
         тривалий resync паралельно з уже працюючим процесом.
+
+        `read_only=True` відкриває local-базу без права запису та пропускає
+        міграції/outbox-DDL — призначено для звітних CLI-команд, яким потрібен
+        лише доступ до даних (у т.ч. remote) без зміни локальної копії.
         """
         if self._initialized:
             return
 
         local_path = self.cfg.local_db_path or get_settings().db_path
         self.local = SqliteDatabase(local_path)
-        await self.local.initialize()
+        await self.local.initialize(read_only=read_only)
 
-        from harvester.db.migrations import apply_migrations
+        if not read_only:
+            from harvester.db.migrations import apply_migrations
 
-        await apply_migrations(self.local)
-        await self.local.execute(OUTBOX_DDL)
+            await apply_migrations(self.local)
+            await self.local.execute(OUTBOX_DDL)
 
         remote_ok = False
         if self.cfg.remote_configured:
@@ -243,39 +252,31 @@ class FailoverDatabase(Database):
         return await self._route("execute", sql, params)
 
     async def executemany(self, sql: str, params: list[tuple]) -> None:
+        # Серійні таблиці потребують id для дзеркала/outbox. Розбиваємо
+        # такі batch-вставки на одиночні операції, інакше `lastrowid` remote
+        # втрачається та локальна копія отримує конфліктні id.
+        if insert_id_table(sql) is not None:
+            for row in params:
+                await self._route("execute", sql, tuple(row))
+            return
         await self._route("executemany", sql, [list(p) for p in params])
 
     async def executescript(self, sql: str) -> None:
-        # Схемні маніпуляції в outbox не пишуться (виконуються при ініціалізації).
         active = self._active()
         if active is not None:
             await active.executescript(sql)
 
     async def fetchone(self, sql: str, params: tuple | None = None):
+        if self._tx_state_var.get() is not None:
+            return await self._fetchone_locked(sql, params)
         async with self._switch_lock:
-            if self._is_local_only_sql(sql):
-                return await self.local.fetchone(sql, params)
-            if self._mode == "remote":
-                try:
-                    return await self._remote_retry("fetchone", sql, params)
-                except RemoteUnavailable:
-                    if self.strict_remote:
-                        raise
-                    await self._downgrade()
-            return await self.local.fetchone(sql, params)
+            return await self._fetchone_locked(sql, params)
 
     async def fetchall(self, sql: str, params: tuple | None = None) -> list[Any]:
+        if self._tx_state_var.get() is not None:
+            return await self._fetchall_locked(sql, params)
         async with self._switch_lock:
-            if self._is_local_only_sql(sql):
-                return await self.local.fetchall(sql, params)
-            if self._mode == "remote":
-                try:
-                    return await self._remote_retry("fetchall", sql, params)
-                except RemoteUnavailable:
-                    if self.strict_remote:
-                        raise
-                    await self._downgrade()
-            return await self.local.fetchall(sql, params)
+            return await self._fetchall_locked(sql, params)
 
     async def insert(self, sql: str, params: tuple | None = None) -> int | None:
         return await self._route("insert", sql, params)
@@ -294,36 +295,32 @@ class FailoverDatabase(Database):
         і виконуються у local лише після успішного COMMIT (інакше rollback
         remote залишив би зайві рядки у локальному дзеркалі).
         """
-        if self._mode != "remote" or self.remote is None:
+        existing = self._tx_state_var.get()
+        if existing is not None:
+            # Вкладений контекст підтверджується зовнішнім кадром.
+            yield self._active()
+            return
+
+        await self._switch_lock.acquire()
+        state: dict[str, Any] = {"mode": self._mode, "buffer": []}
+        token = self._tx_state_var.set(state)
+        try:
             active = self._active()
             if active is None:
                 yield None
                 return
-            async with active.transaction() as conn:
-                yield conn
-            return
 
-        if self._tx_buf is not None:
-            # Вкладений контекст: підтвердження — на зовнішньому кадрі.
-            async with self._remote_tx_conn() as conn:
-                yield conn
-            return
-
-        buf: list[tuple[Any, Any, Any, Any]] = []
-        self._tx_buf = buf
-        try:
-            async with self.remote.transaction() as conn:
-                yield conn
-            for op, sql, params, lid in buf:
-                await self._mirror_local(op, sql, params, lid=lid)
+            if state["mode"] != "remote" or self.remote is None:
+                async with active.transaction() as conn:
+                    yield conn
+            else:
+                async with self.remote.transaction() as conn:
+                    yield conn
+                for op, sql, params, lid in state["buffer"]:
+                    await self._mirror_local(op, sql, params, lid=lid)
         finally:
-            self._tx_buf = None
-
-    @asynccontextmanager
-    async def _remote_tx_conn(self):
-        """Доступ до поточного з'єднання remote-транзакції (для вкладення)."""
-        conn = getattr(self.remote, "_tx_conn", None)
-        yield conn
+            self._tx_state_var.reset(token)
+            self._switch_lock.release()
 
     async def _route(self, op: str, sql: str, params: Any = None) -> Any:
         """Єдина точка входу для DML-операцій (під локом перемикання).
@@ -333,51 +330,86 @@ class FailoverDatabase(Database):
         Local-режим: операція виконується локально та записується в outbox
         для подальшого replay у remote.
         """
+        if self._tx_state_var.get() is not None:
+            return await self._route_locked(op, sql, params)
         async with self._switch_lock:
-            if self.local is None:
-                raise RuntimeError("FailoverDatabase не ініціалізовано")
+            return await self._route_locked(op, sql, params)
 
-            if self._is_local_only_sql(sql):
-                active = self._active()
-                return await self._exec_on(active, op, sql, params)
+    async def _route_locked(self, op: str, sql: str, params: Any = None) -> Any:
+        if self.local is None:
+            raise RuntimeError("FailoverDatabase не ініціалізовано")
 
-            if self._mode == "remote":
-                try:
-                    result = await self._remote_retry(op, sql, params)
-                except RemoteUnavailable:
-                    if self.strict_remote:
-                        logger.critical(
-                            "db_remote_unavailable_strict", host=self.cfg.host or "", op=op
-                        )
-                        raise
-                    await self._downgrade()
+        if self._is_local_only_sql(sql):
+            active = self._active()
+            return await self._exec_on(active, op, sql, params)
+
+        if self._mode == "remote":
+            try:
+                result = await self._remote_retry(op, sql, params)
+            except RemoteUnavailable:
+                # Усередині транзакції не можна безпечно продовжити на
+                # SQLite після часткового remote-виконання: нехай зовнішній
+                # контекст відкотить транзакцію і повторить пакет пізніше.
+                if self._tx_state_var.get() is not None or self.strict_remote:
+                    logger.critical(
+                        "db_remote_unavailable_in_transaction",
+                        host=self.cfg.host or "",
+                        op=op,
+                    )
+                    raise
+                await self._downgrade()
+            else:
+                lid = None
+                if op == "insert":
+                    lid = result if isinstance(result, int) else None
                 else:
-                    lid = None
-                    if op == "insert":
-                        lid = result if isinstance(result, int) else None
+                    lid = getattr(result, "lastrowid", None)
+                if not self.strict_remote:
+                    state = self._tx_state_var.get()
+                    if state is not None:
+                        state["buffer"].append((op, sql, params, lid))
                     else:
-                        lid = getattr(result, "lastrowid", None)
-                    if not self.strict_remote:
-                        if self._tx_buf is not None:
-                            self._tx_buf.append((op, sql, params, lid))
-                        else:
-                            await self._mirror_local(op, sql, params, lid=lid)
-                    return result
+                        await self._mirror_local(op, sql, params, lid=lid)
+                return result
 
-            # Local-mode (або щойно перемкнено після невдачі remote).
-            sql_for_store = sql
-            if op in ("execute", "insert"):
-                tbl = insert_id_table(sql)
-                if tbl is not None:
-                    next_id = await self._next_reserved_id(tbl)
-                    injected = inject_id(sql, next_id)
-                    if injected is not None:
-                        sql = injected
-                        sql_for_store = injected
+        # Local-mode (або щойно перемкнено після невдачі remote).
+        sql_for_store = sql
+        if op in ("execute", "insert"):
+            tbl = insert_id_table(sql)
+            if tbl is not None:
+                next_id = await self._next_reserved_id(tbl)
+                injected = inject_id(sql, next_id)
+                if injected is not None:
+                    sql = injected
+                    sql_for_store = injected
 
-            result = await self._exec_on(self.local, op, sql, params)
-            await self._outbox_append(op, sql_for_store, params)
-            return result
+        result = await self._exec_on(self.local, op, sql, params)
+        await self._outbox_append(op, sql_for_store, params)
+        return result
+
+    async def _fetchone_locked(self, sql: str, params: tuple | None = None):
+        if self._is_local_only_sql(sql):
+            return await self.local.fetchone(sql, params)
+        if self._mode == "remote":
+            try:
+                return await self._remote_retry("fetchone", sql, params)
+            except RemoteUnavailable:
+                if self._tx_state_var.get() is not None or self.strict_remote:
+                    raise
+                await self._downgrade()
+        return await self.local.fetchone(sql, params)
+
+    async def _fetchall_locked(self, sql: str, params: tuple | None = None) -> list[Any]:
+        if self._is_local_only_sql(sql):
+            return await self.local.fetchall(sql, params)
+        if self._mode == "remote":
+            try:
+                return await self._remote_retry("fetchall", sql, params)
+            except RemoteUnavailable:
+                if self._tx_state_var.get() is not None or self.strict_remote:
+                    raise
+                await self._downgrade()
+        return await self.local.fetchall(sql, params)
 
     async def _mirror_local(self, op: str, sql: str, params: Any = None, lid: int | None = None) -> None:
         """Дзеркалює успішно виконану на remote операцію у локальну SQLite.
@@ -548,7 +580,7 @@ class FailoverDatabase(Database):
     @staticmethod
     def _is_local_only_sql(sql: str) -> bool:
         head = sql.lstrip().upper()
-        return head.startswith("PRAGMA") or head.startswith("VACUUM")
+        return head.startswith(("PRAGMA", "VACUUM"))
 
     async def _remote_retry(self, op: str, sql: str, params: Any = None) -> Any:
         last_err: Exception | None = None
@@ -711,9 +743,7 @@ class FailoverDatabase(Database):
         name = type(e).__name__
         if name in ("UniqueViolationError", "IntegrityError"):
             return True
-        if _AsyncpgUniqueError is not None and isinstance(e, _AsyncpgUniqueError):
-            return True
-        return False
+        return _AsyncpgUniqueError is not None and isinstance(e, _AsyncpgUniqueError)
 
     @staticmethod
     def _is_fk_violation(e: Exception) -> bool:
@@ -722,9 +752,7 @@ class FailoverDatabase(Database):
         if "foreign key constraint" in msg or "violates foreign key" in msg:
             return True
         name = type(e).__name__
-        if name == "ForeignKeyViolationError":
-            return True
-        return False
+        return name == "ForeignKeyViolationError"
 
     # ------------------------------------------------------------------- state
     @property

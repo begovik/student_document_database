@@ -72,7 +72,7 @@ class Supervisor:
         n_discipline_queries = await seed_discipline_queries(self.db)
 
         pending_search = await self.scheduler.pending_count("search")
-        if pending_search == 0:
+        if self.settings.channels.ddgs.enabled and pending_search == 0:
             from harvester.db.repositories import SearchQueriesRepository
 
             queries_repo = SearchQueriesRepository(self.db)
@@ -90,7 +90,7 @@ class Supervisor:
                 )
 
         pending_oai = await self.scheduler.pending_count("api_iter")
-        if pending_oai == 0:
+        if self.settings.channels.openalex.enabled and pending_oai == 0:
             for it in create_openalex_iterators():
                 await self.scheduler.schedule_task("api_iter", it, priority=15)
 
@@ -155,7 +155,7 @@ class Supervisor:
                 from harvester.verifier.worker import VerifierWorker
 
                 for i in range(w.verifier):
-                    v_worker = VerifierWorker(i)
+                    v_worker = VerifierWorker(i, db=self.db, settings=self.settings)
                     self._worker_objs.append(v_worker)
                     self._workers.append(self._spawn(f"verifier-{i}", v_worker.run()))
                 logger.info("verifier_workers_started", count=w.verifier)
@@ -168,7 +168,7 @@ class Supervisor:
                 from harvester.classify.discipline_assigner import DisciplineAssigner
 
                 for i in range(w.discipline_assign):
-                    a_worker = DisciplineAssigner(i)
+                    a_worker = DisciplineAssigner(i, db=self.db, settings=self.settings)
                     self._worker_objs.append(a_worker)
                     self._workers.append(self._spawn(f"discipline-assign-{i}", a_worker.run()))
                 logger.info("discipline_assign_workers_started", count=w.discipline_assign)
@@ -239,26 +239,16 @@ class Supervisor:
         try:
             while self._running:
                 await asyncio.sleep(1)
-                if await self._check_llm_exhausted():
-                    logger.critical("llm_limits_exhausted_stopping")
-                    break
+                # Вичерпання LLM не повинно зупиняти discovery/verify: LLM-
+                # воркери самі відкладають свої задачі до відновлення квоти.
         except asyncio.CancelledError:
             pass
         finally:
             await self.stop()
 
     async def _check_llm_exhausted(self) -> bool:
-        """Перевіряє, чи всі LLM ліміти вичерпані."""
-        # У gemma_per_key_model режимі — кожен воркер сам керує ключем
-        # Перевіряємо чи хоча б один воркер ще працює
-        classify_alive = any(
-            w._running for w in self._worker_objs
-            if isinstance(w, ClassifyWorker)
-        )
-        # Якщо хоча б один воркер працює — не зупиняємося
-        if classify_alive:
-            return False
-        return True
+        """Залишено для сумісності з викликачами; сервіс не зупиняється через LLM."""
+        return False
 
     async def _handle_signal(self, sig: signal.Signals) -> None:
         logger.info("signal_received", signal=sig.name)

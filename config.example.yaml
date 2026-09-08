@@ -26,7 +26,7 @@ paths:
 workers:
   verify: 6
   discovery: 3
-  scanner: 1
+  scanner: 0  # окремого scanner-воркера ще немає
   classify: 1
 
 http:
@@ -58,27 +58,27 @@ channels:
     enabled: true
     rps: 5
   crossref:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 5
   unpaywall:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 1
   semanticscholar:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 1
   arxiv:
-    enabled: true
-    interval_s: 3
+    enabled: false  # адаптер ще не реалізований
+    rps: 0.33
   doaj:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 1
   internet_archive:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 1
   core:
     enabled: false
   oai:
-    enabled: true
+    enabled: false  # OAI-сканер ще не реалізований
     per_host_interval_s: 2
 
 filters:

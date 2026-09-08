@@ -1,7 +1,5 @@
 """Тести трансляції SQLite -> PostgreSQL діалекту."""
 
-import pytest
-
 from harvester.db.dialect import (
     crowcount_from_status,
     inject_id,
@@ -91,11 +89,11 @@ class TestUpsertQualify:
 
 class TestPrepare:
     def test_rows_mode(self):
-        pg, mode = prepare("SELECT 1")
+        _pg, mode = prepare("SELECT 1")
         assert mode == "rows"
 
     def test_status_mode(self):
-        pg, mode = prepare("UPDATE documents SET status = ? WHERE id = ?")
+        _pg, mode = prepare("UPDATE documents SET status = ? WHERE id = ?")
         assert mode == "status"
 
     def test_prepare_many_strips_returning(self):
@@ -124,6 +122,16 @@ class TestInjectId:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
         )
         assert inject_id(sql, 5) is None
+
+    def test_id_injected_into_id_table_upsert(self):
+        sql = (
+            "INSERT INTO tasks (type, payload) VALUES (?, ?) "
+            "ON CONFLICT(type, payload_hash) DO UPDATE SET status = excluded.status"
+        )
+        assert inject_id(sql, 5) == (
+            "INSERT INTO tasks (id, type, payload) VALUES (5, ?, ?) "
+            "ON CONFLICT(type, payload_hash) DO UPDATE SET status = excluded.status"
+        )
 
     def test_non_insert_not_injected(self):
         assert inject_id("UPDATE documents SET status = ? WHERE id = ?", 5) is None

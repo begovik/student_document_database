@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +43,7 @@ def run(
     dry_run: bool = typer.Option(False, "--dry-run", "-d", help="Не зберігати результати, лише показати що було б зроблено"),
     retry_failed: bool = typer.Option(False, "--retry-failed", "-r", help="Пере процесувати тільки документи з помилками (попередні спроби не вдалися)"),
     skip_extracted: bool = typer.Option(True, "--skip-extracted/--no-skip-extracted", help="Пропускати документи, для яких вже є дані в extractions"),
-    catalog_dir: str | None = typer.Option(None, "--catalog-dir", "-C", help="Шлях до каталогу з resources/ (для використання локальних PDF замість завантаження)"),
+    catalog_dir: str | None = typer.Option(None, "--catalog-dir", "-C", help="Каталог для обмеження списку документів; PDF завантажуються тимчасово (legacy resources/ підтримується)"),
 ):
     """Запустити витяг цитат і сумаризацій для обраного набору документів.
 
@@ -140,7 +139,7 @@ async def main(
         successful = [r for r in results if r.success]
         failed = [r for r in results if not r.success]
 
-        print(f"\n📊 Статистика:")
+        print("\n📊 Статистика:")
         print(f"  Всього: {len(results)}")
         print(f"  Успішно: {len(successful)}")
         print(f"  Помилки: {len(failed)}")
@@ -181,7 +180,7 @@ async def main(
                                 print(f"        Ідеї: {', '.join(ideas[:3])}")
                     else:
                         # Старий формат (сумісність)
-                        print(f"  Сумаризація:")
+                        print("  Сумаризація:")
                         print(f"    Огляд: {s.get('overview', '')[:150]}")
 
     finally:

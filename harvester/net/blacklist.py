@@ -24,7 +24,7 @@ class BlacklistService:
     _instance: "BlacklistService | None" = None
 
     def __init__(self):
-        self._domains: set[str] = set()
+        self._domains: set[str] = {d.lower().rstrip(".") for d in DEFAULT_BLACKLIST_DOMAINS}
         self._tlds: set[str] = set()
         self._regexes: list[re.Pattern] = []
         self._loaded_at = 0.0
@@ -34,7 +34,11 @@ class BlacklistService:
 
         settings = get_settings()
         for tld in settings.filters.blocked_tlds:
-            self._tlds.add(tld.lower())
+            normalized = tld.strip().lower()
+            if normalized and not normalized.startswith("."):
+                normalized = f".{normalized}"
+            if normalized:
+                self._tlds.add(normalized)
 
     @classmethod
     def get(cls) -> "BlacklistService":
@@ -44,6 +48,7 @@ class BlacklistService:
 
     def set_db(self, db) -> None:
         self._db = db
+        self._loaded_at = 0.0
 
     async def refresh_if_needed(self) -> None:
         if time.monotonic() - self._loaded_at < self._refresh_interval:
@@ -55,21 +60,44 @@ class BlacklistService:
             self._loaded_at = time.monotonic()
 
     async def _load_from_db(self) -> None:
+        settings = get_settings()
+        tlds = set()
+        for value in settings.filters.blocked_tlds:
+            normalized = value.strip().lower()
+            if normalized and not normalized.startswith("."):
+                normalized = f".{normalized}"
+            if normalized:
+                tlds.add(normalized)
+        domains = {d.lower().rstrip(".") for d in DEFAULT_BLACKLIST_DOMAINS}
+        regexes: list[re.Pattern] = []
+
         if self._db is None:
+            self._domains = domains
+            self._tlds = tlds
+            self._regexes = regexes
             return
+
         try:
             rows = await self._db.fetchall("SELECT pattern, kind FROM blacklist")
             for row in rows:
-                pattern, kind = row["pattern"].lower(), row["kind"]
+                pattern = str(row["pattern"]).strip()
+                kind = row["kind"]
                 if kind == "domain":
-                    self._domains.add(pattern)
+                    domains.add(pattern.lower().rstrip("."))
                 elif kind == "tld":
-                    self._tlds.add(pattern)
+                    normalized = pattern.lower()
+                    if normalized and not normalized.startswith("."):
+                        normalized = f".{normalized}"
+                    if normalized:
+                        tlds.add(normalized)
                 elif kind == "url_regex":
                     try:
-                        self._regexes.append(re.compile(pattern, re.IGNORECASE))
+                        regexes.append(re.compile(pattern, re.IGNORECASE))
                     except re.error:
                         logger.warning("blacklist_bad_regex", pattern=pattern)
+            self._domains = domains
+            self._tlds = tlds
+            self._regexes = regexes
             logger.debug(
                 "blacklist_loaded", domains=len(self._domains), tlds=len(self._tlds)
             )
@@ -78,7 +106,7 @@ class BlacklistService:
 
     async def is_blocked_host(self, host: str) -> bool:
         await self.refresh_if_needed()
-        host = host.lower()
+        host = host.strip().rstrip(".").lower()
 
         for tld in self._tlds:
             if host.endswith(tld):

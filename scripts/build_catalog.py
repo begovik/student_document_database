@@ -5,12 +5,8 @@ import asyncio
 import json
 import os
 import subprocess
-import tempfile
-import time
 from datetime import datetime
 from pathlib import Path
-
-import httpx
 
 CATALOG_DIR_MODE = 0o755
 CATALOG_FILE_MODE = 0o644
@@ -171,49 +167,6 @@ def fetch_documents() -> list[dict]:
     return docs
 
 
-async def download_pdf(url: str, dest: Path, timeout_s: float = 60.0) -> bool:
-    """Завантажити PDF за URL."""
-    settings_path = Path("/opt/harvester/.env")
-    user_agent = "Harvester/1.0 (research)"
-    if settings_path.exists():
-        for line in settings_path.read_text().splitlines():
-            if line.startswith("HARVESTER_CONTACT_EMAIL="):
-                email = line.split("=", 1)[1]
-                user_agent = f"Harvester/1.0 ({email})"
-                break
-    
-    headers = {"User-Agent": user_agent, "Accept": "application/pdf,*/*"}
-    timeout = httpx.Timeout(timeout_s, connect=10.0, read=30.0, pool=None)
-    
-    try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code != 200:
-                print(f"  HTTP {resp.status_code} for {url}")
-                return False
-            
-            content_type = resp.headers.get("content-type", "")
-            if "pdf" not in content_type.lower() and not url.lower().endswith(".pdf"):
-                if "html" in content_type.lower():
-                    print(f"  Not PDF (HTML) for {url}")
-                    return False
-            
-            data = resp.content
-            if len(data) < 1024:
-                print(f"  Too small ({len(data)} bytes) for {url}")
-                return False
-            
-            if data[:4] != b"%PDF":
-                print(f"  No %PDF magic bytes for {url}")
-                return False
-            
-            dest.write_bytes(data)
-            return True
-    except Exception as e:
-        print(f"  Error downloading {url}: {e}")
-        return False
-
-
 async def build_catalog():
     """Створити каталог."""
     print("Отримання документів з БД...")
@@ -248,39 +201,11 @@ async def build_catalog():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     catalog_name = f"catalog_{timestamp}"
     catalog_dir = CATALOGS_DIR / catalog_name
-    resources_dir = catalog_dir / "resources"
-    resources_dir.mkdir(parents=True, exist_ok=True)
+    catalog_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(catalog_dir, CATALOG_DIR_MODE)
-    os.chmod(resources_dir, CATALOG_DIR_MODE)
     
     print(f"Створено каталог: {catalog_dir}")
-    
-    # Завантажити PDF
-    downloaded = 0
-    failed = 0
-    for i, doc in enumerate(docs, 1):
-        pdf_path = resources_dir / f"{doc['id']}.pdf"
-        if pdf_path.exists():
-            print(f"  [{i}/{len(docs)}] #{doc['id']} вже існує")
-            os.chmod(pdf_path, CATALOG_FILE_MODE)
-            downloaded += 1
-            continue
-        
-        print(f"  [{i}/{len(docs)}] Завантаження #{doc['id']}...")
-        success = await download_pdf(doc["canonical_url"], pdf_path)
-        if success:
-            os.chmod(pdf_path, CATALOG_FILE_MODE)
-            downloaded += 1
-            doc["pdf_path"] = f"resources/{doc['id']}.pdf"
-        else:
-            failed += 1
-            doc["pdf_path"] = None
-        
-        # Невелика затримка між запитами
-        await asyncio.sleep(0.5)
-    
-    print(f"\nЗавантажено: {downloaded}, Помилки: {failed}")
-    
+
     # Створити JSON каталогу (прибрати службові ключі аналізу якості)
     clean_docs = [
         {k: v for k, v in doc.items() if k not in ("_quality", "_quality_score")}
@@ -291,7 +216,7 @@ async def build_catalog():
         "created_at": datetime.now().isoformat(),
         "total_documents": len(clean_docs),
         "replaced_count": 0,
-        "resources_dir": "resources",
+        "pdf_storage": "temporary_only",
         "documents": clean_docs,
     }
     
@@ -303,7 +228,7 @@ async def build_catalog():
     print(f"JSON збережено: {json_path}")
     print(f"\nКаталог створено: {catalog_dir}")
     print(f"Всього документів: {len(docs)}")
-    print(f"Завантажено PDF: {downloaded}")
+    print("PDF не зберігалися: каталог містить метадані, URL, SHA-256 та витяги з БД.")
     
     return catalog_dir
 

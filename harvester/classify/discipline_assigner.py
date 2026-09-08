@@ -15,7 +15,8 @@ from datetime import UTC, datetime, timedelta
 import structlog
 
 from harvester.classify.llm import AllLimitsExhausted, LLMClient
-from harvester.config import get_settings
+from harvester.config import Settings, get_settings
+from harvester.db.connection import Database
 from harvester.db.failover import build_database
 
 logger = structlog.get_logger()
@@ -75,9 +76,15 @@ def _extract_json(raw: str) -> dict:
 class DisciplineAssigner:
     """Цикл присвоювання дисциплін для verified-документів (Gemini 3.5 Flash Lite)."""
 
-    def __init__(self, worker_id: int = 0):
+    def __init__(
+        self,
+        worker_id: int = 0,
+        db: Database | None = None,
+        settings: Settings | None = None,
+    ):
         self.worker_id = worker_id
-        self.settings = get_settings()
+        self.settings = settings or get_settings()
+        self.db = db
         cfg = self.settings.discipline_assign
 
         keys = self.settings.classify_keys
@@ -89,9 +96,6 @@ class DisciplineAssigner:
             gemma_only=False,
             service="DisciplineAssign",
         )
-        # Ротація лише по одній моделі (Gemini 3.5 Flash Lite)
-        self.llm._gemma_models = [cfg.model]
-        self.llm._models = [cfg.model]
         self._running = True
 
     async def run(self) -> None:
@@ -104,20 +108,30 @@ class DisciplineAssigner:
             model=cfg.model,
         )
 
-        try:
-            await self.llm.initialize()
-        except AllLimitsExhausted:
-            sleep_s = (_tomorrow_midnight_utc() - datetime.now(UTC)).total_seconds()
-            log.critical("discipline_assign_all_keys_exhausted_sleep", sleep_s=int(sleep_s))
-            await asyncio.sleep(max(sleep_s, 60))
-            return await self.run()
+        while self._running:
+            try:
+                await self.llm.initialize()
+                break
+            except AllLimitsExhausted:
+                sleep_s = (_tomorrow_midnight_utc() - datetime.now(UTC)).total_seconds()
+                log.critical("discipline_assign_all_keys_exhausted_sleep", sleep_s=int(sleep_s))
+                await asyncio.sleep(max(sleep_s, 60))
+                self.llm._daily_limit_exhausted.clear()
+                self.llm._gemma_limit_exhausted.clear()
+                self.llm._initialized = False
 
-        db = build_database(self.settings)
-        try:
-            await db.initialize(sync_mirror=False)
-        except Exception as e:  # noqa: BLE001
-            log.error("discipline_assign_db_init_failed", error=str(e)[:200])
+        if not self._running:
             return
+
+        db = self.db
+        owns_db = db is None
+        if db is None:
+            db = build_database(self.settings)
+            try:
+                await db.initialize(sync_mirror=False)
+            except Exception as e:  # noqa: BLE001
+                log.error("discipline_assign_db_init_failed", error=str(e)[:200])
+                return
 
         # Список дисциплін для присвоювання (одного разу за старт)
         try:
@@ -126,11 +140,13 @@ class DisciplineAssigner:
             disciplines = await load_disciplines(db)
         except Exception as e:  # noqa: BLE001
             log.error("discipline_assign_load_failed", error=str(e)[:200])
-            await db.close()
+            if owns_db:
+                await db.close()
             return
         if not disciplines:
             log.warning("discipline_assign_empty_list")
-            await db.close()
+            if owns_db:
+                await db.close()
             return
 
         disciplines_list = "\n".join(
@@ -199,7 +215,8 @@ class DisciplineAssigner:
                     log.exception("discipline_assign_worker_error", error=str(e))
                     await asyncio.sleep(10)
         finally:
-            await db.close()
+            if owns_db:
+                await db.close()
             log.info("discipline_assign_worker_stopped")
 
     async def _assign(self, doc: dict, disciplines_list: str) -> tuple[list[str], float]:

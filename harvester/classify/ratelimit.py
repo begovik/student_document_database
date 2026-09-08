@@ -12,7 +12,6 @@ logger = structlog.get_logger()
 
 class DailyLimitExhausted(Exception):
     """Денний ліміт для моделі вичерпано."""
-    pass
 
 
 class ModelRateLimiter:
@@ -51,6 +50,7 @@ class ModelRateLimiter:
             return
 
         while True:
+            wait_s = 0.0
             async with self._lock:
                 self._cleanup(model)
                 self._check_daily_reset()
@@ -58,22 +58,21 @@ class ModelRateLimiter:
                 # RPM — запитів за хвилину
                 rpm_limit = limits.get("rpm", 0)
                 if rpm_limit and len(self._requests[model]) >= rpm_limit:
-                    wait = self._requests[model][0] + 60 - time.monotonic()
-                    if wait > 0:
+                    wait_s = self._requests[model][0] + 60 - time.monotonic()
+                    if wait_s > 0:
                         logger.warning(
                             "rate_limit_rpm",
                             model=model,
                             rpm=len(self._requests[model]),
                             limit=rpm_limit,
-                            wait_s=round(wait, 1),
+                            wait_s=round(wait_s, 1),
                         )
-                        # Звільняємо lock перед сном
-                        await asyncio.sleep(wait)
-                        continue
+                    else:
+                        wait_s = 0.0
 
                 # RPD — запитів за день
                 rpd_limit = limits.get("rpd", 0)
-                if rpd_limit and self._daily_counts[model] >= rpd_limit:
+                if not wait_s and rpd_limit and self._daily_counts[model] >= rpd_limit:
                     logger.warning(
                         "rate_limit_rpd",
                         model=model,
@@ -85,25 +84,30 @@ class ModelRateLimiter:
 
                 # TPM — токенів за хвилину (тільки Gemma)
                 tpm_limit = limits.get("tpm", 0)
-                if tpm_limit:
+                if not wait_s and tpm_limit:
                     total_tokens = sum(tk for _, tk in self._tokens[model])
                     if total_tokens >= tpm_limit:
-                        wait = self._tokens[model][0][0] + 60 - time.monotonic()
-                        if wait > 0:
+                        wait_s = self._tokens[model][0][0] + 60 - time.monotonic()
+                        if wait_s > 0:
                             logger.warning(
                                 "rate_limit_tpm",
                                 model=model,
                                 tokens=total_tokens,
                                 limit=tpm_limit,
-                                wait_s=round(wait, 1),
+                                wait_s=round(wait_s, 1),
                             )
-                            await asyncio.sleep(wait)
-                            continue
+                        else:
+                            wait_s = 0.0
 
                 # Все ок — реєструємо запит
-                self._requests[model].append(time.monotonic())
-                self._daily_counts[model] += 1
-                return
+                if not wait_s:
+                    self._requests[model].append(time.monotonic())
+                    self._daily_counts[model] += 1
+                    return
+
+            # Сон поза lock: інші моделі та запити можуть перевіряти свої
+            # ліміти, поки ця модель чекає на нове вікно.
+            await asyncio.sleep(wait_s)
 
     def record_tokens(self, model: str, token_count: int) -> None:
         """Записує використані токени для моделі (для TPM ліміту)."""

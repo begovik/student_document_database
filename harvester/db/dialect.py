@@ -30,6 +30,7 @@ ID_TABLES = {
     "blacklist",
     "channel_stats",
     "system_events",
+    "verifier_results",
 }
 
 
@@ -110,8 +111,6 @@ def translate_sql(sql: str) -> str:
     kw = _statement_keyword(s)
 
     is_insert = kw == "INSERT"
-    is_select = kw in ("SELECT", "EXPLAIN", "WITH", "VALUES", "SHOW")
-
     # Вилучаємо OR IGNORE / OR REPLACE і запам'ятовуємо це.
     words, ignore_mode = _replace_ignore(s)
     normalized = " ".join(words)
@@ -271,9 +270,13 @@ def _classify(sql: str) -> str:
 def _replace_ignore(sql: str) -> tuple[list[str], str]:
     """Повертає (слова, режим), вилучаючи OR IGNORE / OR REPLACE з INSERT."""
     words = sql.split()
-    if len(words) >= 3 and words[0].upper() == "INSERT":
-        if words[1].upper() == "OR" and words[2].upper() in ("IGNORE", "REPLACE"):
-            return [words[0]] + words[3:], words[2].lower()
+    if (
+        len(words) >= 3
+        and words[0].upper() == "INSERT"
+        and words[1].upper() == "OR"
+        and words[2].upper() in ("IGNORE", "REPLACE")
+    ):
+        return [words[0]] + words[3:], words[2].lower()
     return words, ""
 
 
@@ -363,7 +366,9 @@ def crowcount_from_status(status: str) -> int:
 
 
 _ID_INSERT_RE = re.compile(
-    r"^INSERT(?:\s+OR\s+(?:IGNORE|REPLACE))?\s+INTO\s+(\w+)\s*\((.*?)\)\s*VALUES\s*\((.*)\)\s*$",
+    r"^INSERT(?:\s+OR\s+(?:IGNORE|REPLACE))?\s+INTO\s+(\w+)\s*"
+    r"\((.*?)\)\s*VALUES\s*\((.*?)\)"
+    r"(\s+ON\s+CONFLICT\b.*)?$",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -371,19 +376,21 @@ _ID_INSERT_RE = re.compile(
 def inject_id(sql: str, lid: int) -> str | None:
     """Повернути SQL з явним `id = lid` (params залишаються незмінними).
 
-    Підходить лише для простих INSERT (без ON CONFLICT-хвоста) у таблиці,
-    де `id` ще не задано. Інакше повертає None.
+    Підходить для INSERT/UPSERT у таблиці, де `id` ще не задано. Інакше
+    повертає None. У UPSERT-хвості явно заданий id використовується лише
+    для нового рядка, а на конфлікті PostgreSQL зберігає наявний id.
     """
-    if " ON CONFLICT" in sql.upper():
-        return None
     m = _ID_INSERT_RE.match(sql)
     if not m:
         return None
     head = sql[: m.start(1)].rstrip()
     table = m.group(1)
+    if table.lower() not in ID_TABLES:
+        return None
     cols = m.group(2)
     vals = m.group(3)
+    suffix = m.group(4) or ""
     col_list = [c.strip().strip('"') for c in cols.split(",") if c.strip()]
     if not col_list or "id" in col_list:
         return None
-    return f"{head} {table} (id, {cols}) VALUES ({lid}, {vals})"
+    return f"{head} {table} (id, {cols}) VALUES ({lid}, {vals}){suffix}"

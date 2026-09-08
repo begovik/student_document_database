@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import structlog
 
@@ -20,6 +21,7 @@ from harvester.bibliography import (
 )
 from harvester.bibliography.searcher import BibliographySearcher, SearchResult
 from harvester.config import get_settings
+from harvester.net.client import get_http_client
 
 logger = structlog.get_logger()
 
@@ -105,7 +107,11 @@ class BibliographyService:
         with open(catalog_json, "r", encoding="utf-8") as f:
             catalog = json.load(f)
         
-        resources_dir = catalog_dir / catalog.get("resources_dir", "resources")
+        resources_dir = None
+        if catalog.get("resources_dir"):
+            legacy_resources_dir = catalog_dir / str(catalog["resources_dir"])
+            if legacy_resources_dir.exists():
+                resources_dir = legacy_resources_dir
         
         logger.info(
             "bibliography_scan_start",
@@ -116,7 +122,6 @@ class BibliographyService:
         
         # Обробити кожен документ
         all_references: list[BibliographyEntry] = []
-        all_search_results: list[SearchResult] = []
         docs_with_refs: list[DocumentReferences] = []
         
         for doc in catalog.get("documents", []):
@@ -124,13 +129,29 @@ class BibliographyService:
             doc_title = doc.get("title", "")
             doc_url = doc.get("canonical_url", "")
             
-            pdf_path = resources_dir / f"{doc_id}.pdf"
-            if not pdf_path.exists():
-                logger.warning("pdf_not_found", doc_id=doc_id, path=str(pdf_path))
-                continue
-            
-            # Вилучити повний текст (для LLM — весь документ, бо додатки можуть бути 10+ сторінок після літератури)
-            full_text = await self._extract_full_text(pdf_path)
+            local_pdf = resources_dir / f"{doc_id}.pdf" if resources_dir else None
+            temporary_pdf = None
+            if local_pdf and local_pdf.exists():
+                pdf_path = local_pdf
+            else:
+                # Нові каталоги містять лише метадані. PDF завантажується у
+                # системний temp тільки на час вилучення тексту.
+                pdf_path, download_error = await self._download_pdf_temporarily(doc_url)
+                if pdf_path is None:
+                    logger.warning(
+                        "pdf_download_for_bibliography_failed",
+                        doc_id=doc_id,
+                        error=download_error or "невідома помилка",
+                    )
+                    continue
+                temporary_pdf = pdf_path
+
+            # Вилучити повний текст, включно з кінцем документа, де часто є література.
+            try:
+                full_text = await self._extract_full_text(pdf_path)
+            finally:
+                if temporary_pdf is not None:
+                    await asyncio.to_thread(temporary_pdf.unlink, missing_ok=True)
             if not full_text:
                 logger.warning("no_text_extracted", doc_id=doc_id)
                 continue
@@ -201,11 +222,8 @@ class BibliographyService:
         found_online = sum(1 for r in search_results if r.found and not r.in_database)
         not_found = sum(1 for r in search_results if not r.found)
 
-        # Завантаження знайдених PDF у окрему папку всередині каталогу
-        bibli_pdfs_dir = catalog_dir / "bibliography_pdfs"
-        bibli_pdfs_dir.mkdir(parents=True, exist_ok=True)
         downloaded, added_to_db = await self._download_and_register(
-            search_results, bibli_pdfs_dir, catalog.get("topic", "")
+            search_results, catalog.get("topic", "")
         )
         
         # Створити вихідний документ
@@ -230,7 +248,7 @@ class BibliographyService:
                 "not_found": not_found,
                 "pdfs_downloaded": len(downloaded),
                 "documents_added_to_db": len(added_to_db),
-                "bibliography_pdfs_dir": str(bibli_pdfs_dir),
+                "pdf_storage": "temporary_only",
             },
             "filtered_russian_examples": [
                 {"raw_text": r.raw_text[:200], "reason": reason} for r, reason in russian_filtered[:10]
@@ -277,7 +295,7 @@ class BibliographyService:
                 "found_online": "Кількість посилань, для яких вдалося знайти доступний файл в інтернеті (перевірка: URL дозволено, не .ru/.su/.рф, HTTP HEAD 200, content-type PDF або filetype:pdf через DDGS). 'шукається' означає, що пошук триває/таймаут DDGS або потік був перерваний.",
                 "not_found": "Посилання, для яких не знайдено ні в БД, ні в інтернеті (заблоковано, таймаут, немає результатів DDGS).",
                 "filtered_russian": "Відфільтровано російських/радянських джерел за правилами harvester (TLD .ru/.su/.рф, мова ru, видавництво 'Москва', 'Издательство'). Вони не шукаються і не додаються.",
-                "pdfs_downloaded": "Скільки знайдених онлайн-PDF вдалося фактично завантажити та зберегти у bibliography_pdfs/ після перевірки доступності, релевантності (ключові слова теми) та інформативності (text_layer, розмір).",
+                "pdfs_downloaded": "Скільки знайдених онлайн-PDF вдалося тимчасово завантажити та перевірити; після перевірки файли видаляються.",
             },
         }
         
@@ -320,7 +338,7 @@ class BibliographyService:
             references_found_online=found_online,
             references_not_found=not_found,
             pdfs_downloaded=len(downloaded),
-            pdfs_saved_dir=str(bibli_pdfs_dir),
+            pdfs_saved_dir="",
             documents_added_to_db=len(added_to_db),
             processing_time_s=processing_time,
             output_file=str(output_file),
@@ -344,15 +362,12 @@ class BibliographyService:
         return result
     
     async def _download_and_register(
-        self, search_results: list[SearchResult], dest_dir: Path, topic: str
+        self, search_results: list[SearchResult], topic: str
     ) -> tuple[list[dict], list[int]]:
-        """Завантажити знайдені PDF у окрему папку всередині каталогу та зареєструвати в БД.
+        """Тимчасово перевірити знайдені PDF та зареєструвати якісні джерела.
 
-        - Інтернет-ресурси: перевірка доступності, релевантності, інформативності -> лише у список + завантаження
-        - Документи (online_pdf, які є повноцінними): після завантаження та перевірки -> у список + у БД (insert_or_ignore)
+        Файл живе лише протягом перевірки, після чого видаляється.
         """
-        import re as _re
-
         downloaded: list[dict] = []
         added_ids: list[int] = []
 
@@ -405,104 +420,112 @@ class BibliographyService:
 
             # 3. Завантаження
             try:
-                import httpx
-
-                # Використовуємо спільний HttpClient якщо можливо, але тут простіше httpx
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(30, connect=10), follow_redirects=True, headers={"User-Agent": self.settings.http.user_agent}
-                ) as client:
-                    resp = await client.get(url, headers={"Accept": "application/pdf,*/*"})
+                client = await get_http_client()
+                chunks: list[bytes] = []
+                total = 0
+                too_large = False
+                async with client.stream(
+                    "GET",
+                    url,
+                    headers={"Accept": "application/pdf,*/*"},
+                    timeout=self.settings.http.read_timeout_s,
+                ) as resp:
                     if resp.status_code not in (200, 206):
                         sr.accessibility = f"http_{resp.status_code}"
                         continue
                     ctype = resp.headers.get("content-type", "")
-                    data = resp.content
-                    if len(data) < 5_000:
-                        sr.accessibility = "too_small"
-                        continue
-                    if data[:4] != b"%PDF" and "pdf" not in ctype.lower() and not url.lower().endswith(".pdf"):
-                        # Можливо HTML сторінка, а не PDF - вважаємо як internet resource, не завантажуємо як PDF
-                        sr.source_type = "online_abstract"
-                        continue
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        total += len(chunk)
+                        if total > self.settings.http.max_pdf_bytes:
+                            too_large = True
+                            break
+                        chunks.append(chunk)
+                if too_large:
+                    sr.accessibility = "too_large"
+                    continue
+                data = b"".join(chunks)
+                if len(data) < self.settings.http.min_pdf_bytes:
+                    sr.accessibility = "too_small"
+                    continue
+                if data[:4] != b"%PDF" and "pdf" not in ctype.lower() and not url.lower().endswith(".pdf"):
+                    sr.source_type = "online_abstract"
+                    continue
 
-                    # 4. Перевірка інформативності (parse_pdf)
-                    tmp_path = dest_dir / f"tmp_{abs(hash(url)) % 10_000_000}.pdf"
-                    tmp_path.write_bytes(data)
+                # 4. Перевірка інформативності (повний доступний текст)
+                fd, tmp_name = tempfile.mkstemp(prefix="biblio_", suffix=".pdf")
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                try:
+                    await asyncio.to_thread(tmp_path.write_bytes, data)
+                    parse_res = await parse_pdf(tmp_path, max_pages=self.settings.verify.max_pages)
+                finally:
+                    await asyncio.to_thread(tmp_path.unlink, missing_ok=True)
+
+                # Перевірки виконуються після finally: помилка парсера не може бути
+                # замаскована логікою очищення тимчасового файлу.
+                if not parse_res.has_text_layer:
+                    logger.info("bibliography_skip_no_text_layer", url=url)
+                    continue
+                if parse_res.page_count < 2:
+                    logger.info("bibliography_skip_short_pdf", url=url, pages=parse_res.page_count)
+                    continue
+
+                # Релевантний документ має відповідати темі не лише на рівні заголовка.
+                sample = (parse_res.text[:4000] + " " + sr.reference.title).lower()
+                relevant = any(kw in sample for kw in topic_keywords) or sr.relevance_score >= 0.5
+                if not relevant:
+                    logger.info("bibliography_skip_not_relevant", url=url)
+                    continue
+
+                try:
+                    lang2 = await detect_language(parse_res.text[:3000])
+                    if lang2.language == "ru" and lang2.confidence >= 0.8:
+                        logger.info("bibliography_skip_russian_content", url=url)
+                        continue
+                except Exception:
+                    pass
+
+                downloaded.append({
+                    "url": url,
+                    "pages": parse_res.page_count,
+                    "title": sr.reference.title[:80],
+                    "storage": "temporary_only",
+                })
+
+                # Запис у БД лише після всіх перевірок повного джерела.
+                if db is not None:
                     try:
-                        parse_res = await parse_pdf(tmp_path, max_pages=5)
-                    finally:
-                        try:
-                            tmp_path.unlink()
-                        except Exception:
-                            pass
-
-                    # 4a. Has text layer?
-                    if not parse_res.has_text_layer:
-                        logger.info("bibliography_skip_no_text_layer", url=url)
-                        continue
-                    # 4b. Page count?
-                    if parse_res.page_count < 1:
-                        continue
-                    # 4c. Релевантність: чи містить текст ключові слова теми
-                    sample = (parse_res.text[:4000] + " " + sr.reference.title).lower()
-                    relevant = any(kw in sample for kw in topic_keywords) or sr.relevance_score >= 0.5
-                    if not relevant:
-                        logger.info("bibliography_skip_not_relevant", url=url)
-                        # Все одно зберігаємо як internet resource, але не як документ? - зберігаємо файл але позначаємо
-                        pass
-
-                    # 4d. Мова вмісту (RU фільтр)
-                    try:
-                        lang2 = await detect_language(parse_res.text[:3000])
-                        if lang2.language == "ru" and lang2.confidence >= 0.8:
-                            logger.info("bibliography_skip_russian_content", url=url)
-                            continue
-                    except Exception:
-                        pass
-
-                    # 5. Збереження у окрему папку всередині каталогу
-                    safe_name = _re.sub(r"[^a-zA-Z0-9_-]", "_", sr.reference.title[:40] or "ref")[:40]
-                    filename = f"{safe_name}_{abs(hash(url)) % 1_000_000}.pdf"
-                    dest = dest_dir / filename
-                    dest.write_bytes(data)
-                    downloaded.append({"url": url, "file": str(dest.relative_to(dest_dir.parent)), "pages": parse_res.page_count, "title": sr.reference.title[:80]})
-
-                    # 6. Запис у БД якщо це повноцінний документ (online_pdf + пройшов перевірки)
-                    if db is not None and parse_res.has_text_layer and parse_res.page_count >= 2:
-                        try:
-                            repo = DocumentsRepository(db)
-                            # Перевірка чи вже є
-                            exists = await repo.get_by_canonical_url(url)
-                            if not exists:
-                                # Визначаємо рік з посилання
-                                year_int = None
-                                try:
-                                    if sr.reference.year and sr.reference.year.isdigit():
-                                        y = int(sr.reference.year)
-                                        if 1900 <= y <= 2030:
-                                            year_int = y
-                                except Exception:
-                                    pass
-                                new_id = await repo.insert_or_ignore(
-                                    canonical_url=url,
-                                    title=sr.reference.title or None,
-                                    title_hint=sr.reference.title or None,
-                                    authors=sr.reference.authors or None,
-                                    year=year_int,
-                                    publisher=sr.reference.source or None,
-                                    language="uk",
-                                    doc_type="article" if sr.reference.entry_type == "article" else "other",
-                                    page_count=parse_res.page_count,
-                                    size_bytes=len(data),
-                                    has_text_layer=True,
-                                    status="discovered",
-                                    extra={"bibliography_found": True, "topic": topic},
-                                )
-                                if new_id:
-                                    added_ids.append(new_id)
-                                    sr.document_id = new_id
-                        except Exception as e:
-                            logger.warning("bibliography_db_insert_failed", url=url, error=str(e))
+                        repo = DocumentsRepository(db)
+                        exists = await repo.get_by_canonical_url(url)
+                        if not exists:
+                            year_int = None
+                            try:
+                                if sr.reference.year and sr.reference.year.isdigit():
+                                    y = int(sr.reference.year)
+                                    if 1900 <= y <= 2030:
+                                        year_int = y
+                            except Exception:
+                                pass
+                            new_id = await repo.insert_or_ignore(
+                                canonical_url=url,
+                                title=sr.reference.title or None,
+                                title_hint=sr.reference.title or None,
+                                authors=sr.reference.authors or None,
+                                year=year_int,
+                                publisher=sr.reference.source or None,
+                                language="uk",
+                                doc_type="article" if sr.reference.entry_type == "article" else "other",
+                                page_count=parse_res.page_count,
+                                size_bytes=len(data),
+                                has_text_layer=True,
+                                status="discovered",
+                                extra={"bibliography_found": True, "topic": topic},
+                            )
+                            if new_id:
+                                added_ids.append(new_id)
+                                sr.document_id = new_id
+                    except Exception as e:
+                        logger.warning("bibliography_db_insert_failed", url=url, error=str(e))
 
             except Exception as e:
                 logger.warning("bibliography_download_failed", url=url, error=str(e))
@@ -514,7 +537,12 @@ class BibliographyService:
             except Exception:
                 pass
 
-        logger.info("bibliography_download_complete", downloaded=len(downloaded), added_to_db=len(added_ids), dest=str(dest_dir))
+        logger.info(
+            "bibliography_download_complete",
+            downloaded=len(downloaded),
+            added_to_db=len(added_ids),
+            storage="temporary_only",
+        )
         return downloaded, added_ids
 
     async def _extract_references_with_llm(
@@ -534,10 +562,6 @@ class BibliographyService:
         ]
         # Спробуємо викликати через існуючу логіку extract/engine.py (щоб не дублювати)
         try:
-            from harvester.extract.engine import call_llm_for_extraction  # noqa: WPS433
-
-            # Використаємо call_llm_for_extraction як обгортку, але нам потрібен лише bibliography
-            # Тому викликаємо напряму Gemini логіку тут (спрощено з engine.py)
             result = await self._call_llm_bibliography(messages)
             if result is None:
                 return None
@@ -594,68 +618,20 @@ class BibliographyService:
             return None
 
     async def _call_llm_bibliography(self, messages: list[dict]) -> dict | None:
-        """Низькорівневий виклик Gemini/Gemma для бібліографії (аналог call_llm_for_extraction)."""
-        import json as _json
+        """Викликати спільний LLM-клієнт і нормалізувати JSON-відповідь."""
+        from harvester.classify.llm import LLMClient, LLMUnavailable
 
-        llm_cfg = self.settings.llm
-        # Gemini
-        for api_key in [self.settings.gemini_api_key, self.settings.gemini_api_key_2, self.settings.gemini_api_key_3]:
-            if not api_key:
-                continue
-            try:
-                res = await self._call_gemini_bibliography(api_key, llm_cfg, messages)
-                if res is not None:
-                    return res
-            except Exception as e:
-                logger.warning("gemini_bib_failed", error=str(e)[:150])
-        # Gemma fallback
-        for api_key in [self.settings.gemini_api_key, self.settings.gemini_api_key_2, self.settings.gemini_api_key_3]:
-            if not api_key:
-                continue
-            for model in llm_cfg.gemma_models:
-                try:
-                    from harvester.classify.llm import rephrase_for_gemma
-
-                    # Стискаємо контент
-                    orig_content = messages[1]["content"]
-                    truncated = f"НАЗВА ДОКУМЕНТА: {orig_content[:200]}\n\nТЕКСТ:\n{rephrase_for_gemma(orig_content, llm_cfg.gemma_max_chars)}"
-                    gemma_messages = [
-                        {"role": "system", "content": LLM_BIBLIO_PROMPT},
-                        {"role": "user", "content": truncated},
-                    ]
-                    res = await self._call_gemini_bibliography(api_key, llm_cfg, gemma_messages, model_override=model)
-                    if res is not None:
-                        return res
-                except Exception as e:
-                    logger.warning("gemma_bib_failed", model=model, error=str(e)[:150])
-        return None
-
-    async def _call_gemini_bibliography(self, api_key: str, config, messages: list[dict], model_override: str | None = None) -> dict | None:
-        """Виклик Gemini API для бібліографії."""
-        import aiohttp
-        import json as _json
-
-        model = model_override or (config.gemini_models[0] if config.gemini_models else "gemini-2.0-flash")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        # Для бібліографії потрібно більше токенів (40 записів × ~150 символів)
-        biblio_tokens = max(config.max_tokens, 8192)
-        payload = {
-            "contents": [
-                {"role": messages[0]["role"], "parts": [{"text": messages[0]["content"]}]},
-                {"role": messages[1]["role"], "parts": [{"text": messages[1]["content"]}]},
-            ],
-            "generationConfig": {"temperature": config.temperature, "maxOutputTokens": biblio_tokens},
-        }
-        timeout = aiohttp.ClientTimeout(total=config.timeout_s)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.warning("gemini_bib_api_error", status=resp.status, body=body[:300])
-                    return None
-                data = await resp.json()
+        system_prompt = str(messages[0].get("content") or "")
+        user_prompt = str(messages[1].get("content") or "")
+        client = LLMClient(keys=self.settings.gemini_keys, service="Bibliography")
         try:
-            content_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            response = await client.complete(f"{system_prompt}\n\n{user_prompt}")
+        except LLMUnavailable as e:
+            logger.warning("llm_bib_unavailable", error=str(e)[:200])
+            return None
+
+        content_text = response.text.strip()
+        try:
             if "```" in content_text:
                 # Витягти JSON між ```json ... ``` або ``` ... ```
                 m = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", content_text, re.DOTALL)
@@ -665,8 +641,8 @@ class BibliographyService:
                     content_text = content_text.replace("```json", "").replace("```", "").strip()
             # Спроба прямого парсингу
             try:
-                result = _json.loads(content_text)
-            except _json.JSONDecodeError:
+                result = json.loads(content_text)
+            except json.JSONDecodeError:
                 # Ремонт: прибрати trailing commas, витягти об'єкт
                 fixed = re.sub(r",\s*}", "}", content_text)
                 fixed = re.sub(r",\s*]", "]", fixed)
@@ -674,7 +650,7 @@ class BibliographyService:
                 m2 = re.search(r"(\{.*\}|\[.*\])", fixed, re.DOTALL)
                 if m2:
                     fixed = m2.group(1)
-                result = _json.loads(fixed)
+                result = json.loads(fixed)
             if isinstance(result, dict) and "references" in result:
                 return result
             # Якщо LLM повернув просто список
@@ -688,8 +664,16 @@ class BibliographyService:
             logger.warning("llm_bib_invalid_format", response=content_text[:200])
             return None
         except Exception as e:
-            logger.warning("llm_bib_parse_error", error=str(e)[:150], response=str(data)[:500])
+            logger.warning("llm_bib_parse_error", error=str(e)[:150], response=content_text[:500])
             return None
+
+    async def _download_pdf_temporarily(self, url: str) -> tuple[Path | None, str | None]:
+        """Завантажити PDF у системний temp для одноразового вилучення тексту."""
+        if not url:
+            return None, "відсутній URL"
+        from harvester.extract.engine import download_pdf
+
+        return await download_pdf(url, timeout_s=self.settings.http.total_timeout_s)
 
     async def _extract_full_text(self, pdf_path: Path) -> str:
         """Вилучити ПОВНИЙ текст з PDF (всі сторінки) для LLM."""

@@ -123,6 +123,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_attempts INTEGER NOT NULL DEFAULT 5,
     run_after    TEXT NOT NULL,
     lease_expires_at TEXT,
+    lease_token  TEXT,
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
     UNIQUE(type, payload_hash)

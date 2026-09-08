@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import httpx
 import structlog
 
 from harvester.config import get_settings
+from harvester.net.client import get_http_client
 
 logger = structlog.get_logger()
 
@@ -19,26 +19,25 @@ async def check_availability(
     Returns (available, reason) — reason = None якщо доступно.
     """
     settings = get_settings()
-    timeout = httpx.Timeout(timeout_s, connect=5.0, read=5.0, pool=None)
     headers = {
         "User-Agent": settings.http.user_agent,
         "Accept": "application/pdf,*/*",
     }
 
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            resp = await client.head(url, headers=headers)
-            if resp.status_code != 200:
-                return False, f"HTTP {resp.status_code}"
-            ct = resp.headers.get("content-type", "").lower()
-            if "pdf" not in ct and "octet-stream" not in ct:
-                return False, f"не PDF (content-type={ct})"
-            return True, None
-    except httpx.ConnectTimeout:
+        client = await get_http_client()
+        resp = await client.head(url, headers=headers, timeout=timeout_s)
+        if resp.status_code == 405:
+            resp = await client.get(url, headers=headers, timeout=timeout_s)
+        if not 200 <= resp.status_code < 300:
+            return False, f"HTTP {resp.status_code}"
+        ct = resp.headers.get("content-type", "").lower()
+        if ct and "pdf" not in ct and "octet-stream" not in ct and not url.lower().split("?", 1)[0].endswith(".pdf"):
+            return False, f"не PDF (content-type={ct})"
+        return True, None
+    except TimeoutError:
         return False, "connect_timeout"
-    except httpx.ReadTimeout:
-        return False, "read_timeout"
-    except httpx.ConnectError:
+    except OSError:
         return False, "connect_error"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"

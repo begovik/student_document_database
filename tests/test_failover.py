@@ -97,9 +97,10 @@ async def test_executemany_outbox(db):
         [(docid, "search", "https://example.org/a.pdf", "2026-01-01")],
     )
     rows = await db.fetchall(
-        "SELECT op FROM failover_outbox WHERE op = 'executemany'"
+        "SELECT op, sql FROM failover_outbox WHERE sql LIKE '%document_refs%'"
     )
     assert len(rows) == 1
+    assert rows[0]["op"] == "execute"
 
 
 @pytest.mark.asyncio

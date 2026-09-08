@@ -1,5 +1,6 @@
 import hashlib
 import json
+import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -68,7 +69,7 @@ class DocumentsRepository:
             openalex_id,
             title,
             title_hint,
-            json.dumps(authors) if authors else None,
+            json.dumps(authors, ensure_ascii=False) if authors else None,
             year,
             publisher,
             language,
@@ -89,7 +90,7 @@ class DocumentsRepository:
             next_verify_at,
             first_seen_at,
             verified_at,
-            json.dumps(extra) if extra else None,
+            json.dumps(extra, ensure_ascii=False) if extra else None,
         )
 
         cursor = await self.db.execute(sql, params)
@@ -109,15 +110,16 @@ class DocumentsRepository:
         authors: list[str] | None = None,
         year: int | None = None,
         publisher: str | None = None,
-        doc_type: str = "other",
+        doc_type: str | None = None,
         udc: str | None = None,
         has_text_layer: bool = True,
-        is_oa: bool = True,
+        is_oa: bool | None = None,
         oa_status: str | None = None,
         needs_review: bool = False,
         huge: bool = False,
         verified_at: str | None = None,
         text_sample: str | None = None,
+        extra: dict | None = None,
     ) -> None:
         if verified_at is None:
             verified_at = datetime.utcnow().isoformat()
@@ -127,9 +129,11 @@ class DocumentsRepository:
             sha256 = ?, size_bytes = ?, page_count = ?, language = ?, lang_confidence = ?,
             title = COALESCE(?, title), authors = COALESCE(?, authors),
             year = COALESCE(?, year), publisher = COALESCE(?, publisher),
-            doc_type = ?, udc = ?, has_text_layer = ?, is_oa = ?, oa_status = ?,
+            doc_type = COALESCE(?, doc_type), udc = COALESCE(?, udc),
+            has_text_layer = COALESCE(?, has_text_layer),
+            is_oa = COALESCE(?, is_oa), oa_status = COALESCE(?, oa_status),
             needs_review = ?, huge = ?, verified_at = ?, status = 'verified',
-            text_sample = COALESCE(?, text_sample)
+            text_sample = COALESCE(?, text_sample), extra = COALESCE(?, extra)
         WHERE id = ?
         """
         params = (
@@ -139,20 +143,33 @@ class DocumentsRepository:
             language,
             lang_confidence,
             title,
-            json.dumps(authors) if authors else None,
+            json.dumps(authors, ensure_ascii=False) if authors else None,
             year,
             publisher,
             doc_type,
             udc,
             1 if has_text_layer else 0,
-            1 if is_oa else 0,
+            1 if is_oa else 0 if is_oa is False else None,
             oa_status,
             1 if needs_review else 0,
             1 if huge else 0,
             verified_at,
             text_sample,
+            None,
             doc_id,
         )
+        if extra is not None:
+            existing = await self.db.fetchone("SELECT extra FROM documents WHERE id = ?", (doc_id,))
+            merged_extra: dict[str, Any] = {}
+            if existing and existing["extra"]:
+                try:
+                    parsed = json.loads(existing["extra"])
+                    if isinstance(parsed, dict):
+                        merged_extra.update(parsed)
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            merged_extra.update(extra)
+            params = params[:-2] + (json.dumps(merged_extra, ensure_ascii=False), doc_id)
         await self.db.execute(sql, params)
 
     async def update_status(self, doc_id: int, status: str) -> None:
@@ -270,7 +287,9 @@ class TasksRepository:
             status = 'pending',
             attempts = 0,
             run_after = excluded.run_after,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            lease_expires_at = NULL,
+            lease_token = NULL
         WHERE tasks.status = 'done'
         """
         cursor = await self.db.execute(sql, (task_type, payload_json, payload_hash, priority, max_attempts, run_after, now, now))
@@ -281,6 +300,7 @@ class TasksRepository:
     ) -> dict | None:
         now = datetime.utcnow().isoformat()
         lease_expires = (datetime.utcnow() + timedelta(seconds=lease_duration_s)).isoformat()
+        lease_token = uuid.uuid4().hex
 
         type_filter = ""
         params: list = [now]
@@ -305,13 +325,14 @@ class TasksRepository:
         cursor = await self.db.execute(
             """
             UPDATE tasks SET status = 'running', attempts = attempts + 1,
-                   lease_expires_at = ?, updated_at = ?
+                   lease_expires_at = ?, lease_token = ?, updated_at = ?
             WHERE id = ? AND status = 'pending'
             """,
-            (lease_expires, now, task["id"]),
+            (lease_expires, lease_token, now, task["id"]),
         )
         if cursor.rowcount == 0:
             return None
+        task["lease_token"] = lease_token
         return task
 
     async def count_pending_by_type(self, task_type: str) -> int:
@@ -330,33 +351,53 @@ class TasksRepository:
             result.setdefault(row["type"], {})[row["status"]] = row["count"]
         return result
 
-    async def complete(self, task_id: int) -> None:
+    async def complete(self, task_id: int, lease_token: str | None = None) -> bool:
         now = datetime.utcnow().isoformat()
-        await self.db.execute(
-            "UPDATE tasks SET status = 'done', updated_at = ? WHERE id = ?",
-            (now, task_id),
+        where = "id = ? AND status = 'running'"
+        params: list[Any] = [now, task_id]
+        if lease_token is not None:
+            where += " AND lease_token = ?"
+            params.append(lease_token)
+        cursor = await self.db.execute(
+            f"UPDATE tasks SET status = 'done', lease_expires_at = NULL, lease_token = NULL, updated_at = ? WHERE {where}",
+            tuple(params),
         )
+        return cursor.rowcount > 0
 
-    async def fail(self, task_id: int) -> None:
+    async def fail(self, task_id: int, lease_token: str | None = None) -> bool:
         now = datetime.utcnow().isoformat()
-        await self.db.execute(
-            "UPDATE tasks SET status = 'failed', updated_at = ? WHERE id = ?",
-            (now, task_id),
+        where = "id = ? AND status = 'running'"
+        params: list[Any] = [now, task_id]
+        if lease_token is not None:
+            where += " AND lease_token = ?"
+            params.append(lease_token)
+        cursor = await self.db.execute(
+            f"UPDATE tasks SET status = 'failed', lease_expires_at = NULL, lease_token = NULL, updated_at = ? WHERE {where}",
+            tuple(params),
         )
+        return cursor.rowcount > 0
 
-    async def return_to_pending(self, task_id: int, delay_s: int = 0) -> None:
+    async def return_to_pending(
+        self, task_id: int, delay_s: int = 0, lease_token: str | None = None
+    ) -> bool:
         now = datetime.utcnow().isoformat()
         run_after = (datetime.utcnow() + timedelta(seconds=delay_s)).isoformat()
-        await self.db.execute(
-            "UPDATE tasks SET status = 'pending', run_after = ?, updated_at = ? WHERE id = ?",
-            (run_after, now, task_id),
+        where = "id = ? AND status = 'running'"
+        params: list[Any] = [run_after, now, task_id]
+        if lease_token is not None:
+            where += " AND lease_token = ?"
+            params.append(lease_token)
+        cursor = await self.db.execute(
+            f"UPDATE tasks SET status = 'pending', run_after = ?, lease_expires_at = NULL, lease_token = NULL, updated_at = ? WHERE {where}",
+            tuple(params),
         )
+        return cursor.rowcount > 0
 
     async def recover_stale_tasks(self) -> int:
         now = datetime.utcnow().isoformat()
         cursor = await self.db.execute(
             """
-            UPDATE tasks SET status = 'pending', updated_at = ?
+            UPDATE tasks SET status = 'pending', lease_expires_at = NULL, lease_token = NULL, updated_at = ?
             WHERE status = 'running' AND lease_expires_at < ?
             """,
             (now, now),
@@ -376,7 +417,7 @@ class DomainsRepository:
 
     async def insert_or_get(self, host: str) -> int:
         now = datetime.utcnow().isoformat()
-        host = host.lower()
+        host = host.strip().rstrip(".").lower()
 
         async with self.db.transaction():
             row = await self.db.fetchone("SELECT id FROM domains WHERE host = ?", (host,))
@@ -391,7 +432,8 @@ class DomainsRepository:
             return cursor.lastrowid
 
     async def get_by_host(self, host: str) -> dict | None:
-        row = await self.db.fetchone("SELECT * FROM domains WHERE host = ?", (host.lower(),))
+        normalized = host.strip().rstrip(".").lower()
+        row = await self.db.fetchone("SELECT * FROM domains WHERE host = ?", (normalized,))
         return dict(row) if row else None
 
     async def update_last_seen(self, domain_id: int) -> None:

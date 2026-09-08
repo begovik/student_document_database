@@ -20,7 +20,9 @@ class PathsConfig(BaseModel):
 class WorkersConfig(BaseModel):
     verify: int = Field(default=6, ge=1, le=32)
     discovery: int = Field(default=3, ge=1, le=16)
-    scanner: int = Field(default=1, ge=1, le=8)
+    # Окремого сканер-воркера наразі немає, тому не створюємо фальшивий
+    # активний компонент у конфігурації.
+    scanner: int = Field(default=0, ge=0, le=8)
     classify: int = Field(default=1, ge=1, le=4)
     verifier: int = Field(default=1, ge=0, le=4)
     discipline_assign: int = Field(default=1, ge=0, le=4)
@@ -43,6 +45,7 @@ class HttpConfig(BaseModel):
 class DDGSChannelConfig(BaseModel):
     enabled: bool = True
     backends: list[str] = Field(
+        min_length=1,
         default=["duckduckgo", "bing", "brave", "mojeek", "startpage", "yahoo", "wikipedia"]
     )
     query_interval_s: tuple[float, float] = (3.0, 10.0)
@@ -253,8 +256,8 @@ class Settings(BaseSettings):
     @field_validator("contact")
     @classmethod
     def validate_contact(cls, v: ContactConfig) -> ContactConfig:
-        if not v.email or v.email == "you@example.org":
-            pass
+        if not v.email or not v.email.strip():
+            raise ValueError("contact.email не може бути порожнім")
         return v
 
     @property
@@ -282,6 +285,27 @@ def load_config(config_path: str | Path | None = None) -> Settings:
             data = yaml.safe_load(f) or {}
 
     settings = Settings(**data)
+
+    # Один канонічний шлях БД. Старий `paths.db_path` залишаємо для
+    # сумісності конфігів, але синхронізуємо його з database.local_db_path;
+    # явний env для database має вищий пріоритет.
+    database_data = data.get("database") or {}
+    paths_data = data.get("paths") or {}
+    env_db_path = os.getenv("HARVESTER_DATABASE__LOCAL_DB_PATH")
+    env_legacy_db_path = os.getenv("HARVESTER_PATHS__DB_PATH")
+    if env_db_path:
+        canonical_db_path = env_db_path
+    elif env_legacy_db_path:
+        # Підтримуємо стару назву env, але зберігаємо один канонічний параметр.
+        canonical_db_path = env_legacy_db_path
+    elif "local_db_path" in database_data:
+        canonical_db_path = str(settings.database.local_db_path)
+    elif paths_data.get("db_path"):
+        canonical_db_path = str(paths_data["db_path"])
+    else:
+        canonical_db_path = settings.database.local_db_path
+    settings.database.local_db_path = canonical_db_path
+    settings.paths.db_path = canonical_db_path
 
     # VPS-режим: якщо в .env VPS=true — примусово remote БД
     # Дозволяє тримати config.yaml універсальним (mode: auto, host: "") для локальної розробки,

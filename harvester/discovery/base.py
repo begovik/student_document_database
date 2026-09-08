@@ -1,5 +1,22 @@
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Protocol
+from typing import Any, Protocol
+
+# Зарезервовані канали можуть бути присутніми в YAML, але не повинні
+# запускатися, доки для них немає адаптера та тестів.
+IMPLEMENTED_DISCOVERY_CHANNELS = frozenset({"ddgs", "openalex"})
+PLANNED_DISCOVERY_CHANNELS = frozenset(
+    {
+        "crossref",
+        "unpaywall",
+        "semanticscholar",
+        "arxiv",
+        "doaj",
+        "internet_archive",
+        "core",
+        "oai",
+    }
+)
 
 
 @dataclass

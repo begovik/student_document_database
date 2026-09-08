@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-import re
 from typing import Any
 
 import structlog
 
-from harvester.config import get_settings, get_filter_rules, FilterRules
+from harvester.config import FilterRules, get_filter_rules, get_settings
 from harvester.curator.prompts import (
     CANDIDATE_LINE,
     PROMPT_SELECT_END,
@@ -75,169 +73,79 @@ async def call_llm_for_selection(
         )
     prompt += PROMPT_SELECT_END.replace("{min_count}", str(min_count or 10))
 
-    # Виклик LLM
     try:
-        import aiohttp
+        from harvester.classify.llm import LLMClient, LLMUnavailable
 
-        config = settings.llm
-        gemini_keys = [
-            settings.gemini_api_key,
-            settings.gemini_api_key_2,
-            settings.gemini_api_key_3,
-        ]
-        gemini_keys = [k for k in gemini_keys if k]
-
-        models = config.gemini_models or ["gemini-3.1-flash-lite"]
-
-        last_error: Exception | None = None
-        used_model = None
-
-        # Фаза 1: Gemini
-        for model in models:
-            for gemini_key in gemini_keys:
-                try:
-                    used_model = model
-                    client = aiohttp.ClientSession()
-                    url = (
-                        f"{config.gemini_base_url}/models/{model}:generateContent"
-                        f"?key={gemini_key}"
-                    )
-                    payload = {
-                        "contents": [
-                            {
-                                "parts": [
-                                    {"text": prompt},
-                                ]
-                            }
-                        ],
-                        "generationConfig": {
-                            "temperature": config.temperature,
-                            "maxOutputTokens": config.max_tokens,
-                        },
-                    }
-                    async with client:
-                        resp = await client.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=config.timeout_s))
-                        if resp.status != 200:
-                            body = await resp.text()
-                            raise RuntimeError(f"Gemini API error {resp.status}: {body[:300]}")
-
-                        data = await resp.json()
-                        text = ""
-                        for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-                            text += part.get("text", "")
-                        if not text:
-                            raise RuntimeError("Порожня відповідь від LLM")
-
-                        result = parse_selection_response(text)
-                        if result:
-                            await client.close()
-                            result = enforce_min_count(result, candidates, min_count)
-                            logger.info("selection_success", topic=topic, count=result.suggested_count, selected=len(result.selected_ids))
-                            return result
-                        else:
-                            raise RuntimeError("Не вдалося парсити відповідь LLM")
-
-                except Exception as e:
-                    await client.close()
-                    last_error = e
-                    logger.warning("llm_selection_attempt_failed", model=model, key=gemini_key[:8] + "...", error_msg=str(e)[:100])
-                    await asyncio.sleep(config.min_interval_s)
-
-        # Фаза 2: Gemma (ті самі ключі, gemma_models + стиснення)
-        from harvester.classify.llm import rephrase_for_gemma
-
-        gemma_models = config.gemma_models or ["gemma-4-31b-it", "gemma-4-26b-it"]
-        truncated_prompt = rephrase_for_gemma(prompt, config.gemma_max_chars)
-
-        for model in gemma_models:
-            for gemini_key in gemini_keys:
-                try:
-                    used_model = model
-                    client = aiohttp.ClientSession()
-                    url = (
-                        f"{config.gemini_base_url}/models/{model}:generateContent"
-                        f"?key={gemini_key}"
-                    )
-                    payload = {
-                        "contents": [
-                            {
-                                "parts": [
-                                    {"text": truncated_prompt},
-                                ]
-                            }
-                        ],
-                        "generationConfig": {
-                            "temperature": config.temperature,
-                            "maxOutputTokens": config.max_tokens,
-                        },
-                    }
-                    async with client:
-                        resp = await client.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=config.timeout_s))
-                        if resp.status != 200:
-                            body = await resp.text()
-                            raise RuntimeError(f"Gemma API error {resp.status}: {body[:300]}")
-
-                        data = await resp.json()
-                        text = ""
-                        for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-                            text += part.get("text", "")
-                        if not text:
-                            raise RuntimeError("Порожня відповідь від LLM")
-
-                        result = parse_selection_response(text)
-                        if result:
-                            await client.close()
-                            result = enforce_min_count(result, candidates, min_count)
-                            logger.info("selection_success_gemma", topic=topic, model=model, count=result.suggested_count, selected=len(result.selected_ids))
-                            return result
-                        else:
-                            raise RuntimeError("Не вдалося парсити відповідь LLM")
-
-                except Exception as e:
-                    await client.close()
-                    last_error = e
-                    logger.warning("gemma_selection_attempt_failed", model=model, key=gemini_key[:8] + "...", error_msg=str(e)[:100])
-                    await asyncio.sleep(config.min_interval_s)
-
-        logger.error("selection_all_attempts_failed", topic=topic, error=str(last_error)[:200])
-        return None
-
-    except Exception as e:
-        last_error = e
+        client = LLMClient(keys=settings.gemini_keys, service="CuratorSelect")
+        response = await client.complete(prompt)
+        result = parse_selection_response(response.text)
+        if result is None:
+            logger.warning("selection_invalid_response", topic=topic, provider=response.provider)
+            return None
+        valid_ids = {int(c["id"]) for c in candidates if c.get("id") is not None}
+        result.selected_ids = [doc_id for doc_id in result.selected_ids if doc_id in valid_ids]
+        result = enforce_min_count(result, candidates, min_count)
+        result.topic = topic
+        result.candidates_count = len(candidates)
+        logger.info(
+            "selection_success",
+            topic=topic,
+            provider=response.provider,
+            count=result.suggested_count,
+            selected=len(result.selected_ids),
+        )
+        return result
+    except LLMUnavailable as e:
+        logger.warning("selection_llm_unavailable", topic=topic, error=str(e)[:300])
+    except Exception as e:  # noqa: BLE001
         logger.error("selection_unexpected_error", topic=topic, error_msg=str(e)[:200])
-        return None
+    return None
 
 
 def parse_selection_response(text: str) -> SelectionResult | None:
     """Парсити відповідь LLM на відбір документів."""
-    # Прибраний markdown- fences
-    text = text.replace("```json", "").replace("```", "").replace("```json", "")
-
-    # Знайти JSON у тексті
-    match = re.search(r'\{[^}]*"suggested_count"[^}]*\}', text)
-    if not match:
-        match = re.search(r'\{.*\}', text)
-    if not match:
-        return None
-
-    try:
-        data = json.loads(match.group())
-    except json.JSONDecodeError:
+    decoder = json.JSONDecoder()
+    data = None
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and "selected_ids" in candidate:
+            data = candidate
+            break
+    if not isinstance(data, dict):
         return None
 
     suggested_count = data.get("suggested_count", 30)
+    if isinstance(suggested_count, bool):
+        suggested_count = 30
+    try:
+        suggested_count = int(suggested_count)
+    except (TypeError, ValueError):
+        suggested_count = 30
     selected_ids = data.get("selected_ids", [])
     reasoning = data.get("reasoning", "")
 
     if not isinstance(selected_ids, list):
         selected_ids = []
-    selected_ids = [int(x) for x in selected_ids if isinstance(x, (int, float)) and x > 0]
+    normalized_ids: list[int] = []
+    for value in selected_ids:
+        if isinstance(value, bool):
+            continue
+        try:
+            doc_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if doc_id > 0 and doc_id not in normalized_ids:
+            normalized_ids.append(doc_id)
+    selected_ids = normalized_ids
 
     # Обмежити діапазон
-    if suggested_count < 20:
-        suggested_count = 20
-    if suggested_count > 50:
-        suggested_count = 50
+    suggested_count = max(suggested_count, 20)
+    suggested_count = min(suggested_count, 50)
     if len(selected_ids) > suggested_count:
         selected_ids = selected_ids[:suggested_count]
 
@@ -246,7 +154,7 @@ def parse_selection_response(text: str) -> SelectionResult | None:
         candidates_count=0,
         suggested_count=suggested_count,
         selected_ids=selected_ids,
-        reasoning=reasoning,
+        reasoning=str(reasoning),
     )
 
 
@@ -286,7 +194,7 @@ def format_candidates_text(
     topic: str,
 ) -> str:
     """Сформатувати текст для LLM-промпта відбору."""
-    prompt = PROMPT_SELECT_DOCUMENTS.format(topic=topic, count=len(candidates))
+    prompt = get_selection_prompt("basic").format(topic=topic, count=len(candidates))
     for c in candidates:
         prompt += CANDIDATE_LINE.format(
             id=c["id"],

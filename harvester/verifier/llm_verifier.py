@@ -19,7 +19,8 @@ PROMPT = """\
 - Мова: {language}
 - УДК: {udc}
 - Сторінок: {page_count}
-- Фрагмент тексту (до 3000 знаків): \"\"\"{text_sample}\"\"\"
+- Початковий фрагмент тексту (до 3000 знаків; це НЕ весь документ): \"\"\"{text_sample}\"\"\"
+- Структурні ознаки, обчислені парсером усього PDF: {structure}
 
 Доступні теги (коди тем, обери 1-3):
 {topics_list}
@@ -59,6 +60,13 @@ async def verify_with_llm(doc: dict, llm_client, topics: list[dict] | None = Non
     if topics is None:
         topics = []
     topics_list = "\n".join(f"- {t['code']} — {t['name_uk']} / {t['name_en']}" for t in topics) or "немає тем"
+    extra = doc.get("extra")
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except json.JSONDecodeError:
+            extra = {}
+    structure = extra.get("structure", {}) if isinstance(extra, dict) else {}
     prompt = PROMPT.format(
         title=title,
         authors=authors,
@@ -66,6 +74,7 @@ async def verify_with_llm(doc: dict, llm_client, topics: list[dict] | None = Non
         udc=doc.get("udc") or "—",
         page_count=doc.get("page_count") or "?",
         text_sample=(doc.get("text_sample") or "")[:3000],
+        structure=json.dumps(structure, ensure_ascii=False, sort_keys=True)[:1500],
         topics_list=topics_list,
         doc_types=", ".join(DOC_TYPES),
     )
@@ -75,16 +84,29 @@ async def verify_with_llm(doc: dict, llm_client, topics: list[dict] | None = Non
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw
             raw = raw.rsplit("```", 1)[0]
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        if start >= 0 and end > start:
-            raw = raw[start:end]
-        data = json.loads(raw)
+        decoder = json.JSONDecoder()
+        data = None
+        for start, char in enumerate(raw):
+            if char != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(raw[start:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                data = candidate
+                break
+        if data is None:
+            raise ValueError("LLM не повернув JSON-об'єкт")
         verdict = data.get("verdict", "fail")
         if verdict not in ("pass", "fail"):
             verdict = "fail"
         comment = str(data.get("comment") or "")[:300]
-        conf = float(data.get("confidence") or 0.5)
+        try:
+            conf = float(data.get("confidence") or 0.5)
+        except (TypeError, ValueError):
+            conf = 0.0
+        conf = max(0.0, min(1.0, conf))
         extracted_title = data.get("extracted_title")
         if isinstance(extracted_title, str):
             extracted_title = extracted_title.strip() or None

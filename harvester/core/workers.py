@@ -12,8 +12,8 @@ from harvester.core.scheduler import Scheduler
 from harvester.db.connection import Database
 from harvester.db.repositories import (
     ChannelStatsRepository,
-    DocumentsRepository,
     DocumentRefsRepository,
+    DocumentsRepository,
     SearchQueriesRepository,
 )
 from harvester.dedup.urlnorm import normalize_url
@@ -84,6 +84,8 @@ class DiscoveryWorker:
 
     async def _ensure_search_task(self) -> None:
         """Якщо немає активних search-задач — запланувати LRU-запит."""
+        if not self.settings.channels.ddgs.enabled:
+            return
         pending = await self.scheduler.pending_count("search")
         if pending > 0:
             return
@@ -111,7 +113,12 @@ class DiscoveryWorker:
 
         channel = self.channels.get(task_type)
         if channel is None:
-            await self.scheduler.fail_task(task_id)
+            await self.scheduler.fail_task(task_id, lease_token=task.get("lease_token"))
+            return
+        if not channel.enabled:
+            await self.scheduler.complete_task(task_id, task.get("lease_token"))
+            log = logger.bind(task_id=task_id, task_type=task_type)
+            log.info("discovery_task_skipped_disabled_channel", channel=channel.name)
             return
 
         log = logger.bind(task_id=task_id, task_type=task_type, worker=f"discovery-{self.worker_id}")
@@ -127,7 +134,7 @@ class DiscoveryWorker:
                 if inserted:
                     new_count += 1
 
-            await self.scheduler.complete_task(task_id)
+            await self.scheduler.complete_task(task_id, task.get("lease_token"))
             await self.stats.increment(
                 channel.name, requests=1, ok=1, items_found=found_count, items_new=new_count
             )
@@ -147,7 +154,9 @@ class DiscoveryWorker:
         except Exception as e:
             log.error("discovery_task_error", error=str(e), exc_info=True)
             await self.stats.increment(channel.name, requests=1, errors=1)
-            await self.scheduler.fail_task(task_id, delay_s=300)
+            await self.scheduler.fail_task(
+                task_id, delay_s=300, lease_token=task.get("lease_token")
+            )
             await self.events.error("discovery", "task_failed", {"task_id": task_id, "error": str(e)})
 
     async def _schedule_next_search(self, payload: dict) -> None:
@@ -156,6 +165,8 @@ class DiscoveryWorker:
 
     async def _schedule_next_openalex_page(self, payload: dict, next_cursor: str | None) -> None:
         """OpenAlex курсорна пагінація: плануємо наступну сторінку або відкладений рестарт циклу."""
+        if not self.settings.channels.openalex.enabled:
+            return
         if next_cursor:
             await self.scheduler.schedule_task(
                 "api_iter",
@@ -173,7 +184,7 @@ class DiscoveryWorker:
 
     async def _register_candidate(self, candidate) -> bool:
         canonical = normalize_url(candidate.url)
-        allowed, reason = await is_url_allowed(canonical)
+        allowed, _reason = await is_url_allowed(canonical)
         if not allowed:
             return False
 
@@ -199,6 +210,19 @@ class DiscoveryWorker:
         )
 
         if doc_id is None:
+            # Дублікати URL/DOI все одно мають зберегти provenance. Нову
+            # probe-задачу не створюємо, бо документ уже обробляється/готовий.
+            existing = await self.docs_repo.get_by_canonical_url(canonical)
+            if existing is None and candidate.doi:
+                existing = await self.docs_repo.get_by_doi(candidate.doi)
+            if existing:
+                await self.refs_repo.insert(
+                    document_id=existing["id"],
+                    found_via=candidate.channel or "unknown",
+                    channel=candidate.channel,
+                    query_text=candidate.query_text,
+                    ref_url=candidate.ref_url,
+                )
             return False
 
         await self.refs_repo.insert(
@@ -281,12 +305,19 @@ class VerifyWorker:
         doc = await self.docs_repo.get_by_id(doc_id)
         if not doc:
             log.warning("verify_doc_not_found")
-            await self.scheduler.complete_task(task_id)
+            await self.scheduler.complete_task(task_id, task.get("lease_token"))
             return
 
-        if doc["status"] in ("verified", "filtered_ru", "filtered_soviet", "duplicate", "not_pdf"):
+        if doc["status"] in (
+            "verified",
+            "filtered_ru",
+            "filtered_soviet",
+            "filtered_domain",
+            "duplicate",
+            "not_pdf",
+        ):
             log.debug("verify_already_done", status=doc["status"])
-            await self.scheduler.complete_task(task_id)
+            await self.scheduler.complete_task(task_id, task.get("lease_token"))
             return
 
         log.info("verify_task_start", url=doc["canonical_url"])
@@ -301,7 +332,7 @@ class VerifyWorker:
         duration_s = round((datetime.utcnow() - started).total_seconds(), 1)
 
         if result.success:
-            await self.scheduler.complete_task(task_id)
+            await self.scheduler.complete_task(task_id, task.get("lease_token"))
             await self.stats.increment("verify", requests=1, ok=1, items_new=1)
             log.info("verify_task_done", code=result.code, duration_s=duration_s)
             await self.scheduler.schedule_task(
@@ -321,7 +352,7 @@ class VerifyWorker:
                 delay = RETRY_DELAYS[attempts - 1]
                 log.warning("verify_retry_scheduled", code=result.code, attempt=attempts, delay_s=delay)
                 await self.docs_repo.update_status(doc_id, "queued")
-                await self.scheduler.complete_task(task_id)
+                await self.scheduler.complete_task(task_id, task.get("lease_token"))
                 retry_at = (datetime.utcnow() + timedelta(seconds=delay)).isoformat()
                 await self.scheduler.schedule_task(
                     "probe", {"document_id": doc_id}, priority=5, run_after=retry_at
@@ -329,7 +360,7 @@ class VerifyWorker:
             else:
                 final_status = "broken" if result.code in RETRYABLE_CODES else result.code.lower()
                 await self.docs_repo.update_status(doc_id, final_status)
-                await self.scheduler.complete_task(task_id)
+                await self.scheduler.complete_task(task_id, task.get("lease_token"))
                 log.warning("verify_task_failed", code=result.code, duration_s=duration_s)
                 await self.events.error(
                     "verify", "document_verify_failed",
@@ -389,7 +420,7 @@ class ClassifyWorker:
             "SELECT * FROM documents WHERE id = ?", (doc_id,)
         )
         if not doc or doc["status"] != "verified":
-            await self.scheduler.complete_task(task_id)
+            await self.scheduler.complete_task(task_id, task.get("lease_token"))
             return
 
         doc_dict = dict(doc)
@@ -404,15 +435,21 @@ class ClassifyWorker:
                 logger.warning("classify_transient_error", worker=f"classify-{self.worker_id}",
                              error_msg=error_str[:200])
                 await asyncio.sleep(10)
-                await self.scheduler.complete_task(task_id)
+                await self.scheduler.complete_task(task_id, task.get("lease_token"))
                 return
             logger.critical("classify_worker_all_limits_exhausted", worker=f"classify-{self.worker_id}")
             await self.events.error("classify", "all_limits_exhausted", {"worker": f"classify-{self.worker_id}"})
-            self._running = False
-            await self.scheduler.complete_task(task_id)
+            await self.scheduler.complete_task(task_id, task.get("lease_token"))
+            retry_at = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+            await self.scheduler.schedule_task(
+                "classify",
+                {"document_id": doc_id},
+                priority=5,
+                run_after=retry_at,
+            )
             return
 
-        await self.scheduler.complete_task(task_id)
+        await self.scheduler.complete_task(task_id, task.get("lease_token"))
         logger.info(
             "classify_task_done",
             task_id=task_id,

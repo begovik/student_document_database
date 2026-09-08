@@ -1,12 +1,12 @@
 import asyncio
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 import httpx
 import structlog
 
 from harvester.config import get_settings
 from harvester.discovery.base import Candidate
-from harvester.net.guards import is_url_allowed
+from harvester.net.client import get_http_client
 
 logger = structlog.get_logger()
 
@@ -22,15 +22,29 @@ class OpenAlexChannel:
         self.base_url = "https://api.openalex.org"
         self.last_next_cursor: str | None = None
         self.last_count: int = 0
+        self._request_lock = asyncio.Lock()
+        self._last_request_at = 0.0
 
     def rate_limit(self) -> float:
-        return 1.0 / self.rps
+        return 1.0 / self.rps if self.rps > 0 else 0.0
+
+    async def _wait_rate_limit(self) -> None:
+        if self.rps <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        async with self._request_lock:
+            now = loop.time()
+            next_request_at = max(now, self._last_request_at + 1.0 / self.rps)
+            self._last_request_at = next_request_at
+        # Не утримувати mutex під час очікування: інші корутини можуть
+        # зарезервувати наступні слоти, не створюючи чергу під lock.
+        await asyncio.sleep(max(0.0, next_request_at - now))
 
     async def discover(self, task: dict) -> AsyncIterator[Candidate]:
         if not self.enabled:
             return
 
-        cursor = task.get("cursor", "*")
+        cursor = str(task.get("cursor") or "*")
         filters = task.get("filters", {})
         per_page = task.get("per_page", 200)
 
@@ -42,33 +56,37 @@ class OpenAlexChannel:
             "select": "id,doi,title,display_name,publication_year,language,type,open_access,best_oa_location,locations,primary_topic,authorships",
         }
 
+        self.last_next_cursor = None
+        await self._wait_rate_limit()
         logger.info("openalex_query_start", filters=filters, cursor=cursor[:20])
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(f"{self.base_url}/works", params=params)
-                response.raise_for_status()
+            client = await get_http_client()
+            response = await client.get(f"{self.base_url}/works", params=params)
+            response.raise_for_status()
 
-                data = response.json()
-                results = data.get("results", [])
-                next_cursor = data.get("meta", {}).get("next_cursor")
-                self.last_next_cursor = next_cursor
-                self.last_count = len(results)
+            data = response.json()
+            results = data.get("results", [])
+            next_cursor = data.get("meta", {}).get("next_cursor")
+            self.last_next_cursor = next_cursor
+            self.last_count = len(results)
 
-                for work in results:
-                    candidate = self._work_to_candidate(work)
-                    if candidate:
-                        yield candidate
+            for work in results:
+                candidate = self._work_to_candidate(work)
+                if candidate:
+                    yield candidate
 
-                if next_cursor:
-                    logger.debug("openalex_has_more", next_cursor=next_cursor[:20])
+            if next_cursor:
+                logger.debug("openalex_has_more", next_cursor=next_cursor[:20])
 
-                logger.info("openalex_query_complete", results=len(results))
+            logger.info("openalex_query_complete", results=len(results))
 
         except httpx.HTTPStatusError as e:
             logger.error("openalex_http_error", status=e.response.status_code, error=str(e))
+            raise
         except Exception as e:
             logger.error("openalex_error", error=str(e), exc_info=True)
+            raise
 
     def _build_filter(self, filters: dict) -> str:
         parts = []

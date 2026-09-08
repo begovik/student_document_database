@@ -48,7 +48,7 @@ source .venv/bin/activate
 
 ## 3. Сервіс кураторства каталогів (`harvester curator`)
 
-Формування та верифікація тематичних каталогів літератури з автозавантаженням PDF.
+Формування та верифікація тематичних каталогів літератури без постійного зберігання PDF.
 
 ### `harvester curator prepare`
 Підготувати каталог документів для заданої теми.
@@ -132,7 +132,7 @@ PGPASSWORD=$PG_PASS psql -h 89.167.68.48 -U harvester -d harvester -c "SELECT ve
 
 ## 6. Витяг літератури та добирання джерел (`harvester bibliography`)
 
-Допоміжний сервіс добирання: сканує всі PDF у каталозі, витягує `ЛІТЕРАТУРА/REFERENCES` (LLM + fallback regex), дедуплікує, фільтрує RU (`is_russian_entry` — `.ru/.su/.рф`, `Москва`/`Издательство`, `ыэъё` без `іїєґ`), шукає кожне посилання в БД (`doi/url/title` `harvester/bibliography/searcher.py:113`) та в інтернеті (`DDGSSearchChannel` `harvester/discovery/ddgs_search.py:18` + `is_url_allowed` `harvester/net/guards.py:99`), завантажує знайдені PDF у `catalog_dir/bibliography_pdfs/` після перевірок (`200 OK`, `>5KB`, `%PDF`, `has_text_layer` `harvester/verify/pdfparse.py:32`, релевантність/інформативність) — документи → і в список, і в БД (`DocumentsRepository.insert_or_ignore` `harvester/db/repositories.py:17`), інтернет-ресурси → лише у список.
+Допоміжний сервіс добирання: читає legacy-PDF з каталогу або тимчасово завантажує PDF за URL, витягує `ЛІТЕРАТУРА/REFERENCES` (LLM + fallback regex), дедуплікує, фільтрує RU, шукає посилання в БД та інтернеті, а після перевірки видаляє тимчасові файли. Документи, що пройшли перевірку, додаються до БД; у JSON зберігаються URL і результати, але не PDF.
 
 ```bash
 harvester bibliography scan CATALOG_DIR [OPTIONS]
@@ -147,7 +147,7 @@ harvester bibliography scan CATALOG_DIR [OPTIONS]
 - `bibliography_YYYYMMDD_HHMMSS.json` — `statistics` (`found_in_database`/`found_online`/`filtered_russian`/`pdfs_downloaded`), `explanation`
 - `bibliography_YYYYMMDD_HHMMSS_literature.txt` — відформатований список
 - `bibliography_YYYYMMDD_HHMMSS_found.json` — знайдені URL
-- `bibliography_pdfs/*.pdf` — верифіковані завантажені PDF
+- PDF-файли не створюються у каталозі; завантаження виконуються лише у системний temp
 
 ```bash
 harvester bibliography scan catalogs/catalog_20260828_135702

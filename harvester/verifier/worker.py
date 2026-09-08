@@ -9,7 +9,8 @@ from datetime import UTC, datetime, timedelta
 import structlog
 
 from harvester.classify.llm import AllLimitsExhausted, LLMClient
-from harvester.config import get_settings
+from harvester.config import Settings, get_settings
+from harvester.db.connection import Database
 from harvester.db.failover import build_database
 
 logger = structlog.get_logger()
@@ -24,17 +25,20 @@ def _tomorrow_midnight_utc() -> datetime:
 class VerifierWorker:
     """Цикл перевірки verified-документів."""
 
-    def __init__(self, worker_id: int = 0):
+    def __init__(
+        self,
+        worker_id: int = 0,
+        db: Database | None = None,
+        settings: Settings | None = None,
+    ):
         self.worker_id = worker_id
-        self.settings = get_settings()
+        self.settings = settings or get_settings()
+        self.db = db
         # Тільки GEMINI_DOC_VERIFIER_KEY_1..4 + Gemini 3.1 Flash Lite
         keys = self.settings.classify_keys
         if not keys:
             keys = self.settings.gemini_keys  # fallback якщо немає окремих
         self.llm = LLMClient(keys=keys, models=["gemini-3.1-flash-lite"], gemma_only=False, service="Verifier")
-        # Перевизначимо gemma_models щоб ротація йшла лише по одній моделі
-        self.llm._gemma_models = ["gemini-3.1-flash-lite"]
-        self.llm._models = ["gemini-3.1-flash-lite"]
         self._running = True
 
     async def run(self) -> None:
@@ -42,16 +46,26 @@ class VerifierWorker:
         log.info("verifier_worker_started", llm_enabled=self.llm.enabled, keys=len(self.llm._keys))
 
         # Чекаємо ініціалізації LLM
-        try:
-            await self.llm.initialize()
-        except AllLimitsExhausted:
-            sleep_s = ( _tomorrow_midnight_utc() - datetime.now(UTC)).total_seconds()
-            log.critical("verifier_all_keys_exhausted_sleep", sleep_s=int(sleep_s))
-            await asyncio.sleep(max(sleep_s, 60))
-            return await self.run()
+        while self._running:
+            try:
+                await self.llm.initialize()
+                break
+            except AllLimitsExhausted:
+                sleep_s = (_tomorrow_midnight_utc() - datetime.now(UTC)).total_seconds()
+                log.critical("verifier_all_keys_exhausted_sleep", sleep_s=int(sleep_s))
+                await asyncio.sleep(max(sleep_s, 60))
+                self.llm._daily_limit_exhausted.clear()
+                self.llm._gemma_limit_exhausted.clear()
+                self.llm._initialized = False
 
-        db = build_database(self.settings)
-        await db.initialize(sync_mirror=False)
+        if not self._running:
+            return
+
+        db = self.db
+        owns_db = db is None
+        if db is None:
+            db = build_database(self.settings)
+            await db.initialize(sync_mirror=False)
 
         # Завантажити теми для тегів (25 тем)
         try:
@@ -138,6 +152,7 @@ class VerifierWorker:
                                 log_doc.info(
                                     "verifier_llm_ok",
                                     verdict=llm_verdict,
+                                    confidence=llm_conf,
                                     comment=llm_comment[:100],
                                     extracted_title=llm_extracted_title[:60] if llm_extracted_title else None,
                                     extracted_authors=llm_extracted_authors,
@@ -146,6 +161,10 @@ class VerifierWorker:
                                     passed = False
                                     failed_rules.append(f"llm:{llm_comment[:80]}")
                                     comment = llm_comment or "LLM: не відповідає критеріям цілісності"
+                                elif llm_doc_type in {"thesis", "dissertation"}:
+                                    passed = False
+                                    failed_rules.append("non_target_type")
+                                    comment = "дисертація або дипломна робота не є цільовим типом джерела"
                                 elif llm_verdict == "error":
                                     # Не вважаємо помилку LLM за fail — залишаємо passed з попередженням
                                     log_doc.warning("verifier_llm_error_ignored", error=llm_comment[:100])
@@ -206,7 +225,8 @@ class VerifierWorker:
                     log.error("verifier_worker_error", error=str(e), exc_info=True)
                     await asyncio.sleep(10)
         finally:
-            await db.close()
+            if owns_db:
+                await db.close()
             log.info("verifier_worker_stopped")
 
     async def _maybe_update_title_authors(
@@ -293,9 +313,7 @@ class VerifierWorker:
                     return True
                 if len(authors) == 1 and authors[0] in ("USER", "1", "Unknown", "service", "", "Admin", "Lena"):
                     return True
-                if all(_re.match(r"^[А-ЩЬьюЯ]{1,3}\.[А-ЩЬьюЯ]{1,3}\.*$", a) for a in authors):
-                    return True
-                return False
+                return all(_re.match(r"^[А-ЩЬьюЯ]{1,3}\.[А-ЩЬьюЯ]{1,3}\.*$", a) for a in authors)
 
             authors_is_garbage = _is_garbage_authors(db_authors)
 

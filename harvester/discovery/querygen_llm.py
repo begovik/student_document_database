@@ -66,8 +66,7 @@ async def generate_queries_for_topic(
     settings = get_settings()
     if not settings.llm.enabled:
         return []
-    keys = settings.gemini_keys  # лише GEMINI_API_KEY 1-3
-    if not keys:
+    if not settings.gemini_keys and not settings.open_router_api_key:
         logger.warning("querygen_llm_no_keys")
         return []
 
@@ -78,77 +77,24 @@ async def generate_queries_for_topic(
         existing=", ".join((existing_queries or [])[:5]) or "немає",
     )
 
-    # Спроба 1: Gemini 3.1/3.5 Flash Lite напряму
-    for model in settings.llm.gemini_models:
-        for key in keys:
-            try:
-                text = await _call_gemini(prompt, key, model)
-                if text:
-                    qs = _parse_queries(text)
-                    if qs:
-                        logger.info("querygen_llm_ok", model=model, topic=topic_name[:40], count=len(qs))
-                        return qs[:count]
-            except Exception as e:  # noqa: BLE001
-                err = str(e)
-                is_quota = "429" in err and ("quota" in err.lower() or "exceeded" in err.lower())
-                is_rate = "429" in err
-                if is_quota:
-                    logger.warning("querygen_llm_quota", model=model, error=err[:100])
-                    continue
-                if is_rate:
-                    logger.warning("querygen_llm_rate", model=model, error=err[:100])
-                    continue
-                logger.warning("querygen_llm_error", model=model, error=err[:150])
-
-    # Fallback: Gemma 4 31b/26b-a4b (ті ж 3 ключі, стиснений промпт)
     try:
-        from harvester.classify.llm import rephrase_for_gemma
-    except Exception:
+        from harvester.classify.llm import AllLimitsExhausted, LLMClient, LLMUnavailable
+
+        client = LLMClient(keys=settings.gemini_keys, service="QueryGen")
+        response = await client.complete(prompt)
+        queries = _parse_queries(response.text)
+        if queries:
+            logger.info(
+                "querygen_llm_ok",
+                provider=response.provider,
+                model=response.model,
+                topic=topic_name[:40],
+                count=len(queries),
+            )
+        return queries[: max(1, count)]
+    except (LLMUnavailable, AllLimitsExhausted) as e:
+        logger.warning("querygen_llm_unavailable", topic=topic_name[:40], error=str(e)[:200])
         return []
-
-    for model in settings.llm.gemma_models:
-        for key in keys:
-            try:
-                short_prompt = rephrase_for_gemma(prompt, settings.llm.gemma_max_chars)
-                text = await _call_gemini(prompt=short_prompt, key=key, model=model)
-                if text:
-                    qs = _parse_queries(text)
-                    if qs:
-                        logger.info("querygen_llm_ok", model=model, topic=topic_name[:40], count=len(qs))
-                        return qs[:count]
-            except Exception as e:  # noqa: BLE001
-                logger.warning("querygen_llm_gemma_error", model=model, error=str(e)[:150])
-
-    logger.warning("querygen_llm_all_failed", topic=topic_name[:40])
-    return []
-
-
-async def _call_gemini(prompt: str, key: str, model: str) -> str | None:
-    """Низькорівневий виклик Gemini generateContent."""
-    import httpx
-
-    settings = get_settings()
-    cfg = settings.llm
-    url = f"{cfg.gemini_base_url}/models/{model}:generateContent"
-    async with httpx.AsyncClient(timeout=cfg.timeout_s) as client:
-        resp = await client.post(
-            url,
-            params={"key": key},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": cfg.temperature, "maxOutputTokens": 1024},
-            },
-        )
-        if resp.status_code == 429:
-            raise RuntimeError(f"429 {resp.text[:200]}")
-        resp.raise_for_status()
-        data = resp.json()
-        parts = data["candidates"][0]["content"]["parts"]
-        text = ""
-        for p in parts:
-            if not p.get("thought", False):
-                text = p.get("text", "")
-                break
-        if not text:
-            text = parts[-1].get("text", "")
-        return text.strip() or None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("querygen_llm_error", topic=topic_name[:40], error=str(e)[:200])
+        return []

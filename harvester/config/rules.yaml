@@ -11,14 +11,14 @@ profiles:
     min_page_count: 3
     min_chars_per_page: 1500  # Мінімальна щільність тексту (знаків на сторінку)
     require_references: true  # Потрібен розділ "Література/References"
-    require_conclusion: false  # Потрібні висновки
-    require_introduction: false  # Потрібен вступ
+    require_conclusion: true  # Потрібні висновки
+    require_introduction: true  # Потрібен вступ
     require_structured_sections: false  # Потрібні розділи з номерами
     require_title_page: false  # Потрібен титульний аркуш
     max_toc_ratio: 0.15  # Максимальна частка змісту в документі (зміст не повинен перевищувати 15% тексту)
     reject_ppt: true  # Відкидати презентації PowerPoint
-    reject_annotations: false  # Відкидати анотації/реферати
-    reject_theses_fragments: false  # Відкидати фрагменти дипломних
+    reject_annotations: true  # Відкидати анотації/реферати
+    reject_theses_fragments: true  # Відкидати дисертації та фрагменти дипломних
     llm_completeness_level: "strict"
 
   # М'який профіль

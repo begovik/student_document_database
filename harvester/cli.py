@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import json
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -10,10 +11,10 @@ from rich import print as rprint
 from rich.console import Console
 from rich.table import Table
 
-from harvester.config import get_settings, load_config
-from harvester.extract.cli import extract_app
-from harvester.curator.cli import curator_app
 from harvester.bibliography.cli import bibliography_app
+from harvester.config import get_settings, load_config
+from harvester.curator.cli import curator_app
+from harvester.extract.cli import extract_app
 
 app = typer.Typer(
     name="harvester",
@@ -27,6 +28,37 @@ console = Console()
 app.add_typer(extract_app, name="extract")
 app.add_typer(curator_app, name="curator")
 app.add_typer(bibliography_app, name="bibliography")
+
+
+def _format_bytes(size_bytes: int) -> str:
+    if size_bytes >= 1024**3:
+        return f"{size_bytes / 1024**3:.2f} ГБ"
+    if size_bytes >= 1024**2:
+        return f"{size_bytes / 1024**2:.1f} МБ"
+    return f"{size_bytes / 1024:.1f} КБ"
+
+
+def _open_sqlite(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(path), timeout=0.5, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 500")
+    return conn
+
+
+def _sqlite_fetchall(path: Path, sql: str, params: tuple | None = None) -> list[sqlite3.Row]:
+    if not path.exists():
+        return []
+    conn = _open_sqlite(path)
+    try:
+        cursor = conn.execute(sql, params or ())
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def _sqlite_fetchone(path: Path, sql: str, params: tuple | None = None):
+    rows = _sqlite_fetchall(path, sql, params)
+    return rows[0] if rows else None
 
 
 @app.command()
@@ -65,7 +97,7 @@ def status():
     async def _status():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
             settings_repo = SettingsRepository(db)
@@ -101,6 +133,8 @@ def status():
             table.add_column("Значення", style="green")
 
             table.add_row("База даних", db_mode)
+            if settings.database.remote_configured and db.remote is not None:
+                table.add_row("Remote налаштовано", "так")
             if pending_outbox:
                 table.add_row("Outbox (очікує злиття)", str(pending_outbox))
             table.add_row("Heartbeat", heartbeat_info)
@@ -109,7 +143,10 @@ def status():
             for st, cnt in sorted(doc_stats.items(), key=lambda x: -x[1]):
                 table.add_row(f"  · {st}", str(cnt))
             if lang_stats:
-                table.add_row("Мови (verified)", ", ".join(f"{k}:{v}" for k, v in sorted(lang_stats.items(), key=lambda x: -x[1])))
+                table.add_row(
+                    "Мови (verified)",
+                    ", ".join(f"{k}:{v}" for k, v in sorted(lang_stats.items(), key=lambda x: -x[1])),
+                )
             table.add_row("Класифікації (всього)", str(classified_total))
             table.add_row("  · унікальних документів", str(classified_docs))
             table.add_row("Завдання (pending)", str(task_stats.get("pending", 0)))
@@ -139,7 +176,7 @@ def stats(
     async def _stats():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
             stats_repo = ChannelStatsRepository(db)
@@ -165,12 +202,12 @@ def stats(
 
                 for stat in channel_stats:
                     table.add_row(
-                        stat["channel"],
-                        str(stat["requests"]),
-                        str(stat["ok"]),
-                        str(stat["errors"]),
-                        str(stat["items_found"]),
-                        str(stat["items_new"]),
+                        str(stat["channel"]),
+                        str(stat.get("requests", 0) or 0),
+                        str(stat.get("ok", 0) or 0),
+                        str(stat.get("errors", 0) or 0),
+                        str(stat.get("items_found", 0) or 0),
+                        str(stat.get("items_new", 0) or 0),
                     )
 
                 console.print(table)
@@ -193,7 +230,7 @@ def export(
     async def _export():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
             query = "SELECT * FROM documents WHERE status = ?"
@@ -229,13 +266,39 @@ def doctor():
     """Самодіагностика системи"""
     from harvester.db.failover import build_database
     from harvester.db.migrations import get_current_version
+    from harvester.discovery.base import IMPLEMENTED_DISCOVERY_CHANNELS, PLANNED_DISCOVERY_CHANNELS
 
     async def _doctor():
         console.print("[cyan]Перевірка системи...[/cyan]")
 
         settings = get_settings()
+        enabled_channels = {
+            name
+            for name in IMPLEMENTED_DISCOVERY_CHANNELS
+            if getattr(settings.channels, name).enabled
+        }
+        unimplemented_channels = sorted(
+            name
+            for name in PLANNED_DISCOVERY_CHANNELS
+            if getattr(settings.channels, name, None)
+            and getattr(settings.channels, name).enabled
+        )
+        if not enabled_channels:
+            rprint("[red]✗ Не увімкнено жодного реалізованого discovery-каналу[/red]")
+        else:
+            rprint(f"[green]✓ Discovery-канали: {', '.join(sorted(enabled_channels))}[/green]")
+        if unimplemented_channels:
+            rprint(
+                "[yellow]⚠ Увімкнено канали без адаптера: "
+                f"{', '.join(unimplemented_channels)}; вони не запускатимуться[/yellow]"
+            )
+        if settings.workers.scanner:
+            rprint(
+                "[yellow]⚠ workers.scanner > 0, але scanner-воркер ще не реалізований; "
+                "значення буде проігноровано[/yellow]"
+            )
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
             version = await get_current_version(db)
@@ -289,7 +352,7 @@ def db_status():
     async def _db_status():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
             table = Table(title="Стан бази даних")
@@ -342,7 +405,7 @@ def db_size():
     async def _db_size():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
             table = Table(title="Розмір баз даних")
@@ -353,24 +416,19 @@ def db_size():
             db_path = settings.db_path
             if db_path.exists():
                 size_bytes = db_path.stat().st_size
-                if size_bytes >= 1024**3:
-                    size_str = f"{size_bytes / 1024**3:.2f} ГБ"
-                elif size_bytes >= 1024**2:
-                    size_str = f"{size_bytes / 1024**2:.1f} МБ"
-                else:
-                    size_str = f"{size_bytes / 1024:.1f} КБ"
                 table.add_row("Локальна SQLite", str(db_path))
-                table.add_row("  Розмір файлу", size_str)
+                table.add_row("  Розмір файлу", _format_bytes(size_bytes))
 
-                # Розмір по таблицях
                 try:
-                    tables = [row[0] for row in await db.local.fetchall(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                    )]
-                    for tbl in sorted(tables):
+                    tables = _sqlite_fetchall(
+                        db_path,
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                    )
+                    for tbl_row in tables:
+                        tbl = tbl_row["name"]
                         try:
-                            row = await db.local.fetchone(f"SELECT COUNT(*) AS c FROM {tbl}")
-                            count = row["c"] if row else 0
+                            count_row = _sqlite_fetchone(db_path, f"SELECT COUNT(*) AS c FROM {tbl}")
+                            count = count_row["c"] if count_row else 0
                             if count > 0:
                                 table.add_row(f"  · {tbl}", f"{count:,} рядків")
                         except Exception:
@@ -383,22 +441,17 @@ def db_size():
             # Віддалена PostgreSQL
             if db.remote is not None and db.mode == "remote":
                 try:
-                    # Оцінка розміру через pg_database
                     row = await db.remote.fetchone(
                         "SELECT pg_database_size(current_database()) AS size_bytes"
                     )
                     if row and row["size_bytes"]:
                         pg_bytes = row["size_bytes"]
-                        if pg_bytes >= 1024**3:
-                            pg_str = f"{pg_bytes / 1024**3:.2f} ГБ"
-                        elif pg_bytes >= 1024**2:
-                            pg_str = f"{pg_bytes / 1024**2:.1f} МБ"
-                        else:
-                            pg_str = f"{pg_bytes / 1024:.1f} КБ"
-                        table.add_row("Віддалена PostgreSQL", f"{settings.database.host}:{settings.database.port}/{settings.database.name}")
-                        table.add_row("  Розмір БД", pg_str)
+                        table.add_row(
+                            "Віддалена PostgreSQL",
+                            f"{settings.database.host}:{settings.database.port}/{settings.database.name}",
+                        )
+                        table.add_row("  Розмір БД", _format_bytes(pg_bytes))
 
-                    # Розмір по таблицях
                     pg_tables = await db.remote.fetchall(
                         "SELECT relname, n_live_tup FROM pg_stat_user_tables "
                         "WHERE schemaname = 'public' ORDER BY n_live_tup DESC LIMIT 15"
@@ -406,7 +459,7 @@ def db_size():
                     for tbl_row in pg_tables:
                         tbl_name = tbl_row["relname"]
                         count = tbl_row["n_live_tup"]
-                        if count > 0:
+                        if count:
                             table.add_row(f"  · {tbl_name}", f"{count:,} рядків")
                 except Exception as e:
                     table.add_row("Віддалена PostgreSQL", f"[yellow]помилка: {str(e)[:80]}[/yellow]")
@@ -453,7 +506,6 @@ def db_resync():
 def db_seed():
     """Однократно перенести локальну БД у віддалену PostgreSQL"""
     from harvester.db.failover import build_database
-    from harvester.db.postgres import PostgresDatabase
 
     async def _seed():
         settings = get_settings()
@@ -975,20 +1027,19 @@ def find(
     """Знайти літературу в базі даних за тематикою
 
     Пошук документів відбувається в існуючій базі.
-    Фільтрується: мова, тип документу, наявність title.
+    Фільтрується: verified-статус, повний текстовий шар, мінімальна якість,
+    мова, тип документу та наявність title.
     """
-    from harvester.db.failover import build_database
-    from harvester.db.repositories import DocumentsRepository
     from harvester.classify.taxonomy import load_disciplines
+    from harvester.config import get_filter_rules
+    from harvester.db.failover import build_database
 
     async def _find():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
-            docs_repo = DocumentsRepository(db)
-
             # Спробувати знайти топік по назві (широкі теми + дисципліни каталогу)
             topics = await load_disciplines(db)
             topic_code = None
@@ -998,8 +1049,14 @@ def find(
                     rprint(f"[cyan]Знайдено топік: {t['name_uk']} ({t['code']})[/cyan]")
                     break
 
-            where = ""
-            params: list = []
+            rules = get_filter_rules("strict")
+            where = """
+                AND d.status = ?
+                AND d.has_text_layer = 1
+                AND d.page_count >= ?
+                AND LOWER(COALESCE(d.language, '')) NOT IN ('', 'unknown', 'und')
+            """
+            params: list = ["verified", rules.min_page_count]
 
             if doc_type:
                 where += " AND d.doc_type = ?"

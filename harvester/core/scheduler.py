@@ -1,7 +1,3 @@
-import asyncio
-import json
-from datetime import datetime, timedelta
-
 import structlog
 
 from harvester.db.connection import Database
@@ -35,17 +31,26 @@ class Scheduler:
             logger.debug("task_picked", task_id=task["id"], task_type=task["type"])
         return task
 
-    async def complete_task(self, task_id: int) -> None:
-        await self.tasks_repo.complete(task_id)
-        logger.debug("task_completed", task_id=task_id)
+    async def complete_task(self, task_id: int, lease_token: str | None = None) -> bool:
+        completed = await self.tasks_repo.complete(task_id, lease_token)
+        if completed:
+            logger.debug("task_completed", task_id=task_id)
+        else:
+            logger.warning("task_completion_ignored_stale_lease", task_id=task_id)
+        return completed
 
-    async def fail_task(self, task_id: int, delay_s: int = 0) -> None:
+    async def fail_task(
+        self, task_id: int, delay_s: int = 0, lease_token: str | None = None
+    ) -> None:
         task = await self.tasks_repo.db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        if not task or (lease_token is not None and task["lease_token"] != lease_token):
+            logger.warning("task_failure_ignored_stale_lease", task_id=task_id)
+            return
         if task and task["attempts"] < task["max_attempts"]:
-            await self.tasks_repo.return_to_pending(task_id, delay_s)
+            await self.tasks_repo.return_to_pending(task_id, delay_s, lease_token)
             logger.debug("task_returned_to_pending", task_id=task_id, delay_s=delay_s)
         else:
-            await self.tasks_repo.fail(task_id)
+            await self.tasks_repo.fail(task_id, lease_token)
             logger.warning("task_failed_permanently", task_id=task_id)
 
     async def recover_stale_tasks(self) -> int:

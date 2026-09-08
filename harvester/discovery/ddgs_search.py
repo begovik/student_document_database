@@ -1,6 +1,6 @@
 import asyncio
 import random
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 import structlog
 from ddgs import DDGS

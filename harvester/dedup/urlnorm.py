@@ -25,8 +25,7 @@ def normalize_url(url: str) -> str:
         scheme = "https"
 
     netloc = parsed.netloc.lower()
-    if netloc.startswith("www."):
-        netloc = netloc[4:]
+    netloc = netloc.removeprefix("www.")
 
     if ":" in netloc:
         host, port = netloc.rsplit(":", 1)

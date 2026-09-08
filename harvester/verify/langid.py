@@ -57,9 +57,7 @@ def _detect_language_sync(text: str) -> LanguageResult:
             lang_code = detected.iso_code_639_1.name.lower()
             confidence = 0.8
 
-            if lang_code == "uk":
-                confidence = 0.85
-            elif lang_code == "ru":
+            if lang_code == "uk" or lang_code == "ru":
                 confidence = 0.85
 
             return LanguageResult(lang_code, confidence, "lingua")
@@ -77,9 +75,7 @@ def _detect_language_sync(text: str) -> LanguageResult:
             lang_code = detected.split("-")[0].lower()
             confidence = 0.7
 
-            if lang_code == "uk":
-                confidence = 0.75
-            elif lang_code == "ru":
+            if lang_code == "uk" or lang_code == "ru":
                 confidence = 0.75
 
             return LanguageResult(lang_code, confidence, "langdetect")

@@ -2,7 +2,7 @@ import json
 
 import structlog
 
-from harvester.classify.llm import LLMClient, LLMUnavailable, AllLimitsExhausted
+from harvester.classify.llm import AllLimitsExhausted, LLMClient, LLMUnavailable
 from harvester.classify.taxonomy import load_topics
 from harvester.config import get_settings
 from harvester.db.connection import Database
@@ -149,12 +149,24 @@ class Classifier:
         return data
 
     async def save_classification(self, doc_id: int, result: dict) -> None:
-        await self.db.execute("DELETE FROM document_topics WHERE document_id = ?", (doc_id,))
+        # Не видаляємо kind='discipline': дисципліни призначає окремий
+        # воркер, і повторна широка класифікація не повинна їх стирати.
+        await self.db.execute(
+            """
+            DELETE FROM document_topics
+            WHERE document_id = ?
+              AND topic_id IN (SELECT id FROM topics WHERE kind = 'topic')
+            """,
+            (doc_id,),
+        )
         for topic_id, score in result["topics"]:
             await self.db.execute(
                 """
-                INSERT OR REPLACE INTO document_topics (document_id, topic_id, score, signals)
+                INSERT INTO document_topics (document_id, topic_id, score, signals)
                 VALUES (?, ?, ?, ?)
+                ON CONFLICT(document_id, topic_id) DO UPDATE SET
+                    score = excluded.score,
+                    signals = excluded.signals
                 """,
                 (doc_id, topic_id, round(score, 4), json.dumps(result["signals"], ensure_ascii=False)),
             )

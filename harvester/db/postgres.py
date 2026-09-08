@@ -8,9 +8,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import structlog
 
@@ -40,7 +42,7 @@ PG_MIGRATIONS_DIR = Path(__file__).parent / "pg_migrations"
 class PGResult:
     """Адаптер результату execute для сумісності з sqlite3.Cursor."""
 
-    __slots__ = ("rows", "rowcount", "lastrowid")
+    __slots__ = ("lastrowid", "rowcount", "rows")
 
     def __init__(self, rows: list | None = None, rowcount: int = 0):
         self.rows = rows if rows is not None else []
@@ -56,7 +58,9 @@ class PostgresDatabase(Database):
         self.cfg = cfg
         self._password = password if password is not None else get_settings().pg_password
         self._pool: Pool | None = None
-        self._tx_conn: Any | None = None
+        self._tx_conn_var: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+            "postgres_transaction_connection", default=None
+        )
         self._is_initialized = False
         self.db_path = f"postgresql://{self.cfg.user}@{self.cfg.host}:{self.cfg.port}/{self.cfg.name}"
 
@@ -83,24 +87,30 @@ class PostgresDatabase(Database):
     def _dsn(self) -> str:
         if self.cfg.dsn:
             return self.cfg.dsn
-        user = self.cfg.user or get_settings().pg_user or "postgres"
+        # `DatabaseConfig.user` має історичний default, тому спочатку беремо
+        # явне значення з env (`PG_USER`), інакше env ніколи не застосовується.
+        user = get_settings().pg_user or self.cfg.user or "postgres"
         host = self.cfg.host
         port = self.cfg.port
         name = self.cfg.name
+        user_q = quote(user, safe="")
+        name_q = quote(name, safe="")
         if self._password:
-            return f"postgresql://{user}:{self._password}@{host}:{port}/{name}"
-        return f"postgresql://{user}@{host}:{port}/{name}"
+            password_q = quote(self._password, safe="")
+            return f"postgresql://{user_q}:{password_q}@{host}:{port}/{name_q}"
+        return f"postgresql://{user_q}@{host}:{port}/{name_q}"
 
     async def try_connect(self, timeout_s: float | None = None) -> bool:
         """Швидкий перевірковий `SELECT 1` одним з'єднанням."""
         self._check_asyncpg()
         if not self.cfg.remote_configured:
             return False
+        timeout = timeout_s if timeout_s is not None else self.cfg.connect_timeout_s
         conn = None
         try:
             conn = await asyncio.wait_for(
-                asyncpg.connect(self._dsn(), timeout=self.cfg.connect_timeout_s),
-                timeout=timeout_s or self.cfg.connect_timeout_s + 1,
+                asyncpg.connect(self._dsn(), timeout=timeout),
+                timeout=timeout + 1,
             )
             await asyncio.wait_for(conn.fetchval("SELECT 1"), timeout=5)
             return True
@@ -173,7 +183,7 @@ class PostgresDatabase(Database):
             return False
 
     def _conn_or_pool(self):
-        return self._tx_conn if self._tx_conn is not None else self._pool
+        return self._tx_conn_var.get() or self._pool
 
     async def execute(self, sql: str, params: tuple | None = None) -> PGResult:
         if self._pool is None:
@@ -192,14 +202,16 @@ class PostgresDatabase(Database):
         if self._pool is None:
             raise RuntimeError("PostgresDatabase не ініціалізовано")
         pg_sql = prepare_many(sql)
-        await self._pool.executemany(pg_sql, [self._sanitize_params(p) for p in params])
+        target = self._conn_or_pool()
+        await target.executemany(pg_sql, [self._sanitize_params(p) for p in params])
 
     async def executescript(self, sql: str) -> None:
         if self._pool is None:
             raise RuntimeError("PostgresDatabase не ініціалізовано")
         self._check_asyncpg()
+        target = self._conn_or_pool()
         for stmt in split_statements(sql):
-            await self._pool.execute(translate_sql(stmt))
+            await target.execute(translate_sql(stmt))
 
     async def fetchone(self, sql: str, params: tuple | None = None):
         if self._pool is None:
@@ -233,9 +245,12 @@ class PostgresDatabase(Database):
     async def transaction(self):
         if self._pool is None:
             raise RuntimeError("PostgresDatabase не ініціалізовано")
+        existing = self._tx_conn_var.get()
+        if existing is not None:
+            yield existing
+            return
         conn = await self._pool.acquire()
-        prev = self._tx_conn
-        self._tx_conn = conn
+        token = self._tx_conn_var.set(conn)
         try:
             tr = conn.transaction()
             await tr.start()
@@ -246,7 +261,7 @@ class PostgresDatabase(Database):
                 raise
             await tr.commit()
         finally:
-            self._tx_conn = prev
+            self._tx_conn_var.reset(token)
             await self._pool.release(conn)
 
     async def _version(self) -> int:

@@ -6,7 +6,7 @@ extract_from_catalog.py — витяг цитат і сумаризацій дл
 Каталог може бути:
     - Файл: catalogs/catalog_YYYYMMDD_HHMMSS.json
     - Папка: catalogs/catalog_YYYYMMDD_HHMMSS/ (всередині лежить catalog_YYYYMMDD_HHMMSS.json
-      і папка resources/ з PDF-файлами)
+      і, для legacy-каталогів, папка resources/ з PDF-файлами)
 
 Поведінка:
     - документи, які вже є в таблиці extractions, беруться з БД (без LLM-викликів);

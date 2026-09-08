@@ -1,6 +1,10 @@
 import asyncio
+import hashlib
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+import os
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import structlog
@@ -13,6 +17,7 @@ logger = structlog.get_logger()
 
 class HttpClient:
     _instance: "HttpClient | None" = None
+    _instance_lock = asyncio.Lock()
 
     def __init__(self):
         settings = get_settings()
@@ -29,16 +34,19 @@ class HttpClient:
 
     @classmethod
     async def get_instance(cls) -> "HttpClient":
-        if cls._instance is None:
-            cls._instance = cls()
-            await cls._instance.initialize()
+        async with cls._instance_lock:
+            if cls._instance is None:
+                instance = cls()
+                await instance.initialize()
+                cls._instance = instance
         return cls._instance
 
     @classmethod
     async def reset(cls) -> None:
-        if cls._instance is not None:
-            await cls._instance.close()
-            cls._instance = None
+        async with cls._instance_lock:
+            if cls._instance is not None:
+                await cls._instance.close()
+                cls._instance = None
 
     async def initialize(self) -> None:
         if self._client is not None:
@@ -46,8 +54,8 @@ class HttpClient:
 
         self._client = httpx.AsyncClient(
             http2=True,
-            follow_redirects=True,
-            max_redirects=self.settings.http.max_redirects,
+            # Redirects проходять через ручну перевірку SSRF у request/stream.
+            follow_redirects=False,
             timeout=httpx.Timeout(
                 connect=self.settings.http.connect_timeout_s,
                 read=self.settings.http.read_timeout_s,
@@ -77,15 +85,43 @@ class HttpClient:
         if not self._client:
             raise RuntimeError("HttpClient not initialized")
 
-        from urllib.parse import urlparse
-        host = urlparse(url).netloc.split(":")[0]
+        kwargs = dict(kwargs)
+        kwargs.pop("follow_redirects", None)
+        max_redirects = int(kwargs.pop("max_redirects", self.settings.http.max_redirects))
+        current_url = url
+        current_method = method
 
         await self.global_limiter.acquire()
         try:
-            await self.host_limiter.wait(host)
+            for redirect_count in range(max_redirects + 1):
+                await self._assert_url_allowed(current_url)
+                host = urlparse(current_url).hostname or ""
+                await self.host_limiter.wait(host)
+                response = await self._client.request(
+                    current_method,
+                    current_url,
+                    follow_redirects=False,
+                    **kwargs,
+                )
+                location = response.headers.get("location")
+                if response.status_code not in (301, 302, 303, 307, 308) or not location:
+                    return response
+                if redirect_count >= max_redirects:
+                    await response.aclose()
+                    raise httpx.TooManyRedirects(
+                        f"Забагато перенаправлень для {url}", request=response.request
+                    )
 
-            response = await self._client.request(method, url, **kwargs)
-            return response
+                next_url = urljoin(str(response.url), location)
+                await response.aclose()
+                if response.status_code == 303 or (
+                    response.status_code in (301, 302)
+                    and current_method.upper() not in ("GET", "HEAD")
+                ):
+                    current_method = "GET"
+                    for key in ("content", "data", "json"):
+                        kwargs.pop(key, None)
+                current_url = next_url
         finally:
             self.global_limiter.release()
 
@@ -100,17 +136,57 @@ class HttpClient:
         if not self._client:
             raise RuntimeError("HttpClient not initialized")
 
-        from urllib.parse import urlparse
-        host = urlparse(url).netloc.split(":")[0]
+        kwargs = dict(kwargs)
+        kwargs.pop("follow_redirects", None)
+        max_redirects = int(kwargs.pop("max_redirects", self.settings.http.max_redirects))
+        current_url = url
+        current_method = method
+        context = None
 
         await self.global_limiter.acquire()
         try:
-            await self.host_limiter.wait(host)
+            for redirect_count in range(max_redirects + 1):
+                await self._assert_url_allowed(current_url)
+                host = urlparse(current_url).hostname or ""
+                await self.host_limiter.wait(host)
+                context = self._client.stream(
+                    current_method,
+                    current_url,
+                    follow_redirects=False,
+                    **kwargs,
+                )
+                response = await context.__aenter__()
+                location = response.headers.get("location")
+                if response.status_code not in (301, 302, 303, 307, 308) or not location:
+                    yield response
+                    return
+                if redirect_count >= max_redirects:
+                    raise httpx.TooManyRedirects(
+                        f"Забагато перенаправлень для {url}", request=response.request
+                    )
 
-            async with self._client.stream(method, url, **kwargs) as response:
-                yield response
+                next_url = urljoin(str(response.url), location)
+                await context.__aexit__(None, None, None)
+                context = None
+                if response.status_code == 303 or (
+                    response.status_code in (301, 302)
+                    and current_method.upper() not in ("GET", "HEAD")
+                ):
+                    current_method = "GET"
+                    for key in ("content", "data", "json"):
+                        kwargs.pop(key, None)
+                current_url = next_url
         finally:
+            if context is not None:
+                await context.__aexit__(None, None, None)
             self.global_limiter.release()
+
+    async def _assert_url_allowed(self, url: str) -> None:
+        from harvester.net.guards import is_url_allowed
+
+        allowed, reason = await is_url_allowed(url)
+        if not allowed:
+            raise httpx.InvalidURL(f"URL заборонено ({reason}): {url}")
 
     async def stream_download(
         self,
@@ -135,6 +211,45 @@ class HttpClient:
                 chunks.append(chunk)
 
         return b"".join(chunks), total_bytes
+
+    async def stream_to_file(
+        self,
+        url: str,
+        destination: Path,
+        max_bytes: int | None = None,
+    ) -> tuple[int, str, bytes]:
+        """Потоково записати відповідь у temp-файл без накопичення всього PDF у RAM."""
+        if max_bytes is None:
+            max_bytes = self.settings.http.max_pdf_bytes
+
+        hasher = hashlib.sha256()
+        prefix = bytearray()
+        total_bytes = 0
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            async with self.stream("GET", url) as response:
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes(chunk_size=65536):
+                    total_bytes += len(chunk)
+                    if total_bytes > max_bytes:
+                        raise ValueError(f"Download exceeds max_bytes: {max_bytes}")
+                    await self.bandwidth_limiter.wait_for_bytes(len(chunk))
+                    hasher.update(chunk)
+                    if len(prefix) < 5:
+                        prefix.extend(chunk[: 5 - len(prefix)])
+                    await asyncio.to_thread(_write_all, fd, chunk)
+        finally:
+            os.close(fd)
+
+        return total_bytes, hasher.hexdigest(), bytes(prefix)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Повністю записати chunk у файл, обробляючи можливий partial write."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
 
 
 async def get_http_client() -> HttpClient:

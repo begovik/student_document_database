@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import structlog
 
 from harvester.bibliography import BibliographyEntry
 from harvester.config import get_settings
+from harvester.net.client import get_http_client
 
 logger = structlog.get_logger()
 
@@ -194,33 +194,28 @@ class BibliographySearcher:
     
     async def _search_by_doi(self, doi: str) -> dict | None:
         """Шукати документ за DOI."""
-        import httpx
-        
-        settings = get_settings()
         url = f"https://doi.org/{doi}"
         
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(
-                    url,
-                    headers={"Accept": "application/pdf"},
-                    follow_redirects=True,
-                )
-                
-                if resp.status_code == 200:
-                    content_type = resp.headers.get("content-type", "")
-                    if "pdf" in content_type.lower():
-                        return {
-                            "url": str(resp.url),
-                            "type": "online_pdf",
-                            "relevance": 0.9,
-                        }
-                    else:
-                        return {
-                            "url": str(resp.url),
-                            "type": "online_abstract",
-                            "relevance": 0.5,
-                        }
+            client = await get_http_client()
+            resp = await client.get(
+                url,
+                headers={"Accept": "application/pdf"},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                content_type = resp.headers.get("content-type", "")
+                if "pdf" in content_type.lower():
+                    return {
+                        "url": str(resp.url),
+                        "type": "online_pdf",
+                        "relevance": 0.9,
+                    }
+                return {
+                    "url": str(resp.url),
+                    "type": "online_abstract",
+                    "relevance": 0.5,
+                }
         except Exception as e:
             logger.warning("doi_search_error", doi=doi, error=str(e))
         
@@ -272,21 +267,25 @@ class BibliographySearcher:
                 # Перевірка доступності першого результату (HEAD)
                 best = results[0]
                 try:
-                    import httpx
-
-                    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-                        resp = await client.head(best["url"], headers={"User-Agent": get_settings().http.user_agent})
-                        if resp.status_code in (200, 206):
-                            ct = resp.headers.get("content-type", "")
-                            if "pdf" in ct.lower() or best["url"].lower().endswith(".pdf"):
-                                best["accessibility"] = "accessible"
-                            else:
-                                best["type"] = "online_abstract"
-                                best["accessibility"] = "accessible"
-                        elif resp.status_code in (403, 404, 451):
-                            best["accessibility"] = "restricted"
+                    client = await get_http_client()
+                    resp = await client.head(
+                        best["url"],
+                        headers={"User-Agent": get_settings().http.user_agent},
+                        timeout=10,
+                    )
+                    if resp.status_code == 405:
+                        resp = await client.get(best["url"], timeout=10)
+                    if resp.status_code in (200, 206):
+                        ct = resp.headers.get("content-type", "")
+                        if "pdf" in ct.lower() or best["url"].lower().endswith(".pdf"):
+                            best["accessibility"] = "accessible"
                         else:
-                            best["accessibility"] = "unknown"
+                            best["type"] = "online_abstract"
+                            best["accessibility"] = "accessible"
+                    elif resp.status_code in (403, 404, 451):
+                        best["accessibility"] = "restricted"
+                    else:
+                        best["accessibility"] = "unknown"
                 except Exception:
                     best["accessibility"] = "unknown"
                 return best

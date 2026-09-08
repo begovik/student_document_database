@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import json
-import asyncio
 import os
 import tempfile
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import structlog
 
-from harvester.config import get_settings, get_filter_rules, FilterRules
-from harvester.db.failover import build_database
+from harvester.config import FilterRules, get_filter_rules, get_settings
 from harvester.curator.availability import check_availability
+from harvester.db.failover import build_database
 
 logger = structlog.get_logger()
 
@@ -33,17 +32,21 @@ async def find_replacement_candidates(
         rules = get_filter_rules()
     
     min_page_count = rules.min_page_count
-    from harvester.db.repositories import DocumentsRepository
-
     topic_ids = []
     for t in original_doc.get("topics", []):
-        topic_ids.append(t.get("topic_id"))
+        topic_id = t.get("topic_id")
+        if topic_id is not None:
+            topic_ids.append(topic_id)
 
     # Створити умову NOT IN з плейсхолдерами
     not_in_placeholders = ",".join("?" * len(selected_ids))
-    not_in_condition = f"d.id NOT IN ({not_in_placeholders})"
+    not_in_condition = (
+        f"d.id NOT IN ({not_in_placeholders})" if selected_ids else "1=1"
+    )
 
-    topic_in_condition = "1=0"
+    # Якщо документ не має topic-зв'язків, заміни все одно можна шукати
+    # серед усіх якісних verified-документів.
+    topic_in_condition = "1=1"
     if topic_ids:
         topic_in_placeholders = ",".join("?" * len(topic_ids))
         topic_in_condition = f"dt.topic_id IN ({topic_in_placeholders})"
@@ -67,9 +70,10 @@ async def find_replacement_candidates(
           AND d.title IS NOT NULL AND d.title != ''
           AND d.authors IS NOT NULL
           AND d.language IS NOT NULL
+          AND LOWER(d.language) NOT IN ('', 'unknown', 'und')
           AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
           AND d.page_count >= {min_page_count}
-          AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
+          AND d.has_text_layer = 1
           AND ({not_in_condition})
           AND ({topic_in_condition})
           AND (d.extra IS NULL OR d.extra NOT LIKE '%"curator"%')
@@ -84,7 +88,7 @@ async def find_replacement_candidates(
         candidates.append({
             "id": row["id"],
             "title": row["title"],
-            "authors": json.loads(row["authors"]) if row["authors"] else [],
+            "authors": _parse_authors(row["authors"]),
             "year": row["year"],
             "publisher": row["publisher"],
             "doc_type": row["doc_type"],
@@ -103,6 +107,23 @@ async def find_replacement_candidates(
     return candidates
 
 
+def _parse_authors(value: Any) -> list[str]:
+    """Безпечно нормалізувати authors із JSON та старих рядкових записів."""
+    if isinstance(value, list):
+        return [str(author).strip() for author in value if str(author).strip()]
+    if not value:
+        return []
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return [value.strip()] if value.strip() else []
+        if isinstance(parsed, list):
+            return [str(author).strip() for author in parsed if str(author).strip()]
+        return [value.strip()] if value.strip() else []
+    return [str(value).strip()]
+
+
 async def call_llm_for_fix(
     doc: dict[str, Any],
     error: str,
@@ -112,13 +133,6 @@ async def call_llm_for_fix(
     settings = get_settings()
     if not settings.llm.enabled:
         return None
-
-    import aiohttp
-    import re
-
-    config = settings.llm
-    gemini_keys = [k for k in [settings.gemini_api_key, settings.gemini_api_key_2, settings.gemini_api_key_3] if k]
-    models = config.gemini_models or ["gemini-3.1-flash-lite"]
 
     prompt = f"""Ти — куратор наукової бібліотеки. Документ у каталозі має помилку — виріши, що робити.
 
@@ -144,73 +158,49 @@ async def call_llm_for_fix(
 {"action": "replace|retry|skip", "replacement_id": null, "reasoning": "коротка причина"}
 """
 
-    last_error = None
-    # Фаза 1: Gemini
-    for model in models:
-        for gemini_key in gemini_keys:
+    try:
+        from harvester.classify.llm import LLMClient, LLMUnavailable
+
+        client = LLMClient(keys=settings.gemini_keys, service="CuratorVerify")
+        response = await client.complete(prompt)
+        text = response.text.strip()
+        decoder = json.JSONDecoder()
+        result = None
+        for index, char in enumerate(text):
+            if char != "{":
+                continue
             try:
-                async with aiohttp.ClientSession() as client:
-                    url = f"{config.gemini_base_url}/models/{model}:generateContent?key={gemini_key}"
-                    payload = {
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {
-                            "temperature": config.temperature,
-                            "maxOutputTokens": config.max_tokens,
-                        },
-                    }
-                    resp = await client.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=config.timeout_s))
-                    if resp.status != 200:
-                        raise RuntimeError(f"Gemini error {resp.status}")
+                candidate, _ = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict) and "action" in candidate:
+                result = candidate
+                break
+        if not isinstance(result, dict):
+            return None
 
-                    data = await resp.json()
-                    text = ""
-                    for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-                        text += part.get("text", "")
-
-                    match = re.search(r'\{[^}]*"action"[^}]*\}', text)
-                    if match:
-                        return json.loads(match.group())
-                    break
-            except Exception as e:
-                last_error = e
-                await asyncio.sleep(config.min_interval_s)
-
-    # Фаза 2: Gemma (ті самі ключі, gemma_models + стиснення)
-    from harvester.classify.llm import rephrase_for_gemma
-
-    gemma_models = config.gemma_models or ["gemma-4-31b-it", "gemma-4-26b-it"]
-    truncated_prompt = rephrase_for_gemma(prompt, config.gemma_max_chars)
-
-    for model in gemma_models:
-        for gemini_key in gemini_keys:
+        action = str(result.get("action") or "skip").strip().lower()
+        if action not in {"replace", "retry", "skip"}:
+            action = "skip"
+        replacement_id = result.get("replacement_id")
+        if isinstance(replacement_id, bool):
+            replacement_id = None
+        else:
             try:
-                async with aiohttp.ClientSession() as client:
-                    url = f"{config.gemini_base_url}/models/{model}:generateContent?key={gemini_key}"
-                    payload = {
-                        "contents": [{"parts": [{"text": truncated_prompt}]}],
-                        "generationConfig": {
-                            "temperature": config.temperature,
-                            "maxOutputTokens": config.max_tokens,
-                        },
-                    }
-                    resp = await client.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=config.timeout_s))
-                    if resp.status != 200:
-                        raise RuntimeError(f"Gemma error {resp.status}")
-
-                    data = await resp.json()
-                    text = ""
-                    for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-                        text += part.get("text", "")
-
-                    match = re.search(r'\{[^}]*"action"[^}]*\}', text)
-                    if match:
-                        return json.loads(match.group())
-                    break
-            except Exception as e:
-                last_error = e
-                await asyncio.sleep(config.min_interval_s)
-
-    logger.warning("llm_fix_failed", error=str(last_error)[:100] if last_error else "unknown")
+                replacement_id = int(replacement_id) if replacement_id is not None else None
+            except (TypeError, ValueError):
+                replacement_id = None
+        return {
+            "action": action,
+            "replacement_id": replacement_id,
+            "reasoning": str(result.get("reasoning") or "").strip(),
+        }
+    except LLMUnavailable as e:
+        logger.warning("llm_fix_unavailable", error=str(e)[:200])
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning("llm_fix_invalid_json", error=str(e)[:200])
+    except Exception as e:  # noqa: BLE001
+        logger.warning("llm_fix_failed", error=str(e)[:200])
     return None
 
 

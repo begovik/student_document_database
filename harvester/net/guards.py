@@ -1,12 +1,9 @@
 import ipaddress
-import re
 import socket
 from urllib.parse import urlparse
 
 import structlog
 import tldextract
-
-from harvester.config import get_settings
 
 logger = structlog.get_logger()
 
@@ -20,12 +17,22 @@ PRIVATE_NETWORKS = [
     ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("100.64.0.0/10"),
 ]
 
 
 def is_private_ip(ip_str: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_str)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            return True
         for network in PRIVATE_NETWORKS:
             if ip in network:
                 return True
@@ -35,11 +42,14 @@ def is_private_ip(ip_str: str) -> bool:
 
 
 def extract_domain(url: str) -> str | None:
-    parsed = urlparse(url)
-    if not parsed.netloc:
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+    except ValueError:
         return None
-    host = parsed.netloc.split(":")[0].lower()
-    return host
+    if not host:
+        return None
+    return host.rstrip(".").lower()
 
 
 def extract_registered_domain(url: str) -> str | None:
@@ -73,7 +83,7 @@ async def check_ssrf(url: str) -> bool:
             if is_private_ip(ip_str):
                 logger.warning("ssrf_check_failed", reason="private_ip", url=url, ip=ip_str)
                 return False
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("ssrf_check_failed", reason="dns_timeout", url=url)
         return False
     except socket.gaierror as e:
@@ -97,11 +107,24 @@ async def is_domain_blocked(url: str) -> bool:
 
 
 async def is_url_allowed(url: str) -> tuple[bool, str | None]:
-    if not url.startswith(("http://", "https://")):
-        return False, "invalid_scheme"
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False, "invalid_url"
 
-    if await is_domain_blocked(url):
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False, "invalid_scheme"
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        return False, "invalid_host"
+
+    from harvester.net.blacklist import BlacklistService
+
+    blacklist = BlacklistService.get()
+    host = parsed.hostname
+    if await blacklist.is_blocked_host(host):
         return False, "domain_blocked"
+    if await blacklist.is_blocked_url(url):
+        return False, "url_blocked"
 
     if not await check_ssrf(url):
         return False, "ssrf_blocked"

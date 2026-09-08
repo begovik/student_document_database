@@ -298,8 +298,8 @@ async def seed_discipline_queries(db: Database) -> int:
     # LLM-доповнення для бідних тем (де шаблонні запити дали 0 results_yield)
     # Використовує Gemini 3.1/3.5 Flash Lite (GEMINI_API_KEY 1-3) з fallback на Gemma
     try:
-        from harvester.discovery.querygen_llm import generate_queries_for_topic
         from harvester.config import get_settings
+        from harvester.discovery.querygen_llm import generate_queries_for_topic
 
         settings = get_settings()
         if settings.llm.enabled and settings.gemini_keys and inserted == 0:
