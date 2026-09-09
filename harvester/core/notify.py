@@ -15,6 +15,8 @@ logger = structlog.get_logger()
 # Rate limiting: мінімум 5 хвилин між однаковими сповіщеннями
 _RATE_LIMIT: dict[str, datetime] = {}
 _RATE_LIMIT_INTERVAL = timedelta(minutes=5)
+# Вичерпання всіх LLM-лімітів — денний стан, повторюємо не частіше ніж раз на 6 годин
+_ALL_EXHAUSTED_INTERVAL = timedelta(hours=6)
 
 # Накопичення помилок: key -> (count, first_seen, last_seen)
 _ERROR_ACCUMULATOR: dict[str, tuple[int, datetime, datetime]] = {}
@@ -24,11 +26,12 @@ _ERROR_THRESHOLD = 3
 _ERROR_WINDOW = timedelta(minutes=10)
 
 
-def _should_send(key: str) -> bool:
+def _should_send(key: str, interval: timedelta | None = None) -> bool:
     """Перевіряє чи можна відправити сповіщення (rate limiting)."""
+    interval = interval or _RATE_LIMIT_INTERVAL
     now = datetime.utcnow()
     last_sent = _RATE_LIMIT.get(key)
-    if last_sent and now - last_sent < _RATE_LIMIT_INTERVAL:
+    if last_sent and now - last_sent < interval:
         return False
     _RATE_LIMIT[key] = now
     return True
@@ -67,13 +70,15 @@ def _accumulate_error(key: str) -> tuple[bool, int]:
     return False, count
 
 
-async def send_notification(subject: str, body: str, key: str | None = None) -> bool:
+async def send_notification(subject: str, body: str, key: str | None = None,
+                            interval: timedelta | None = None) -> bool:
     """Відправити сповіщення на пошту (async, з rate limiting).
 
     Args:
         subject: Тема листа
         body: Тіло листа
         key: Унікальний ключ для rate limiting (якщо None — використовується subject)
+        interval: Період rate limiting (якщо None — стандартні 5 хв)
 
     Returns:
         True якщо відправлено, False якщо пропущено або помилка
@@ -89,7 +94,7 @@ async def send_notification(subject: str, body: str, key: str | None = None) -> 
 
     # Rate limiting
     rate_key = key or subject
-    if not _should_send(rate_key):
+    if not _should_send(rate_key, interval):
         logger.debug("notification_rate_limited", key=rate_key)
         return False
 
@@ -163,7 +168,13 @@ Harvester автоматичне сповіщення"""
 
 
 async def notify_llm_all_exhausted(errors: list[str], service: str = "LLM") -> None:
-    """Сповіщення про вичерпання всіх LLM-провайдерів."""
+    """Сповіщення про вичерпання всіх LLM-провайдерів.
+
+    Це денний стан (вичерпано денну квоту), тож повідомляємо на пошту
+    не частіше ніж раз на 6 годин — на відміну від 5-хвилинного інтервалу
+    для звичайних помилок. Інакше воркери, що закликають LLM щохвилини,
+    слали б лист щоразу спрацювання rate-limiter.
+    """
     subject = f"LLM: усі провайдери вичерпані [{service}]"
     body = f"""Усі LLM-провайдери вичерпані в Harvester:
 
@@ -177,7 +188,8 @@ async def notify_llm_all_exhausted(errors: list[str], service: str = "LLM") -> N
 
 ---
 Harvester автоматичне сповіщення"""
-    await send_notification(subject, body, key=f"llm_all_exhausted_{service}")
+    await send_notification(subject, body, key="llm_all_exhausted",
+                            interval=_ALL_EXHAUSTED_INTERVAL)
 
 
 async def notify_critical(component: str, message: str, error: str | None = None) -> None:

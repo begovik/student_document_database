@@ -10,6 +10,11 @@ from harvester.config import get_settings
 
 logger = structlog.get_logger()
 
+# Обмеження повторних критичних логів про вичерпання: стан денний,
+# тому дублювання щосекунди лише засмічує лог.
+_ALL_EXHAUSTED_LOG_INTERVAL = 300.0  # секунд (5 хв)
+_last_all_exhausted_log: float = 0.0
+
 
 class LLMUnavailable(Exception):
     """Усі LLM-провайдери недоступні."""
@@ -196,13 +201,16 @@ class LLMClient:
         exhausted_combinations += len(self._gemma_limit_exhausted)
 
         if combinations and exhausted_combinations >= combinations:
-            logger.critical("llm_all_limits_exhausted")
-            # Сповіщення на пошту про вичерпання всіх LLM
-            try:
-                from harvester.core.notify import notify_llm_all_exhausted
-                await notify_llm_all_exhausted(errors, service=self.service)
-            except Exception:
-                pass
+            global _last_all_exhausted_log
+            if time.monotonic() - _last_all_exhausted_log >= _ALL_EXHAUSTED_LOG_INTERVAL:
+                _last_all_exhausted_log = time.monotonic()
+                logger.critical("llm_all_limits_exhausted")
+                # Сповіщення на пошту про вичерпання всіх LLM
+                try:
+                    from harvester.core.notify import notify_llm_all_exhausted
+                    await notify_llm_all_exhausted(errors, service=self.service)
+                except Exception:
+                    pass
             raise AllLimitsExhausted("; ".join(errors) or "усі ключі та моделі вичерпані")
 
         if not errors:

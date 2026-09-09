@@ -16,6 +16,7 @@ from rich.table import Table
 
 from harvester.bibliography.cli import bibliography_app
 from harvester.config import get_settings, load_config
+from harvester.core.llm_report import build_llm_report
 from harvester.curator.cli import curator_app
 from harvester.extract.cli import extract_app
 
@@ -69,6 +70,15 @@ def _fmt_time(ts: str | None) -> str:
     if not ts:
         return "—"
     return str(ts)[11:16]
+
+
+def _fmt_tokens(tokens: int) -> str:
+    """Форматуємо токени: 18_370 -> '18.4K', 4_000_000 -> '4.0M'."""
+    if not tokens:
+        return "0"
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.1f}M"
+    return f"{tokens / 1000:.1f}K"
 
 
 @contextmanager
@@ -207,7 +217,7 @@ def report(
     days: int = typer.Option(7, "--days", "-d", help="Період динаміки в днях (за замовчуванням 7)"),
     json_output: bool = typer.Option(False, "--json", help="Вивід у форматі JSON"),
 ):
-    """Зведений звіт: стан системи + динаміка перевірки джерел"""
+    """Зведений звіт: використання LLM-моделей і лімітів + динаміка перевірки джерел"""
     from harvester.db.failover import build_database
     from harvester.db.repositories import (
         ChannelStatsRepository,
@@ -230,7 +240,7 @@ def report(
                 tasks_repo = TasksRepository(db)
                 chan_repo = ChannelStatsRepository(db)
                 verif_repo = VerifierRepository(db)
-    
+
                 doc_stats = await docs_repo.count_by_status()
                 lang_stats = await docs_repo.count_by_language()
                 classified_total, classified_docs = await docs_repo.count_classified()
@@ -240,11 +250,16 @@ def report(
                 verif_daily = await verif_repo.daily_summary(days)
                 verif_total = await verif_repo.overall_summary()
                 verified_total, verified_checked = await verif_repo.coverage()
-    
+
                 db_mode = "local (SQLite)"
                 if db.mode == "remote":
                     db_mode = "remote (PostgreSQL)"
-    
+
+                # LLM-звіт з логів
+                log_dir = Path(settings.logging.file).parent if settings.logging.file else Path("logs")
+                log_prefix = Path(settings.logging.file).name if settings.logging.file else "harvester.log"
+                llm_report = build_llm_report(log_dir, days=days, log_prefix=log_prefix)
+
                 if json_output:
                     print(
                         json.dumps(
@@ -258,6 +273,7 @@ def report(
                                 "tasks_by_status": task_stats,
                                 "tasks_by_type": task_by_type,
                                 "channels": channel_stats,
+                                "llm": llm_report,
                                 "verifier": {
                                     "total": verif_total,
                                     "coverage": {
@@ -272,29 +288,78 @@ def report(
                         )
                     )
                     return
-    
-                table1 = Table(title="Загальний стан Harvester")
-                table1.add_column("Параметр", style="cyan")
-                table1.add_column("Значення", style="green")
-                table1.add_row("База даних", db_mode)
-                table1.add_row("Документи (всього)", str(sum(doc_stats.values())))
-                for st, cnt in sorted(doc_stats.items(), key=lambda x: -x[1]):
-                    table1.add_row(f"  · {st}", str(cnt))
-                if lang_stats:
-                    table1.add_row(
-                        "Мови (verified)",
-                        ", ".join(f"{k}:{v}" for k, v in sorted(lang_stats.items(), key=lambda x: -x[1])),
+
+                coverage_from = llm_report.get("log_coverage_from")
+                cov_title = (
+                    f"Використання LLM-моделей і лімітів (лог від {coverage_from[5:]})"
+                    if coverage_from
+                    else "Використання LLM-моделей і лімітів"
+                )
+                table1 = Table(title=cov_title)
+                table1.add_column("День", style="cyan", width=5)
+                table1.add_column("Викл.", justify="right")
+                table1.add_column("Токени", justify="right")
+                table1.add_column("Сер.,с", justify="right")
+                table1.add_column("Клас.", justify="right", style="green")
+                table1.add_column("Quota", justify="right", style="red")
+                table1.add_column("Rate", justify="right", style="yellow")
+                table1.add_column("5xx", justify="right", style="red")
+                table1.add_column("Вичерп.", justify="right", style="bright_red")
+                table1.add_column("БезLLM", justify="right")
+
+                for day, stats in llm_report["by_day"].items():
+                    has_data = bool(coverage_from and day >= coverage_from)
+                    if has_data and (stats["ok"] or stats["quota"] or stats["rate"]
+                                     or stats["transient"] or stats["exhausted"] or stats["unavailable"]):
+                        table1.add_row(
+                            str(day)[5:],
+                            str(stats["ok"]),
+                            _fmt_tokens(stats["tokens"]),
+                            f"{stats['avg_duration_ms'] / 1000:.1f}" if stats["avg_duration_ms"] else "—",
+                            str(stats["classified"]),
+                            str(stats["quota"]),
+                            str(stats["rate"]),
+                            str(stats["transient"]),
+                            str(stats["exhausted"]),
+                            str(stats["unavailable"]),
+                        )
+                    else:
+                        table1.add_row(str(day)[5:], "—", "—", "—", "—", "—", "—", "—", "—", "—")
+
+                table1_2 = Table(title="LLM по моделях (підсумок)")
+                table1_2.add_column("Модель", style="cyan")
+                table1_2.add_column("Викл.", justify="right")
+                table1_2.add_column("Токени", justify="right")
+                table1_2.add_column("Сер.,с", justify="right")
+                table1_2.add_column("Quota", justify="right", style="red")
+                table1_2.add_column("Rate", justify="right", style="yellow")
+                table1_2.add_column("5xx", justify="right", style="red")
+
+                for model, stats in llm_report["by_model"].items():
+                    table1_2.add_row(
+                        str(model)[:40],
+                        str(stats["ok"]),
+                        _fmt_tokens(stats["tokens"]),
+                        f"{stats['avg_duration_ms'] / 1000:.1f}" if stats["avg_duration_ms"] else "—",
+                        str(stats["quota"]),
+                        str(stats["rate"]),
+                        str(stats["transient"]),
                     )
-                table1.add_row("Класифікації (всього)", str(classified_total))
-                table1.add_row("  · унікальних документів", str(classified_docs))
-                table1.add_row("Завдання (pending)", str(task_stats.get("pending", 0)))
-                table1.add_row("Завдання (running)", str(task_stats.get("running", 0)))
-                for ttype, by_status in sorted(task_by_type.items()):
-                    pending = by_status.get("pending", 0)
-                    running = by_status.get("running", 0)
-                    if pending or running:
-                        table1.add_row(f"  · {ttype}", f"p:{pending} r:{running}")
-    
+
+                table1.add_row("", "", "", "", "", "", "", "", "", "")
+                table1.add_row(
+                    "Всього",
+                    str(sum(s["ok"] for s in llm_report["by_day"].values())),
+                    _fmt_tokens(sum(s["tokens"] for s in llm_report["by_day"].values())),
+                    "—",
+                    str(sum(s["classified"] for s in llm_report["by_day"].values())),
+                    str(sum(s["quota"] for s in llm_report["by_day"].values())),
+                    str(sum(s["rate"] for s in llm_report["by_day"].values())),
+                    str(sum(s["transient"] for s in llm_report["by_day"].values())),
+                    str(sum(s["exhausted"] for s in llm_report["by_day"].values())),
+                    str(sum(s["unavailable"] for s in llm_report["by_day"].values())),
+                )
+
                 table2 = Table(title=f"Перевірка джерел (verifier, {days} днів)")
                 table2.add_column("День", style="cyan", width=5)
                 table2.add_column("Перев.", justify="right")
@@ -306,7 +371,7 @@ def report(
                 table2.add_column("LLM-", justify="right", style="red")
                 table2.add_column("1-й LLM", style="yellow", width=5)
                 table2.add_column("ост.", style="yellow", width=5)
-    
+
                 for r in verif_daily:
                     table2.add_row(
                         str(r["day"])[5:],
@@ -320,7 +385,7 @@ def report(
                         _fmt_time(r.get("first_llm")),
                         _fmt_time(r.get("last_llm")),
                     )
-    
+
                 table3 = Table(title="Підсумок verifier")
                 table3.add_column("Параметр", style="cyan")
                 table3.add_column("Значення", style="green")
@@ -333,19 +398,28 @@ def report(
                 table3.add_row("  · fail", str(verif_total.get("llm_fail", 0) or 0))
                 coverage_pct = (verified_checked / verified_total * 100) if verified_total else 0.0
                 table3.add_row("Охоплення verified-документів", f"{verified_checked} / {verified_total} ({coverage_pct:.1f}%)")
-    
-                if channel_stats:
-                    chan_rows = "\n".join(
-                        f"  · {s['channel']}: нових {s.get('items_new', 0)}, помилок {s.get('errors', 0)}"
-                        for s in channel_stats[:6]
-                    )
-                    table1.add_row("Канали (топ)", chan_rows)
-    
+
                 console.print(table1)
                 console.print("")
+                if llm_report["by_model"]:
+                    console.print(table1_2)
+                    console.print("")
                 console.print(table3)
                 console.print("")
                 console.print(table2)
+                if channel_stats:
+                    chan_table = Table(title=f"Канали ({days} днів)")
+                    chan_table.add_column("Канал", style="cyan")
+                    chan_table.add_column("Нових", justify="right", style="green")
+                    chan_table.add_column("Помилок", justify="right", style="red")
+                    for s in channel_stats[:8]:
+                        chan_table.add_row(
+                            str(s["channel"])[:40],
+                            str(s.get("items_new", 0) or 0),
+                            str(s.get("errors", 0) or 0),
+                        )
+                    console.print("")
+                    console.print(chan_table)
             finally:
                 await db.close()
 

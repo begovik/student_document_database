@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta
 
 import structlog
@@ -23,6 +24,10 @@ from harvester.net.guards import is_url_allowed
 from harvester.verify.pipeline import VerifyPipeline
 
 logger = structlog.get_logger()
+
+# Вичерпання всіх LLM-лімітів — денний стан; не логуємо критично на кожну задачу
+_CLASSIFY_EXHAUSTED_LOG_INTERVAL = 300.0  # секунд (5 хв)
+_last_classify_exhausted_log: float = 0.0
 
 LANG_PRIORITY = {"uk": 100, "en": 50}
 DEFAULT_PRIORITY = 10
@@ -437,8 +442,11 @@ class ClassifyWorker:
                 await asyncio.sleep(10)
                 await self.scheduler.complete_task(task_id, task.get("lease_token"))
                 return
-            logger.critical("classify_worker_all_limits_exhausted", worker=f"classify-{self.worker_id}")
-            await self.events.error("classify", "all_limits_exhausted", {"worker": f"classify-{self.worker_id}"})
+            global _last_classify_exhausted_log
+            if time.monotonic() - _last_classify_exhausted_log >= _CLASSIFY_EXHAUSTED_LOG_INTERVAL:
+                _last_classify_exhausted_log = time.monotonic()
+                logger.critical("classify_worker_all_limits_exhausted", worker=f"classify-{self.worker_id}")
+                await self.events.error("classify", "all_limits_exhausted", {"worker": f"classify-{self.worker_id}"})
             await self.scheduler.complete_task(task_id, task.get("lease_token"))
             retry_at = (datetime.utcnow() + timedelta(hours=1)).isoformat()
             await self.scheduler.schedule_task(
