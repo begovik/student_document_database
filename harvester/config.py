@@ -14,7 +14,8 @@ class ContactConfig(BaseModel):
 class PathsConfig(BaseModel):
     db_path: str = "data/harvester.db"
     tmp_dir: str = "data/tmp"
-    backup_dir: str = "backups"
+    # Бекапи тимчасово вимкнені: ані код створення, ані самі бекапи не потрібні.
+    # backup_dir: str = "backups"
 
 
 class WorkersConfig(BaseModel):
@@ -132,7 +133,7 @@ class DisciplineAssignConfig(BaseModel):
 class RetentionConfig(BaseModel):
     fetch_attempts_days: int = Field(default=90, ge=1, le=3650)
     events_days: int = Field(default=180, ge=1, le=3650)
-    backups_keep: int = Field(default=14, ge=1, le=365)
+    # backups_keep: int = Field(default=14, ge=1, le=365)
 
 
 class LoggingConfig(BaseModel):
@@ -268,9 +269,9 @@ class Settings(BaseSettings):
     def tmp_dir(self) -> Path:
         return Path(self.paths.tmp_dir)
 
-    @property
-    def backup_dir(self) -> Path:
-        return Path(self.paths.backup_dir)
+    # @property
+    # def backup_dir(self) -> Path:
+    #     return Path(self.paths.backup_dir)
 
 
 def load_config(config_path: str | Path | None = None) -> Settings:

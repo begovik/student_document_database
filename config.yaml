@@ -18,7 +18,7 @@ database:
 paths:
   db_path: "data/harvester.db"
   tmp_dir: "data/tmp"
-  backup_dir: "backups"
+  # backup_dir: "backups"
 
 workers:
   verify: 6
@@ -112,7 +112,7 @@ scanner:
 retention:
   fetch_attempts_days: 90
   events_days: 180
-  backups_keep: 14
+  # backups_keep: 14
 
 logging:
   level: INFO
