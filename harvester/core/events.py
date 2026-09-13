@@ -48,7 +48,7 @@ def setup_logging(level: str = "INFO", log_file: str | Path | None = None) -> No
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         file_handler = RotatingFileHandler(
-            log_path, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8"
+            log_path, maxBytes=20 * 1024 * 1024, backupCount=21, encoding="utf-8"
         )
         file_handler.setFormatter(
             structlog.stdlib.ProcessorFormatter(processor=structlog.processors.JSONRenderer())
