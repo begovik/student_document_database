@@ -21,7 +21,7 @@
 | `core/supervisor` + `core/scheduler` | Оркестрація 24/7, черга `tasks`, heartbeat | — |
 | `discovery` (ddgs, openalex) | Пошук кандидатів, сідування `search_queries` | LLM-доповнення запитів: `GEMINI_API_KEY 1-3` |
 | `verify` | Верифікація PDF (цілісність, `%PDF`, текстовий шар, мова, дедуп) | — |
-| `classify` | Класифікація тем (УДК + ключові слова + LLM) | `GEMINI_DOC_VERIFIER_KEY_1..4`, `gemma-4-31b-it` / `gemma-4-26b-a4b-it` |
+| `classify` | Класифікація тем (УДК + ключові слова + LLM) | `GEMINI_DOC_VERIFIER_KEY_1..4`, `gemma-4-26b-a4b-it` / `gemma-4-31b-it` |
 | `extract` | Витяг цитат і сумаризацій з PDF | `GEMINI_API_KEY 1..3`, `gemini-3.1-flash-lite` / `gemini-3.5-flash-lite` → fallback `gemma` |
 | `curator` | Підготовка / верифікація каталогів | `GEMINI_API_KEY 1..3` (LLM-відбір) |
 | `bibliography` | Витяг літератури з PDF та добирання джерел | `GEMINI_API_KEY 1..3` (спільний `LLMClient`), пошук `ddgs` |

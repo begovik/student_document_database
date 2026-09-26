@@ -904,6 +904,47 @@ def test_ddgs_search_error_only_when_backend_actually_failed():
     assert "_is_no_results" in source
 
 
+def test_llm_alert_only_when_whole_chain_fails():
+    """Помилка однієї моделі не має сповіщати — ланцюг і далі працює.
+
+    Практика: gemma-4-31b-it падав у 25% випадків, щоразу перехоплювався
+    gemma-4-26b-a4b-it, і на пошту йшло 14 листів на годину без жодних
+    наслідків для якості роботи. Тривога без наслідків знецінює сигнал.
+
+    Справжню аварію («впало все») ловить notify_llm_all_exhausted — раз на
+    6 годин. Тож перевіряємо, що в llm.py більше немає сповіщень на
+    помилку окремої моделі/ключа, а сам механізм «все впало» лишився.
+    """
+    import inspect
+
+    from harvester.classify import llm as llm_mod
+
+    source = inspect.getsource(llm_mod)
+    assert "notify_llm_failure" not in source, (
+        "з'явився виклик сповіщення на помилку однієї моделі/ключа"
+    )
+    # Механізм реальної аварії має лишитися
+    assert "notify_llm_all_exhausted" in source
+    assert "llm_all_limits_exhausted" in source
+    # Помилка має лишатися в списку для діагностики, разом з назвою моделі
+    assert "errors.append(f\"[{phase}/{model}]" in source
+
+
+def test_healthy_gemma_model_is_first_in_chain():
+    """Зламана модель не мусить стояти першою в ланцюзі.
+
+    gemma-4-26b-a4b-it тримав 99.7% успіху, gemma-4-31b-it — 74.9%
+    (деградація на боці Google). Оскільки ланцюг бере першу, що
+    відповіла, 26b має бути першою, інакше близько чверті всіх викликів
+    падатиме вхолосту і провокуватиме ретраї та сповіщення.
+    """
+    from harvester.config import LLMConfig
+
+    models = LLMConfig().gemma_models
+    assert models[0] == "gemma-4-26b-a4b-it", f"першою має бути стійка модель, маємо {models}"
+    assert "gemma-4-31b-it" in models, "резервну модель не можна викидати з ланцюга"
+
+
 def test_notify_calls_match_signatures():
     """Усі виклики notify_* мають відповідати сигнатурам функцій.
 

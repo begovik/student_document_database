@@ -167,7 +167,15 @@ class DatabaseConfig(BaseModel):
 class LLMConfig(BaseModel):
     enabled: bool = True
     gemini_models: list[str] = Field(default=["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"])
-    gemma_models: list[str] = Field(default=["gemma-4-31b-it", "gemma-4-26b-a4b-it"])
+    # Порядок важливий: ланцюг перебирає моделі зверху вниз і зупиняється на
+    # першій, що відповіла. 26b ставимо першим за даними production за
+    # 26.09.2026: за 4 години gemma-4-26b-a4b-it — 1085 успіхів / 3 помилки
+    # (99.7%), тоді як gemma-4-31b-it — 266/89 (74.9%) через деградацію
+    # конкретної моделі на боці Google. Обидві ходять на той самий ендпоінт
+    # з тими самими ключами, тож це не мережа, а саме модель.
+    # Після відновлення 31b-it можна повернути її першою — це лише
+    # один рядок, перезапуск сервісу не потрібен.
+    gemma_models: list[str] = Field(default=["gemma-4-26b-a4b-it", "gemma-4-31b-it"])
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     gemma_max_chars: int = Field(default=15000, ge=5000, le=100000)
     openrouter_model: str = "google/gemini-2.5-flash"

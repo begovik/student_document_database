@@ -170,7 +170,7 @@ class LLMClient:
 
     Фаза 1 — Gemini (gemini-3.1-flash-lite, gemini-3.5-flash-lite) × 3 ключі:
       - контекст 250k, але обмежені денні ліміти
-    Фаза 2 — Gemma 4 (gemma-4-31b-it, gemini-4-26b-it) × 3 ключі:
+    Фаза 2 — Gemma 4 (gemma-4-26b-a4b-it, gemma-4-31b-it) × 3 ключі:
       - величезні денні ліміти, але контекст 16k → текст перефразовується
     Фолбек — OpenRouter (google/gemini-2.5-flash)
     """
@@ -414,20 +414,12 @@ class LLMClient:
                     checked_all = True
             except GeminiAuthError as e:
                 logger.error("gemini_auth_error", phase=phase, key_idx=self._key_idx, model=model, error_msg=redact_secrets(str(e))[:200])
-                errors.append(str(e))
+                # Як і для помилок моделі — без сповіщення на цю помилку:
+                # застарілий ключ не ламає сервіс, поки працюють інші. Про
+                # те, що ключ мертвий, повідомить notify_llm_all_exhausted,
+                # коли впаде весь ланцюг.
+                errors.append(f"[{phase}/{model}] Auth error: {redact_secrets(str(e))[:200]}")
                 exhausted.add((self._key_idx, self._model_idx))
-                try:
-                    from harvester.core.notify import notify_llm_failure
-                    await notify_llm_failure(phase, model, f"Auth error: {e}", service=self.service)
-                except Exception as notify_err:  # noqa: BLE001
-                    log_throttled(
-                        logger,
-                        "llm_notify_failed",
-                        "notify_auth",
-                        phase=phase,
-                        model=model,
-                        error=redact_secrets(str(notify_err))[:200],
-                    )
                 self._advance_phase(models)
                 transient_retries = 0
                 if self._is_back_to_start(start_key_idx, start_model_idx):
@@ -488,25 +480,15 @@ class LLMClient:
 
                 logger.error("gemini_error", phase=phase, key_idx=self._key_idx, model=model,
                             error_msg=error_msg, error_type=error_type, service=self.service)
-                errors.append(error_msg)
-                # Критична помилка — відправити на пошту
-                try:
-                    from harvester.core.notify import notify_llm_failure
-                    # error_type уже вбудований у текст помилки. Окремим
-                    # аргументом не передаємо: notify_llm_failure() такого
-                    # параметра не має, і виклик падав би з TypeError —
-                    # тобто сповіщення про збої LDM ніколи не доходили б
-                    # (через try/except помилка ковталася як llm_notify_failed).
-                    await notify_llm_failure(phase, model, f"[{error_type}] {error_msg[:200]}", service=self.service)
-                except Exception as notify_err:  # noqa: BLE001
-                    log_throttled(
-                        logger,
-                        "llm_notify_failed",
-                        "notify_error",
-                        phase=phase,
-                        model=model,
-                        error=redact_secrets(str(notify_err))[:200],
-                    )
+                # Помилка однієї моделі НЕ сповіщається: ланцюг далі
+                # перебирає інші моделі/ключі й зазвичай відновлюється.
+                # Практика показала 14 листів на годину про gemma-4-31b-it,
+                # який падав у 25% випадків і щоразу перехоплювався
+                # gemma-4-26b-a4b-it (99.7% успіху). Справжню аварію
+                # «упало все» ловить notify_llm_all_exhausted — раз на 6 год.
+                # phase/model у тексті потрібні, щоб те повідомлення
+                # показувало, ЯКА саме модель була зламана.
+                errors.append(f"[{phase}/{model}] {error_msg[:200]}")
                 self._advance_phase(models)
                 transient_retries = 0
                 if self._is_back_to_start(start_key_idx, start_model_idx):
