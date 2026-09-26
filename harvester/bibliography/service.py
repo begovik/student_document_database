@@ -212,8 +212,10 @@ class BibliographyService:
             if db:
                 try:
                     await db.close()
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # Помилка закриття локального з'єднання не повинна
+                    # губитись — інакше видно недовільне з'єднання SQLite.
+                    logger.warning("bibliography_db_close_failed", error=str(e)[:200])
         if db is None:
             search_results = await self.searcher.search_references(unique_references)
         
@@ -415,8 +417,17 @@ class BibliographyService:
                 if lang.language == "ru" and lang.confidence >= 0.8:
                     logger.info("bibliography_russian_skip_download", url=url)
                     continue
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                # Мовний фільтр не відпрацював → документ завантажується
+                # без перевірки на російську. Раніше це було повністю
+                # мовчки, тож фільтр міг тихо зламатись.
+                logger.warning(
+                    "bibliography_lang_check_failed",
+                    url=url,
+                    error=str(e)[:150],
+                    error_type=type(e).__name__,
+                    impact="перевірка RU пропущена",
+                )
 
             # 3. Завантаження
             try:
@@ -482,8 +493,14 @@ class BibliographyService:
                     if lang2.language == "ru" and lang2.confidence >= 0.8:
                         logger.info("bibliography_skip_russian_content", url=url)
                         continue
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "bibliography_content_lang_check_failed",
+                        url=url,
+                        error=str(e)[:150],
+                        error_type=type(e).__name__,
+                        impact="перевірка RU за змістом пропущена",
+                    )
 
                 downloaded.append({
                     "url": url,
@@ -504,8 +521,21 @@ class BibliographyService:
                                     y = int(sr.reference.year)
                                     if 1900 <= y <= 2030:
                                         year_int = y
-                            except Exception:
-                                pass
+                                    else:
+                                        logger.debug(
+                                            "bibliography_year_out_of_range",
+                                            url=url,
+                                            year=y,
+                                        )
+                            except Exception as e:  # noqa: BLE001
+                                # Рік просто не заповниться; логуємо, бо
+                                # невизначений рік погіршує фільтри за датою.
+                                logger.debug(
+                                    "bibliography_year_parse_failed",
+                                    url=url,
+                                    value=repr(sr.reference.year)[:40],
+                                    error=str(e)[:80],
+                                )
                             new_id = await repo.insert_or_ignore(
                                 canonical_url=url,
                                 title=sr.reference.title or None,
@@ -524,17 +554,34 @@ class BibliographyService:
                             if new_id:
                                 added_ids.append(new_id)
                                 sr.document_id = new_id
+                            else:
+                                # NULL означає «дублікат або не вдалося» —
+                                # раніше ці дві причини не відрізнялись.
+                                logger.debug("bibliography_db_deduped", url=url)
                     except Exception as e:
-                        logger.warning("bibliography_db_insert_failed", url=url, error=str(e))
+                        logger.warning(
+                            "bibliography_db_insert_failed",
+                            url=url,
+                            error=str(e)[:200],
+                            error_type=type(e).__name__,
+                        )
 
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.warning("bibliography_download_failed", url=url, error=str(e))
+                logger.warning(
+                    "bibliography_download_failed",
+                    url=url,
+                    error=str(e)[:200],
+                    error_type=type(e).__name__,
+                )
                 continue
 
         if db is not None:
             try:
                 await db.close()
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                logger.warning("bibliography_db_close_failed", error=str(e)[:200])
                 pass
 
         logger.info(
@@ -595,8 +642,14 @@ class BibliographyService:
                         from harvester.bibliography import parse_reference_entry
 
                         fallback = parse_reference_entry(raw)
-                    except Exception:
-                        pass
+                    except Exception as e:  # noqa: BLE001
+                        # Fallback-парсер не спрацював — запис лишається без
+                        # автора/назви й потрапить у відсікання за полями.
+                        logger.debug(
+                            "bibliography_fallback_parse_failed",
+                            raw=raw[:100],
+                            error=str(e)[:120],
+                        )
                     if fallback:
                         if not entry.authors:
                             entry.authors = fallback.authors
@@ -682,12 +735,31 @@ class BibliographyService:
 
             doc = fitz.open(str(pdf_path))
             parts = []
+            page_errors = 0
             for page in doc:
                 try:
                     parts.append(page.get_text() or "")
-                except Exception:
-                    continue
+                except Exception as e:  # noqa: BLE001
+                    # Сторінка без витягу = скан без текстового шару або
+                    # битий об'єкт. Раніше такі сторінки мовчки зникали, і
+                    # неповний текст ішов у LLM як повний.
+                    page_errors += 1
+                    logger.debug(
+                        "bibliography_page_text_failed",
+                        file=pdf_path.name,
+                        page=page.number + 1,
+                        error=str(e)[:120],
+                        error_type=type(e).__name__,
+                    )
+                    parts.append("")
             doc.close()
+            if page_errors:
+                logger.info(
+                    "bibliography_pages_without_text",
+                    file=pdf_path.name,
+                    pages_failed=page_errors,
+                    pages_total=len(parts),
+                )
             full = "\n".join(parts)
             # Обрізаємо під ліміт LLM, але зберігаємо початок і кінець (де зазвичай література)
             max_chars = self.settings.llm.max_text_chars_for_llm if self.settings.llm else 80000

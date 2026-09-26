@@ -105,7 +105,14 @@ async def send_notification(subject: str, body: str, key: str | None = None,
             logger.info("notification_sent", subject=subject[:50])
         return result
     except Exception as e:
-        logger.error("notification_failed", error_msg=str(e))
+        # Сповіщення не дійшло — раніше це єдиний слід, без розрізнення
+        # «SMTP недоступний» і «шаблон зламаний».
+        logger.error(
+            "notification_failed",
+            subject=subject[:80],
+            error_msg=str(e)[:200],
+            error_type=type(e).__name__,
+        )
         return False
 
 

@@ -1,6 +1,8 @@
 import asyncio
+import re
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import httpx
 import structlog
@@ -14,6 +16,15 @@ logger = structlog.get_logger()
 # тому дублювання щосекунди лише засмічує лог.
 _ALL_EXHAUSTED_LOG_INTERVAL = 300.0  # секунд (5 хв)
 _last_all_exhausted_log: float = 0.0
+
+# Скільки символів сирої відповіді LLM писати в лог. Більше — роздування
+# логів без додаткової діагностичної цінності; менше — обрізає причину.
+RAW_LOG_LIMIT = 300
+
+# Лімітер для повторюваних діагностичних повідомлень: одна й та сама причина
+# не повинна засмічувати лог на тисячі рядків (напр. 1 запит = 4 моделі × 4 ключі).
+_DIAG_THROTTLE_S = 120.0
+_diag_throttle: dict[str, float] = {}
 
 
 class LLMUnavailable(Exception):
@@ -30,6 +41,70 @@ class LLMResponse:
     provider: str
     model: str
     duration_ms: int
+    # Діагностика відповіді. Без цих полів збій JSON-розбору невідстеджуваний:
+    # парсер каже лише «не JSON-об'єкт», а через що саме — ніде не видно.
+    finish_reason: str = ""
+    thought_tokens: int = 0
+    part_count: int = 0
+
+
+def log_raw_response(log, event: str, resp: LLMResponse, **extra) -> None:
+    """Зафіксувати сиру відповідь LLM у разі, коли її розбір впав.
+
+    JSON-парсер повідомляє лише «LLM не повернув JSON-об'єкт», чого
+    недостатньо для діагностики: не видно, чи то бюджет пішов у thinking,
+    чи вивід обрізаний, чи модель повернула HTML/текст помилки замість JSON.
+    Саме відсутність цієї діагностики приховала дефект thinking-моделі, який
+    мовчки перетворював 66% строгих перевірок на `pass`.
+    """
+    log.warning(
+        event,
+        model=resp.model,
+        provider=resp.provider,
+        finish_reason=resp.finish_reason,
+        thought_tokens=resp.thought_tokens,
+        chars=len(resp.text),
+        raw=resp.text[:RAW_LOG_LIMIT],
+        **extra,
+    )
+
+
+def log_throttled(log, event: str, key: str, **extra) -> None:
+    """Зафіксувати діагностичну подію не частіше ніж раз на _DIAG_THROTTLE_S.
+
+    Ключ `key` має бути стабільним для однієї й тієї ж причини, інакше
+    трюс втрачає сенс.
+    """
+    now = time.monotonic()
+    last = _diag_throttle.get(key, 0.0)
+    if now - last < _DIAG_THROTTLE_S:
+        return
+    _diag_throttle[key] = now
+    if len(_diag_throttle) > 2000:
+        # Обмежити пам'ять: чистимо застарілі записи.
+        cutoff = now - _DIAG_THROTTLE_S
+        for stale in [k for k, v in _diag_throttle.items() if v < cutoff]:
+            del _diag_throttle[stale]
+    log.warning(event, throttle_key=key, **extra)
+
+
+# Ключі API потрапляли у текст помилок httpx (URL виду `...?key=AIza...`) і
+# через це опинялися в журналі та в `system_events`. Редагують перед логом.
+_SECRET_PATTERNS = (
+    re.compile(r"([?&]key=)[^&\s'\"]+"),
+    re.compile(r"(?i)(authorization:\s*bearer\s+)\S+"),
+    re.compile(r"(?i)((?:api[_-]?key|password|secret|token)\"?\s*[:=]\s*\"?)[^\s'\",}]+"),
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Прибрати API-ключі та паролі з тексту перед логуванням."""
+    if not text:
+        return ""
+    out = text
+    for pattern in _SECRET_PATTERNS:
+        out = pattern.sub(r"\1***", out)
+    return out
 
 
 def rephrase_for_gemma(text: str, max_chars: int = 15000) -> str:
@@ -119,9 +194,10 @@ class LLMClient:
         self._lock = asyncio.Lock()
         self._daily_limit_exhausted: set[tuple[int, int]] = set()
         self._gemma_limit_exhausted: set[tuple[int, int]] = set()
+        self._exhausted_date = datetime.now(UTC).date().isoformat()
         self._phase = "gemma" if gemma_only else "gemini"
         self._initialized = False
-        self._rate_limiter = ModelRateLimiter(
+        self._rate_limiter = ModelRateLimiter.shared(
             gemini_rpm=self.settings.llm.gemini_rpm,
             gemini_rpd=self.settings.llm.gemini_rpd,
             gemma_rpm=self.settings.llm.gemma_rpm,
@@ -142,6 +218,7 @@ class LLMClient:
         квоту та помилково трактував тимчасову мережеву помилку як вичерпання.
         Реальна доступність перевіряється під час `complete()` з ротацією.
         """
+        self._refresh_daily_state()
         if self._initialized:
             return
 
@@ -149,6 +226,11 @@ class LLMClient:
         self._phase = "gemma" if self._gemma_only else "gemini"
         self._key_idx = 0
         self._model_idx = 0
+        # Спільний limiter має розподіляти квоту між ключами, а не ділити її
+        # порівну: квоти Gemini/Gemma діють per-key.
+        key_count = max(len(self._keys), 1)
+        for phase in ("gemini", "gemma"):
+            self._rate_limiter.register_phase_keys(phase, key_count)
         logger.info(
             "llm_initialized",
             phase=self._phase,
@@ -157,6 +239,29 @@ class LLMClient:
             gemma_models=len(self._gemma_models),
             openrouter=bool(self.settings.open_router_api_key),
         )
+
+    def _refresh_daily_state(self) -> None:
+        """Скинути sticky-стан вичерпання при зміні UTC-дати."""
+        today = datetime.now(UTC).date().isoformat()
+        if self._exhausted_date != today:
+            self._daily_limit_exhausted.clear()
+            self._gemma_limit_exhausted.clear()
+            self._exhausted_date = today
+            self._initialized = False
+            logger.info("llm_daily_exhaustion_reset", date=today)
+
+    def reset_exhausted_state(self) -> None:
+        """Дозволити повторну спробу після AllLimitsExhausted.
+
+        Лічильники самого shared limiter-а не скидаються: вони захищають
+        реальний денний ліміт. Скидаються лише локальні set-и, які інакше
+        назавжди блокували б усі key/model комбінації в цьому процесі.
+        """
+        self._daily_limit_exhausted.clear()
+        self._gemma_limit_exhausted.clear()
+        self._exhausted_date = datetime.now(UTC).date().isoformat()
+        self._key_idx = 0
+        self._model_idx = 0
 
     async def complete(self, prompt: str) -> LLMResponse:
         if not self.enabled:
@@ -204,18 +309,38 @@ class LLMClient:
             global _last_all_exhausted_log
             if time.monotonic() - _last_all_exhausted_log >= _ALL_EXHAUSTED_LOG_INTERVAL:
                 _last_all_exhausted_log = time.monotonic()
-                logger.critical("llm_all_limits_exhausted")
+                # Сервіс і причини — інакше не зрозуміло, чий пул вичерпано
+                # (verifier, classify чи discipline_assign) і через що.
+                logger.critical(
+                    "llm_all_limits_exhausted",
+                    service=self.service,
+                    combinations=combinations,
+                    exhausted=exhausted_combinations,
+                    errors=redact_secrets("; ".join(errors))[:500],
+                )
                 # Сповіщення на пошту про вичерпання всіх LLM
                 try:
                     from harvester.core.notify import notify_llm_all_exhausted
                     await notify_llm_all_exhausted(errors, service=self.service)
-                except Exception:
-                    pass
+                except Exception as notify_err:  # noqa: BLE001
+                    # Втрата сповіщення не повинна губити й діагностику:
+                    # без неї не видно, чому пошта не прийшла.
+                    log_throttled(
+                        logger,
+                        "llm_all_exhausted_notify_failed",
+                        "notify_all_exhausted",
+                        service=self.service,
+                        error=redact_secrets(str(notify_err))[:200],
+                    )
             raise AllLimitsExhausted("; ".join(errors) or "усі ключі та моделі вичерпані")
 
         if not errors:
             raise LLMUnavailable("Немає налаштованого доступного LLM-провайдера")
-        logger.warning("llm_unavailable", errors=errors)
+        logger.warning(
+            "llm_unavailable",
+            service=self.service,
+            errors=redact_secrets("; ".join(errors))[:500],
+        )
         raise LLMUnavailable("; ".join(errors))
 
     async def _run_phase(
@@ -288,21 +413,55 @@ class LLMClient:
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
             except GeminiAuthError as e:
-                logger.error("gemini_auth_error", phase=phase, key_idx=self._key_idx, model=model, error_msg=str(e))
+                logger.error("gemini_auth_error", phase=phase, key_idx=self._key_idx, model=model, error_msg=redact_secrets(str(e))[:200])
                 errors.append(str(e))
                 exhausted.add((self._key_idx, self._model_idx))
                 try:
                     from harvester.core.notify import notify_llm_failure
                     await notify_llm_failure(phase, model, f"Auth error: {e}", service=self.service)
-                except Exception:
-                    pass
+                except Exception as notify_err:  # noqa: BLE001
+                    log_throttled(
+                        logger,
+                        "llm_notify_failed",
+                        "notify_auth",
+                        phase=phase,
+                        model=model,
+                        error=redact_secrets(str(notify_err))[:200],
+                    )
                 self._advance_phase(models)
                 transient_retries = 0
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
+            except LLMNoAnswer as e:
+                # Бюджет пішов у thinking — повторюємо той самий запит, бо
+                # це не дефект ключа/моделі, а тимчасова нестача бюджету.
+                transient_retries += 1
+                errors.append(str(e))
+                if transient_retries < MAX_TRANSIENT_RETRIES:
+                    wait = transient_backoff[min(transient_retries, len(transient_backoff) - 1)]
+                    logger.warning(
+                        "llm_no_answer_retry",
+                        phase=phase,
+                        key_idx=self._key_idx,
+                        model=model,
+                        attempt=transient_retries,
+                        wait_s=wait,
+                        detail=str(e)[:150],
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                logger.warning("llm_no_answer_give_up", phase=phase, model=model, attempts=MAX_TRANSIENT_RETRIES)
+                self._advance_phase(models)
+                transient_retries = 0
+                if self._is_back_to_start(start_key_idx, start_model_idx):
+                    checked_all = True
+
             except Exception as e:
                 error_type = type(e).__name__
-                error_msg = str(e) or f"[{error_type}] без повідомлення"
+                # httpx вбудує повний URL з `?key=...` у текст помилки, тому
+                # повідомлення спершу редагується — інакше ключ потрапляє
+                # в журнал і в таблицю system_events.
+                error_msg = redact_secrets(str(e)) or f"[{error_type}] без повідомлення"
                 # Витягуємо HTTP status code з повідомлення
                 status_code = ""
                 for code in ["500", "502", "503", "504", "503"]:
@@ -328,14 +487,21 @@ class LLMClient:
                     continue  # Повторюємо той самий запит
 
                 logger.error("gemini_error", phase=phase, key_idx=self._key_idx, model=model,
-                            error_msg=error_msg, error_type=error_type)
+                            error_msg=error_msg, error_type=error_type, service=self.service)
                 errors.append(error_msg)
                 # Критична помилка — відправити на пошту
                 try:
                     from harvester.core.notify import notify_llm_failure
                     await notify_llm_failure(phase, model, f"[{error_type}] {error_msg[:200]}", error_type=error_type, service=self.service)
-                except Exception:
-                    pass
+                except Exception as notify_err:  # noqa: BLE001
+                    log_throttled(
+                        logger,
+                        "llm_notify_failed",
+                        "notify_error",
+                        phase=phase,
+                        model=model,
+                        error=redact_secrets(str(notify_err))[:200],
+                    )
                 self._advance_phase(models)
                 transient_retries = 0
                 if self._is_back_to_start(start_key_idx, start_model_idx):
@@ -386,6 +552,10 @@ class LLMClient:
                         "generationConfig": {
                             "temperature": cfg.temperature,
                             "maxOutputTokens": cfg.max_tokens,
+                            # Structured-output режим: модель повертає валідний
+                            # JSON без markdown-обгорток. Перевірено на всіх
+                            # моделях конфігурації (gemini-3.x, gemma-4).
+                            "responseMimeType": "application/json",
                         },
                     },
                 )
@@ -406,18 +576,56 @@ class LLMClient:
             data = resp.json()
             try:
                 parts = data["candidates"][0]["content"]["parts"]
-                # Шукаємо частину без thought=True (фактична відповідь, а не роздуми)
-                text = ""
-                for part in parts:
-                    if not part.get("thought", False):
-                        text = part.get("text", "")
-                        break
-                if not text:
-                    text = parts[-1].get("text", "")
+                # Thinking-моделі (Gemma-4) повертають роздуми окремими parts з
+                # thought=True. Фінальна відповідь — лише не-thought parts, і
+                # вона може бути розбита на кілька частин, тому їх треба
+                # склеїти. Текст роздумів ніколи не є відповіддю: раніше він
+                # потрапляв у JSON-парсер, гарантовано ламав розбір і (за
+                # fail-open логікою) записував документ як pass.
+                text = "".join(
+                    part.get("text", "") for part in parts if not part.get("thought", False)
+                )
+                finish_reason = data["candidates"][0].get("finishReason", "")
             except (KeyError, IndexError, TypeError) as e:
-                raise LLMUnavailable(f"несподівана відповідь Gemini: {e}") from e
+                # Тут немає навіть структури відповіді — без сирого тіла
+                # причину (зміна API, помилка провайдера) не відстежити.
+                log_throttled(
+                    logger,
+                    "llm_unexpected_response_shape",
+                    f"shape:{model}",
+                    model=model,
+                    phase=phase,
+                    error=str(e)[:200],
+                    raw=str(data)[:RAW_LOG_LIMIT],
+                )
+                raise LLMUnavailable(
+                    f"несподівана відповідь Gemini ({model}): {e}"
+                ) from e
 
             usage = data.get("usageMetadata", {})
+            thought_tokens = usage.get("thoughtsTokenCount", 0) or 0
+
+            if not text.strip():
+                # Бюджет з'їдено роздумами або відповідь обрізано. Без
+                # структури parts видно лише «немає відповіді», а не те,
+                # що саме модель повернула і на що пішов бюджет.
+                log_throttled(
+                    logger,
+                    "llm_no_answer",
+                    f"noanswer:{model}:{finish_reason}",
+                    model=model,
+                    phase=phase,
+                    finish_reason=finish_reason,
+                    thought_tokens=thought_tokens,
+                    output_tokens=usage.get("candidatesTokenCount", 0),
+                    parts_total=len(parts),
+                    parts_with_thought=sum(1 for p in parts if p.get("thought", False)),
+                )
+                raise LLMNoAnswer(
+                    f"{model}: немає фінальної відповіді "
+                    f"(finishReason={finish_reason}, thinking={thought_tokens} токенів)"
+                )
+
             total_tokens = usage.get("totalTokenCount", 0)
             if total_tokens:
                 self._rate_limiter.record_tokens(model, total_tokens)
@@ -430,8 +638,17 @@ class LLMClient:
                 duration_ms=duration_ms,
                 chars=len(text),
                 tokens=total_tokens,
+                finish_reason=finish_reason,
             )
-            return LLMResponse(text=text, provider=phase, model=model, duration_ms=duration_ms)
+            return LLMResponse(
+                text=text,
+                provider=phase,
+                model=model,
+                duration_ms=duration_ms,
+                finish_reason=finish_reason,
+                thought_tokens=thought_tokens,
+                part_count=len(parts),
+            )
 
         raise GeminiRateLimited(f"429: перевищено кількість повторів для {model}")
 
@@ -472,9 +689,27 @@ class LLMClient:
                 )
             text = str(content or "")
         except (KeyError, IndexError, TypeError, ValueError) as e:
+            # Аналогічно Gemini: без сирої відповіді зміна формату
+            # OpenRouter-відповіді лишається невидимою.
+            log_throttled(
+                logger,
+                "openrouter_unexpected_response_shape",
+                "openrouter_shape",
+                error=str(e)[:200],
+                raw=str(data)[:RAW_LOG_LIMIT],
+            )
             raise LLMUnavailable(f"несподівана відповідь OpenRouter: {e}") from e
 
         if not text.strip():
+            log_throttled(
+                logger,
+                "openrouter_empty_response",
+                "openrouter_empty",
+                model=cfg.openrouter_model,
+                finish_reason=data.get("choices", [{}])[0].get("finish_reason", "")
+                if isinstance(data.get("choices"), list) and data.get("choices")
+                else "",
+            )
             raise LLMUnavailable("OpenRouter повернув порожню відповідь")
         duration_ms = int((time.monotonic() - started) * 1000)
         logger.info(
@@ -500,6 +735,16 @@ class GeminiQuotaExceeded(Exception):
 
 class GeminiAuthError(Exception):
     """Ключ не авторизований або відкликаний."""
+
+
+class LLMNoAnswer(Exception):
+    """Модель не віддала фінальної відповіді (бюджет пішов у thinking).
+
+    Thinking-моделі (Gemma-4) спочатку генерують роздуми як окремі parts.
+    Якщо ``maxOutputTokens`` вичерпано на роздуми, фінальної відповіді немає
+    взагалі. Такий випадок transient-ний: той самий запит варто повторити
+    (з більшим бюджетом або на іншій моделі), а не вважати результатом.
+    """
 
 
 class OpenRouterPaymentRequired(Exception):

@@ -379,11 +379,15 @@ def inject_id(sql: str, lid: int) -> str | None:
     Підходить для INSERT/UPSERT у таблиці, де `id` ще не задано. Інакше
     повертає None. У UPSERT-хвості явно заданий id використовується лише
     для нового рядка, а на конфлікті PostgreSQL зберігає наявний id.
+
+    Leading whitespace/newlines ігноруються: репозиторії пишуть багаторядковий
+    SQL, і без `.strip()` резервний діапазон id не підставлявся взагалі.
     """
-    m = _ID_INSERT_RE.match(sql)
+    stripped = sql.strip()
+    m = _ID_INSERT_RE.match(stripped)
     if not m:
         return None
-    head = sql[: m.start(1)].rstrip()
+    head = stripped[: m.start(1)].rstrip()
     table = m.group(1)
     if table.lower() not in ID_TABLES:
         return None

@@ -3,7 +3,8 @@
 import asyncio
 import time
 from collections import defaultdict
-from datetime import date
+from datetime import UTC, datetime
+from typing import ClassVar
 
 import structlog
 
@@ -21,6 +22,8 @@ class ModelRateLimiter:
       Gemini: 15 запитів/хв, 500 запитів/день
       Gemma:  30 запитів/хв, 14000 запитів/день, 16k токенів/хв
     """
+
+    _shared_instances: ClassVar[dict[tuple, "ModelRateLimiter"]] = {}
 
     def __init__(
         self,
@@ -40,8 +43,52 @@ class ModelRateLimiter:
         self._tokens: dict[str, list[tuple[float, int]]] = defaultdict(list)
         # Daily counters per model
         self._daily_counts: dict[str, int] = defaultdict(int)
-        self._daily_date: str = date.today().isoformat()
+        self._daily_date: str = datetime.now(UTC).date().isoformat()
+        # Кількість API-ключів, зареєстрованих для кожної фази. Квоти Gemini/
+        # Gemma діють per-key, тому спільний лімітер масштабується кількістю
+        # ключів, а не ділиться порівну між усіма ключами разом.
+        self._phase_keys: dict[str, int] = {}
         self._lock = asyncio.Lock()
+
+    def register_phase_keys(self, phase: str, keys_count: int) -> None:
+        """Вказати, скільки ключів обслуговує ця фаза (для розподілу квот).
+
+        Значення монотонне: якщо фазу обслуговують клієнти з різною кількістю
+        ключів (класифікатор, verifier, discipline), береться найбільший
+        набір — результат не залежить від порядку реєстрації.
+        """
+        self._phase_keys[phase] = max(self._phase_keys.get(phase, 1), max(1, int(keys_count or 1)))
+
+    def _scale(self, phase: str, limit: int) -> int:
+        if not limit:
+            return limit
+        return limit * self._phase_keys.get(phase, 1)
+
+    @classmethod
+    def shared(
+        cls,
+        gemini_rpm: int,
+        gemini_rpd: int,
+        gemma_rpm: int,
+        gemma_rpd: int,
+        gemma_tpm: int,
+    ) -> "ModelRateLimiter":
+        """Повернути один limiter на процес для однакового набору квот.
+
+        Один ключ може обслуговувати кілька worker-ів. Окремі екземпляри
+        limiter-а в кожному worker-і дозволяли сумарно перевищити RPD/RPM.
+        """
+        key = (gemini_rpm, gemini_rpd, gemma_rpm, gemma_rpd, gemma_tpm)
+        instance = cls._shared_instances.get(key)
+        if instance is None:
+            instance = cls(*key)
+            cls._shared_instances[key] = instance
+        return instance
+
+    @classmethod
+    def reset_shared(cls) -> None:
+        """Очистити registry (використовується тестами та повторною ініціалізацією)."""
+        cls._shared_instances.clear()
 
     async def acquire(self, model: str, phase: str) -> None:
         """Чекає дозволу на запит до моделі з урахуванням усіх лімітів."""
@@ -55,8 +102,8 @@ class ModelRateLimiter:
                 self._cleanup(model)
                 self._check_daily_reset()
 
-                # RPM — запитів за хвилину
-                rpm_limit = limits.get("rpm", 0)
+                # RPM — запитів за хвилину (per-key, масштабується на ключі)
+                rpm_limit = self._scale(phase, limits.get("rpm", 0))
                 if rpm_limit and len(self._requests[model]) >= rpm_limit:
                     wait_s = self._requests[model][0] + 60 - time.monotonic()
                     if wait_s > 0:
@@ -70,8 +117,8 @@ class ModelRateLimiter:
                     else:
                         wait_s = 0.0
 
-                # RPD — запитів за день
-                rpd_limit = limits.get("rpd", 0)
+                # RPD — запитів за день (per-key)
+                rpd_limit = self._scale(phase, limits.get("rpd", 0))
                 if not wait_s and rpd_limit and self._daily_counts[model] >= rpd_limit:
                     logger.warning(
                         "rate_limit_rpd",
@@ -82,8 +129,8 @@ class ModelRateLimiter:
                     # Кидаємо виключення щоб LLM міг перейти до іншої моделі
                     raise DailyLimitExhausted(f"{model}: денний ліміт {rpd_limit} вичерпано")
 
-                # TPM — токенів за хвилину (тільки Gemma)
-                tpm_limit = limits.get("tpm", 0)
+                # TPM — токенів за хвилину (per-key)
+                tpm_limit = self._scale(phase, limits.get("tpm", 0))
                 if not wait_s and tpm_limit:
                     total_tokens = sum(tk for _, tk in self._tokens[model])
                     if total_tokens >= tpm_limit:
@@ -123,7 +170,7 @@ class ModelRateLimiter:
 
     def _check_daily_reset(self) -> None:
         """Скидає денні лічильники при зміні дати."""
-        today = date.today().isoformat()
+        today = datetime.now(UTC).date().isoformat()
         if self._daily_date != today:
             self._daily_counts.clear()
             self._daily_date = today
@@ -138,9 +185,9 @@ class ModelRateLimiter:
         return {
             "model": model,
             "rpm": rpm,
-            "rpm_limit": limits.get("rpm", 0),
+            "rpm_limit": self._scale(phase, limits.get("rpm", 0)),
             "rpd": self._daily_counts[model],
-            "rpd_limit": limits.get("rpd", 0),
+            "rpd_limit": self._scale(phase, limits.get("rpd", 0)),
             "tpm": tpm,
-            "tpm_limit": limits.get("tpm", 0),
+            "tpm_limit": self._scale(phase, limits.get("tpm", 0)),
         }

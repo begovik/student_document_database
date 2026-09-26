@@ -53,6 +53,30 @@ class Scheduler:
             await self.tasks_repo.fail(task_id, lease_token)
             logger.warning("task_failed_permanently", task_id=task_id)
 
+    async def defer_task(
+        self,
+        task_id: int,
+        delay_s: int,
+        lease_token: str | None = None,
+        reset_attempts: bool = True,
+    ) -> bool:
+        """Повернути running-task у pending без витрати retry-бюджету.
+
+        Використовується для тимчасово недоступного LLM: помилка не є дефектом
+        документа і не повинна після кількох годин перетворити task у failed.
+        """
+        deferred = await self.tasks_repo.return_to_pending(
+            task_id,
+            delay_s=delay_s,
+            lease_token=lease_token,
+            reset_attempts=reset_attempts,
+        )
+        if not deferred:
+            logger.warning("task_defer_ignored_stale_lease", task_id=task_id)
+        else:
+            logger.debug("task_deferred", task_id=task_id, delay_s=delay_s)
+        return deferred
+
     async def recover_stale_tasks(self) -> int:
         count = await self.tasks_repo.recover_stale_tasks()
         if count > 0:
@@ -72,7 +96,25 @@ class Scheduler:
         )
         if task_id:
             logger.debug("task_scheduled", task_id=task_id, task_type=task_type, priority=priority)
+        else:
+            # UNIQUE(type, payload_hash) → така задача вже існує. Це штатно
+            # (idem-потентність), але раніше про None-повернення не було
+            # жодного сліду, тому неможливо було відрізнити «дубль» від
+            # «insert упав мовчки» (напр. БД недоступна).
+            logger.debug("task_schedule_deduped", task_type=task_type, priority=priority)
         return task_id
+
+    async def queue_depths(self) -> dict[str, dict[str, int]]:
+        """Глибини черг за типами задач (для heartbeat-діагностики).
+
+        Дозволяє бачити, який саме тип накопичується: без цього backlog
+        classify у 8 000 задач і здоровий конвеєр виглядали однаково.
+        """
+        try:
+            return await self.tasks_repo.count_by_type()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("queue_depths_failed", error=str(e)[:200])
+            return {}
 
     async def get_stats(self) -> dict:
         return await self.tasks_repo.count_by_status()
@@ -82,3 +124,10 @@ class Scheduler:
 
     async def pending_count(self, task_type: str) -> int:
         return await self.tasks_repo.count_pending_by_type(task_type)
+
+    async def wake_deferred_tasks(self, task_type: str, limit: int = 100) -> int:
+        """Bounded-прокидження відкладених задач конкретного типу."""
+        woken = await self.tasks_repo.wake_deferred(task_type, limit=limit)
+        if woken:
+            logger.info("deferred_tasks_woken", task_type=task_type, count=woken)
+        return woken

@@ -12,6 +12,7 @@ from typing import Any
 
 import structlog
 
+from harvester.classify.llm import log_raw_response
 from harvester.config import get_settings
 from harvester.net.client import get_http_client
 from harvester.verify.pdfparse import parse_pdf
@@ -419,16 +420,32 @@ async def call_llm_for_extraction(text: str, title: str) -> dict[str, Any] | Non
         start = raw.find("{")
         end = raw.rfind("}") + 1
         if start < 0 or end <= start:
-            logger.warning("llm_extraction_json_missing", provider=response.provider)
+            # Логуємо сиру відповідь: без неї «немає JSON» не відрізняє
+            # обрізаний вивід, текст помилки та thinking-бюджет.
+            log_raw_response(logger, "llm_extraction_json_missing", response, title=title[:60])
             return None
-        result = json.loads(raw[start:end])
+        try:
+            result = json.loads(raw[start:end])
+        except json.JSONDecodeError as e:
+            log_raw_response(
+                logger, "llm_extraction_json_error", response, title=title[:60], detail=str(e)[:120]
+            )
+            return None
         if not isinstance(result, dict):
+            # JSON, але не об'єкт (масив/рядок) — теж непарсable результат.
+            log_raw_response(
+                logger,
+                "llm_extraction_not_dict",
+                response,
+                title=title[:60],
+                got_type=type(result).__name__,
+            )
             return None
         return result
     except LLMUnavailable as e:
         logger.warning("llm_extraction_unavailable", error=str(e)[:300])
     except (json.JSONDecodeError, TypeError, ValueError) as e:
-        logger.warning("llm_extraction_json_error", error=str(e)[:300])
+        logger.warning("llm_extraction_json_error", error=str(e)[:300], error_type=type(e).__name__)
     except Exception as e:  # noqa: BLE001
         logger.error("llm_extraction_error", error=str(e)[:300])
     return None

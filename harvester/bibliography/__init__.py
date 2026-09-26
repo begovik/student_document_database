@@ -315,7 +315,16 @@ def is_russian_entry(entry: BibliographyEntry) -> tuple[bool, str | None]:
             domain = f"{ext.domain}.{ext.suffix}".lower() if ext.domain and ext.suffix else entry.url.lower()
             if suffix in RUSSIAN_TLDS or domain.endswith((".ru", ".su")) or ".рф" in entry.url.lower():
                 return True, f"російський домен TLD {suffix or domain}"
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # tldextract падає на екзотичних URL; fallback-рядкове пошукання
+            # TLD — надійніше, але його збій не можна пропускати мовчки:
+            # інакше російське джерело проходить у пул.
+            logger.debug(
+                "is_russian_source_tld_fallback",
+                url=entry.url[:150],
+                error=str(e)[:100],
+                error_type=type(e).__name__,
+            )
             if any(tld in entry.url.lower() for tld in RUSSIAN_TLDS):
                 return True, "російський домен у URL"
 

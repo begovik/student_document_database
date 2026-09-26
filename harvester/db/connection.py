@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -8,6 +9,10 @@ from typing import Any
 import structlog
 
 logger = structlog.get_logger()
+
+# Транзакція, що тримає write-lock довше за цей час, конкурує з рештою
+# воркерів за той самий локальний файл-зеркало.
+SLOW_TX_MS = 2000
 
 
 class Database:
@@ -128,7 +133,19 @@ class SqliteDatabase(Database):
         if not read_only:
             pragmas.insert(0, "PRAGMA journal_mode=WAL")
         for pragma in pragmas:
-            conn.execute(pragma)
+            try:
+                conn.execute(pragma)
+            except sqlite3.Error as e:
+                # PRAGMA не критична сама по собі, але її падіння змінює
+                # семантику (journal_mode=WAL чинить блокування, foreign_keys
+                # — цілісність). Тому не ковтаємо мовчки.
+                logger.warning(
+                    "sqlite_pragma_failed",
+                    pragma=pragma,
+                    error=str(e)[:150],
+                    error_type=type(e).__name__,
+                    read_only=read_only,
+                )
 
     async def execute(self, sql: str, params: tuple | None = None) -> sqlite3.Cursor:
         async with self._write_context() as conn:
@@ -235,15 +252,29 @@ class SqliteDatabase(Database):
 
         await self._write_lock.acquire()
         self._transaction_owner = asyncio.current_task()
+        started = time.monotonic()
         try:
             self._execute_sync(self._conn, "BEGIN IMMEDIATE")
             try:
                 yield self._conn
             except BaseException:
-                self._execute_sync(self._conn, "ROLLBACK")
+                # Помилка ROLLBACK означає, що локальне дзеркало може лишитись
+                # у неконсистентному стані — без логу це непомітно.
+                try:
+                    self._execute_sync(self._conn, "ROLLBACK")
+                except Exception as rb_err:  # noqa: BLE001
+                    logger.error(
+                        "sqlite_rollback_failed",
+                        error=str(rb_err),
+                        error_type=type(rb_err).__name__,
+                    )
+                    raise
                 raise
             else:
                 self._execute_sync(self._conn, "COMMIT")
+                held_ms = int((time.monotonic() - started) * 1000)
+                if held_ms >= SLOW_TX_MS:
+                    logger.warning("sqlite_slow_transaction", duration_ms=held_ms)
         finally:
             self._transaction_owner = None
             self._write_lock.release()

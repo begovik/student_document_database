@@ -15,6 +15,10 @@ logger = structlog.get_logger()
 MAX_BACKENDS_PER_QUERY = 3
 
 
+class DDGSSearchError(RuntimeError):
+    """Помилка всіх backend-ів пошуку, яку не можна вважати порожнім результатом."""
+
+
 class DDGSSearchChannel:
     name = "ddgs"
 
@@ -43,11 +47,15 @@ class DDGSSearchChannel:
 
         if not query_text:
             logger.warning("ddgs_no_query_text", task=task)
-            return
+            raise ValueError("DDGS search task must contain query_text")
+
+        if not self.backends:
+            raise DDGSSearchError("DDGS не налаштовано жодного backend-а")
 
         results: list[dict] = []
         backends_tried: list[str] = []
         rate_limited = False
+        errors: list[str] = []
 
         for _ in range(min(MAX_BACKENDS_PER_QUERY, len(self.backends))):
             backend = self._get_next_backend()
@@ -59,15 +67,31 @@ class DDGSSearchChannel:
                 if results:
                     break
                 logger.debug("ddgs_empty", query=query_text, backend=backend)
-            except RatelimitException:
+            except RatelimitException as e:
                 rate_limited = True
-                logger.warning("ddgs_ratelimit", query=query_text, backend=backend)
+                errors.append(f"{backend}: rate limit ({e})")
+                logger.warning("ddgs_ratelimit", query=query_text, backend=backend, error=str(e))
                 continue
             except TimeoutException as e:
+                errors.append(f"{backend}: timeout ({e})")
                 logger.warning("ddgs_timeout", query=query_text, backend=backend, error=str(e))
                 continue
             except DDGSException as e:
+                errors.append(f"{backend}: {e}")
                 logger.warning("ddgs_backend_error", query=query_text, backend=backend, error=str(e))
+                continue
+            except Exception as e:  # noqa: BLE001
+                # Не-DDGSException (напр. зміна бібліотеки, проблема з
+                # DNS/проксі) інакше виривав би з discover() поза обробкою
+                # і виглядав би як збій воркера, а не помилка backend-а.
+                errors.append(f"{backend}: неочікувана помилка {type(e).__name__}: {e}")
+                logger.warning(
+                    "ddgs_backend_unexpected_error",
+                    query=query_text,
+                    backend=backend,
+                    error=str(e)[:200],
+                    error_type=type(e).__name__,
+                )
                 continue
 
         logger.info(
@@ -76,24 +100,46 @@ class DDGSSearchChannel:
             results=len(results),
             backends=backends_tried,
             rate_limited=rate_limited,
+            errors=len(errors),
         )
 
-        if rate_limited and not results:
-            await asyncio.sleep(60)
+        # Порожній результат після помилок/rate-limit не є валідним «успіхом»:
+        # інакше search query отримує cooldown, а worker завершує task без retry.
+        if not results and (errors or rate_limited):
+            detail = "; ".join(errors) or "усі backend-и rate-limited"
+            raise DDGSSearchError(
+                f"DDGS не отримав результатів для запиту ({'; '.join(backends_tried)}): {detail}"
+            )
+
+        yielded = 0
+        dropped_invalid = 0
+        dropped_blocked: dict[str, int] = {}
 
         for result in results:
             href = result.get("href")
             if not href or not validate_url_format(href):
+                # Раніше `continue` без логу: движок пошуку повертає рекламні
+                # та технічні URL, тому незрозуміло було, чому з 30 «результатів»
+                # реєструється 3 документи.
+                dropped_invalid += 1
+                logger.debug(
+                    "ddgs_result_invalid",
+                    query=query_text,
+                    href=str(href)[:150],
+                    reason="empty" if not href else "bad_format",
+                )
                 continue
 
             allowed, reason = await is_url_allowed(href)
             if not allowed:
-                logger.debug("ddgs_url_blocked", url=href, reason=reason)
+                dropped_blocked[reason or "unknown"] = dropped_blocked.get(reason or "unknown", 0) + 1
+                logger.debug("ddgs_url_blocked", url=href[:150], reason=reason, query=query_text)
                 continue
 
             title = result.get("title")
             body = result.get("body")
 
+            yielded += 1
             yield Candidate(
                 url=href,
                 title_hint=title,
@@ -101,6 +147,17 @@ class DDGSSearchChannel:
                 query_text=query_text,
                 ref_url=href,
                 extra={"body": body, "backends": backends_tried},
+            )
+
+        # Підсумок фільтрації: без нього втрата кандидатів невидима.
+        if dropped_invalid or dropped_blocked:
+            logger.info(
+                "ddgs_results_filtered",
+                query=query_text[:100],
+                results=len(results),
+                yielded=yielded,
+                dropped_invalid=dropped_invalid,
+                dropped_blocked=dropped_blocked,
             )
 
     def _search_sync(

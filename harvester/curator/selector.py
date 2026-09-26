@@ -8,6 +8,7 @@ from typing import Any
 import structlog
 
 from harvester.config import FilterRules, get_filter_rules, get_settings
+from harvester.classify.llm import log_raw_response
 from harvester.curator.prompts import (
     CANDIDATE_LINE,
     PROMPT_SELECT_END,
@@ -80,10 +81,29 @@ async def call_llm_for_selection(
         response = await client.complete(prompt)
         result = parse_selection_response(response.text)
         if result is None:
-            logger.warning("selection_invalid_response", topic=topic, provider=response.provider)
+            # Без сирої відповіді «не вдалося розібрати» не відрізняє
+            # обрізаний вивід від помилки формату — логуємо з діагностикою
+            # відповіді (finish_reason, thinking-бюджет, початок тексту).
+            log_raw_response(
+                logger,
+                "selection_invalid_response",
+                response,
+                topic=topic,
+                candidates=len(candidates),
+            )
             return None
         valid_ids = {int(c["id"]) for c in candidates if c.get("id") is not None}
+        before = len(result.selected_ids)
         result.selected_ids = [doc_id for doc_id in result.selected_ids if doc_id in valid_ids]
+        if before != len(result.selected_ids):
+            # LLM вигадала неіснуючі id — раніше це губилося без слідів і
+            # виглядало як «LLM обрала мало».
+            logger.info(
+                "selection_ids_filtered",
+                topic=topic,
+                hallucinated=before - len(result.selected_ids),
+                kept=len(result.selected_ids),
+            )
         result = enforce_min_count(result, candidates, min_count)
         result.topic = topic
         result.candidates_count = len(candidates)
@@ -98,7 +118,12 @@ async def call_llm_for_selection(
     except LLMUnavailable as e:
         logger.warning("selection_llm_unavailable", topic=topic, error=str(e)[:300])
     except Exception as e:  # noqa: BLE001
-        logger.error("selection_unexpected_error", topic=topic, error_msg=str(e)[:200])
+        logger.exception(
+            "selection_unexpected_error",
+            topic=topic,
+            error_msg=str(e)[:200],
+            error_type=type(e).__name__,
+        )
     return None
 
 

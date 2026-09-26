@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 
-from harvester.classify.llm import AllLimitsExhausted, LLMClient
+from harvester.classify.llm import AllLimitsExhausted, LLMClient, log_raw_response
 from harvester.config import Settings, get_settings
 from harvester.db.connection import Database
 from harvester.db.failover import build_database
@@ -179,6 +179,7 @@ class DisciplineAssigner:
                         continue
 
                     log.info("discipline_assign_batch_start", count=len(rows))
+                    stats = {"processed": 0, "assigned": 0, "no_disciplines": 0, "errors": 0}
 
                     for r in rows:
                         doc = dict(r)
@@ -199,13 +200,49 @@ class DisciplineAssigner:
                             self.llm._gemma_limit_exhausted.clear()
                             self.llm._initialized = False
                             break  # перервати батч, дочекатись сну, почати заново
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:  # noqa: BLE001
+                            # Ізоляція документа: раніше одна помилка розбору
+                            # JSON (або збій запису) обривала весь батч —
+                            # решту документів не обробляли до наступного
+                            # циклу, і в логах лишався один рядок без doc_id.
+                            stats["errors"] += 1
+                            log_doc.exception(
+                                "discipline_assign_error",
+                                error=str(e)[:200],
+                                error_type=type(e).__name__,
+                            )
+                            continue
 
-                        await self._save_result(db, doc_id, picked, confidence, code_to_id, cfg.model)
+                        try:
+                            await self._save_result(
+                                db, doc_id, picked, confidence, code_to_id, cfg.model
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            # Без discipline_checked_at документ наступного
+                            # разу потрапить у той самий батч — без логу
+                            # це виглядає як «воркер працює, а толку немає».
+                            stats["errors"] += 1
+                            log_doc.exception(
+                                "discipline_assign_save_failed",
+                                error=str(e)[:200],
+                                error_type=type(e).__name__,
+                            )
+                            continue
+
+                        stats["processed"] += 1
+                        if picked:
+                            stats["assigned"] += 1
+                        else:
+                            stats["no_disciplines"] += 1
                         log_doc.info(
                             "discipline_assign_done",
                             disciplines=picked,
                             confidence=round(confidence, 3),
                         )
+
+                    log.info("discipline_assign_batch_done", **stats)
 
                     await asyncio.sleep(interval_s)
 
@@ -216,7 +253,10 @@ class DisciplineAssigner:
                     await asyncio.sleep(10)
         finally:
             if owns_db:
-                await db.close()
+                try:
+                    await db.close()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("discipline_assign_db_close_failed", error=str(e)[:200])
             log.info("discipline_assign_worker_stopped")
 
     async def _assign(self, doc: dict, disciplines_list: str) -> tuple[list[str], float]:
@@ -237,7 +277,25 @@ class DisciplineAssigner:
         )
 
         resp = await self.llm.complete(prompt)
-        data = _extract_json(resp.text.strip())
+        try:
+            data = _extract_json(resp.text.strip())
+        except (json.JSONDecodeError, ValueError) as e:
+            # Сиру відповідь логуємо обов'язково: JSONDecodeError сам по
+            # собі не відрізняє обрізаний вивід, thinking-бюджет і
+            # HTML-помилку. Саме через відсутність цієї відповіді дефект
+            # thinking-моделі був невидимим.
+            log_raw_response(
+                logger, "discipline_assign_no_json", resp, doc_id=doc.get("id")
+            )
+            raise
+        if not isinstance(data, dict):
+            logger.warning(
+                "discipline_assign_not_dict",
+                doc_id=doc.get("id"),
+                model=resp.model,
+                got_type=type(data).__name__,
+            )
+            data = {}
 
         codes = [
             str(c).strip()
@@ -247,10 +305,26 @@ class DisciplineAssigner:
         try:
             confidence = float(data.get("confidence") or 0.0)
         except (TypeError, ValueError):
+            # Мовчазне зменшення confidence до 0 робить результат «порожнім»,
+            # тобто модель фактично втратила дисципліни — це видно лише
+            # у лічильнику тем, а не в логах.
+            logger.warning(
+                "discipline_assign_confidence_invalid",
+                doc_id=doc.get("id"),
+                value=repr(data.get("confidence"))[:80],
+            )
             confidence = 0.0
         confidence = max(0.0, min(1.0, confidence))
 
         if confidence < cfg.min_confidence:
+            if codes:
+                logger.info(
+                    "discipline_assign_below_threshold",
+                    doc_id=doc.get("id"),
+                    confidence=confidence,
+                    min_confidence=cfg.min_confidence,
+                    dropped=len(codes),
+                )
             codes = []
 
         logger.info(

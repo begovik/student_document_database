@@ -107,14 +107,34 @@ async def is_domain_blocked(url: str) -> bool:
 
 
 async def is_url_allowed(url: str) -> tuple[bool, str | None]:
+    """Перевірити URL: формат, чорний список доменів, SSRF.
+
+    Кожна відмова логується на debug: раніше викликачі бачили лише
+    `False` без причини, тому незрозуміло було, скільки кандидатів
+    відпало на форматі, скільки — на чорному списку, а скільки —
+    через DNS/SSRF-перевірку.
+    """
     try:
         parsed = urlparse(url)
-    except ValueError:
+    except ValueError as e:
+        logger.debug("url_allowed_rejected", url=url[:150], reason="invalid_url", detail=str(e)[:100])
         return False, "invalid_url"
 
     if parsed.scheme.lower() not in ("http", "https"):
+        logger.debug(
+            "url_allowed_rejected",
+            url=url[:150],
+            reason="invalid_scheme",
+            scheme=parsed.scheme[:20],
+        )
         return False, "invalid_scheme"
     if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        logger.debug(
+            "url_allowed_rejected",
+            url=url[:150],
+            reason="invalid_host",
+            has_host=bool(parsed.hostname),
+        )
         return False, "invalid_host"
 
     from harvester.net.blacklist import BlacklistService
@@ -122,8 +142,10 @@ async def is_url_allowed(url: str) -> tuple[bool, str | None]:
     blacklist = BlacklistService.get()
     host = parsed.hostname
     if await blacklist.is_blocked_host(host):
+        logger.debug("url_allowed_rejected", url=url[:150], reason="domain_blocked", host=host[:100])
         return False, "domain_blocked"
     if await blacklist.is_blocked_url(url):
+        logger.debug("url_allowed_rejected", url=url[:150], reason="url_blocked", host=host[:100])
         return False, "url_blocked"
 
     if not await check_ssrf(url):
@@ -136,5 +158,13 @@ def validate_url_format(url: str) -> bool:
     try:
         result = urlparse(url)
         return all([result.scheme, result.netloc])
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        # Раніше жодного сліду: urlparse рідко кидає, але коли кидає —
+        # результат у DDGS-кандидатів просто відсікався.
+        logger.debug(
+            "url_format_invalid",
+            url=url[:150],
+            error=str(e)[:100],
+            error_type=type(e).__name__,
+        )
         return False

@@ -792,20 +792,37 @@ class FailoverDatabase(Database):
         return 0
 
     async def close(self) -> None:
-        if self._mirror_task is not None:
-            self._mirror_task.cancel()
+        # Кількість невідтворених outbox-операцій критична: close() може
+        # викликатися під час падіння БД, і мовчки забутий outbox означає
+        # втрату даних без жодного сліду.
+        outbox_pending = 0
+        try:
+            outbox_pending = await self.pending_outbox_count()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("outbox_count_before_close_failed", error=str(e)[:200])
+
+        for name, task in (
+            ("mirror", self._mirror_task),
+            ("restore", self._restore_task),
+        ):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._mirror_task
-            except (asyncio.CancelledError, Exception):
+                await task
+            except asyncio.CancelledError:
                 pass
-            self._mirror_task = None
-        if self._restore_task is not None:
-            self._restore_task.cancel()
-            try:
-                await self._restore_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._restore_task = None
+            except Exception as e:  # noqa: BLE001
+                # Фонова задача впала під час зупинки — раніше це
+                # ковталося, і невідомо, чи встигла вона досилити outbox.
+                logger.warning(
+                    "failover_background_task_error_on_close",
+                    task=name,
+                    error=str(e)[:200],
+                    error_type=type(e).__name__,
+                )
+        self._mirror_task = None
+        self._restore_task = None
         if self.remote is not None:
             try:
                 await self.remote.close()
@@ -819,7 +836,11 @@ class FailoverDatabase(Database):
                 logger.warning("error_closing_local", error=str(e))
             self.local = None
         self._is_initialized = False
-        logger.info("failover_db_closed", mode=self._mode)
+        logger.info(
+            "failover_db_closed",
+            mode=self._mode,
+            outbox_pending=outbox_pending,
+        )
 
 
 def build_database(settings=None) -> FailoverDatabase:

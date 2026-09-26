@@ -13,6 +13,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import structlog
+
+logger = structlog.get_logger()
+
 # Події, що вважаються "успішним LLM-викликом"
 OK_EVENTS = {"llm_gemma_ok", "verifier_llm_ok"}
 # Подія класифікації документа (окремо, бо не є викликом сам по собі)
@@ -172,15 +176,32 @@ def build_llm_report(log_dir: str | Path = "logs", days: int = 7,
 
     log_dir = Path(log_dir)
     files = sorted(log_dir.glob(f"{log_prefix}*"))
+    unreadable: list[str] = []
     for path in files:
         if path.is_dir():
             continue
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 lines = fh.readlines()
-        except OSError:
+        except OSError as e:
+            # Непрочитаний лог = неповний звіт: показники за нього будуть
+            # занижені без жодного попередження.
+            unreadable.append(path.name)
+            logger.warning(
+                "llm_report_log_unreadable",
+                file=path.name,
+                error=str(e)[:150],
+                error_type=type(e).__name__,
+            )
             continue
         _parse_log_lines(lines, stats_by_day, present_days)
+
+    if unreadable:
+        logger.warning(
+            "llm_report_incomplete",
+            files_found=len([f for f in files if not f.is_dir()]),
+            files_unreadable=len(unreadable),
+        )
 
     by_day = {d: stats_by_day[d].as_dict() for d in days_range}
     model_totals: dict[str, LLMModelStats] = defaultdict(LLMModelStats)

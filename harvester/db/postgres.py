@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,9 @@ logger = structlog.get_logger()
 
 PG_SCHEMA_PATH = Path(__file__).parent / "pg_schema.sql"
 PG_MIGRATIONS_DIR = Path(__file__).parent / "pg_migrations"
+
+# Поріг, з якого запит вважається повільним і потребує уваги (мс).
+SLOW_QUERY_MS = 2000
 
 
 class PGResult:
@@ -121,8 +125,14 @@ class PostgresDatabase(Database):
             if conn is not None:
                 try:
                     await conn.close()
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # Проба не вдалася — закриття теж. Витік з'єднання
+                    # накопичується при кожній невдалій пробі restore-циклу.
+                    logger.warning(
+                        "pg_probe_close_failed",
+                        error=str(e)[:150],
+                        error_type=type(e).__name__,
+                    )
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -161,6 +171,16 @@ class PostgresDatabase(Database):
                 try:
                     version = int(mf.stem.split("_")[0])
                 except (ValueError, IndexError):
+                    # Міграція з некоректною назвою буде пропущена
+                    # НАЗАВЖДИ, без зміни схеми й без помилки. Найнебезпечніша
+                    # мовчазна втрата: схема й код розходять, симптом —
+                    # незрозумілі помилки колонок у роботі.
+                    logger.error(
+                        "pg_migration_bad_filename",
+                        file=mf.name,
+                        expected="<version>_<name>.sql",
+                        impact="міграція буде пропущена",
+                    )
                     continue
                 if version > current:
                     sql = mf.read_text(encoding="utf-8")
@@ -173,17 +193,54 @@ class PostgresDatabase(Database):
                     logger.info("pg_migration_applied", file=mf.name, version=version)
 
     async def probe(self, timeout_s: float | None = None) -> bool:
+        """Перевірити живість пулу. Помилка НЕ мовчить: health-check, який
+        повертає False без причини, не відрізняє недоступність БД від
+        таймауту пулу."""
         if self._pool is None:
+            logger.warning("pg_probe_no_pool")
             return False
+        started = time.monotonic()
         try:
             async with self._pool.acquire() as conn:
                 await asyncio.wait_for(conn.fetchval("SELECT 1"), timeout=timeout_s or 5)
             return True
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "pg_probe_failed",
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+                timeout_s=timeout_s or 5,
+            )
             return False
+        finally:
+            waited = round((time.monotonic() - started) * 1000)
+            if waited > 1000:
+                # Повільний пул означає, що зʼєднання вичерпуються або
+                # запити конкурують за них — це видно лише за часом.
+                logger.warning("pg_probe_slow", duration_ms=waited)
 
     def _conn_or_pool(self):
         return self._tx_conn_var.get() or self._pool
+
+    async def _timed(self, sql: str, op_name: str, coro):
+        """Виконати запит із фіксацією повільних викликів.
+
+        `command_timeout=60` обриває запит, але без логування не видно,
+        *які* саме запити регулярно впираються в час — зазвичай це
+        неіндексовані вибірки селектора verifier-а чи дзеркала.
+        """
+        started = time.monotonic()
+        try:
+            return await coro
+        finally:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            if duration_ms >= SLOW_QUERY_MS:
+                logger.warning(
+                    "pg_slow_query",
+                    op=op_name,
+                    duration_ms=duration_ms,
+                    sql=sql[:200].replace("\n", " "),
+                )
 
     async def execute(self, sql: str, params: tuple | None = None) -> PGResult:
         if self._pool is None:
@@ -193,9 +250,9 @@ class PostgresDatabase(Database):
         target = self._conn_or_pool()
 
         if mode == "rows":
-            rows = await target.fetch(pg_sql, *params)
+            rows = await self._timed(pg_sql, "fetch", target.fetch(pg_sql, *params))
             return PGResult(rows=rows)
-        status = await target.execute(pg_sql, *params)
+        status = await self._timed(pg_sql, "execute", target.execute(pg_sql, *params))
         return PGResult(rowcount=crowcount_from_status(status))
 
     async def executemany(self, sql: str, params: list[tuple]) -> None:
@@ -219,7 +276,7 @@ class PostgresDatabase(Database):
         pg_sql, _ = prepare(sql)
         params = self._sanitize_params(params) or []
         target = self._conn_or_pool()
-        return await target.fetchrow(pg_sql, *params)
+        return await self._timed(pg_sql, "fetchone", target.fetchrow(pg_sql, *params))
 
     async def fetchall(self, sql: str, params: tuple | None = None) -> list[Any]:
         if self._pool is None:
@@ -227,7 +284,7 @@ class PostgresDatabase(Database):
         pg_sql, _ = prepare(sql)
         params = self._sanitize_params(params) or []
         target = self._conn_or_pool()
-        return await target.fetch(pg_sql, *params)
+        return await self._timed(pg_sql, "fetchall", target.fetch(pg_sql, *params))
 
     async def insert(self, sql: str, params: tuple | None = None) -> int | None:
         result = await self.execute(sql, params)
@@ -272,7 +329,14 @@ class PostgresDatabase(Database):
                 "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
             )
             return int(v) if v is not None else 0
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            # Помилка тут нешкідлива для запису, але критична для міграцій:
+            # version=0 змусить apply_schema накласти початкову схему ще раз.
+            logger.error(
+                "pg_version_read_failed",
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+            )
             return 0
 
     async def close(self) -> None:

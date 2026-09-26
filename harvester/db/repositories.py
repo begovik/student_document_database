@@ -1,7 +1,7 @@
 import hashlib
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -9,6 +9,11 @@ import structlog
 from harvester.db.connection import Database
 
 logger = structlog.get_logger()
+
+
+def utc_now_iso() -> str:
+    """Naive UTC timestamp у форматі, який очікує схема (naive ISO)."""
+    return datetime.now(UTC).replace(tzinfo=None).isoformat()
 
 
 class DocumentsRepository:
@@ -95,7 +100,20 @@ class DocumentsRepository:
 
         cursor = await self.db.execute(sql, params)
         if cursor.rowcount == 0:
+            # NULL = дублікат за canonical_url/doi. Це найчастіший
+            # результат discovery, і раніше він не лишав жодного сліду:
+            # не було видно, скільки знайденого перетворюється на
+            # «вже є в БД» і де саме зосереджений дублювання.
+            logger.debug(
+                "document_insert_deduped",
+                canonical_url=canonical_url[:200],
+                doi=doi,
+            )
             return None
+        if cursor.lastrowid is None:
+            logger.warning(
+                "document_insert_without_id", canonical_url=canonical_url[:200], doi=doi
+            )
         return cursor.lastrowid
 
     async def update_verified(
@@ -166,8 +184,23 @@ class DocumentsRepository:
                     parsed = json.loads(existing["extra"])
                     if isinstance(parsed, dict):
                         merged_extra.update(parsed)
-                except (TypeError, json.JSONDecodeError):
-                    pass
+                    else:
+                        logger.warning(
+                            "document_extra_not_dict",
+                            document_id=doc_id,
+                            got_type=type(parsed).__name__,
+                        )
+                except (TypeError, json.JSONDecodeError) as e:
+                    # Старий extra буде ПЕРЕЗАПИСАНИЙ новим: усі раніше
+                    # збережені ключі (bibliography_found, джерела тощо)
+                    # зникають без жодного сліду.
+                    logger.warning(
+                        "document_extra_parse_failed",
+                        document_id=doc_id,
+                        raw=str(existing["extra"])[:100],
+                        error=str(e)[:120],
+                        impact="попередні ключі extra буде втрачено",
+                    )
             merged_extra.update(extra)
             params = params[:-2] + (json.dumps(merged_extra, ensure_ascii=False), doc_id)
         await self.db.execute(sql, params)
@@ -198,6 +231,51 @@ class DocumentsRepository:
             "SELECT status, COUNT(*) as count FROM documents GROUP BY status"
         )
         return {row["status"]: row["count"] for row in rows}
+
+    async def recover_stuck_verifying(self, limit: int = 50) -> list[int]:
+        """Повернути bounded-порцію документів, застряглих у 'verifying'.
+
+        Документ лишається у 'verifying', якщо процес зупинився під час
+        перевірки. Після повернення lease-ів stale-задачі, але сам документ
+        більше не має probe-задачі, тому його треба повернути в чергу.
+        Idempotent: якщо для документа вже є активна/pending probe-задача,
+        рядок не змінюється.
+        """
+        rows = await self.db.fetchall(
+            """
+            SELECT d.id
+            FROM documents d
+            WHERE d.status = 'verifying'
+              AND NOT EXISTS (
+                  SELECT 1 FROM tasks t
+                  WHERE t.type = 'probe'
+                    AND t.status IN ('pending', 'running')
+                    AND (
+                        t.payload LIKE '%"document_id": ' || CAST(d.id AS TEXT) || '%'
+                        OR t.payload LIKE '%"document_id":' || CAST(d.id AS TEXT) || '%'
+                    )
+              )
+            ORDER BY d.id
+            LIMIT ?
+            """,
+            (max(int(limit), 1),),
+        )
+        ids = [int(r["id"]) for r in rows]
+        restored = 0
+        for doc_id in ids:
+            cursor = await self.db.execute(
+                "UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'verifying'",
+                (doc_id,),
+            )
+            if getattr(cursor, "rowcount", 0) > 0:
+                restored += 1
+            else:
+                # Статус змінили між SELECT та UPDATE (воркер встиг
+                # завершити) — не дефект, але раніше не відрізнялося від
+                # реально відновлених, тому кількість завжди була невірною.
+                logger.debug("recover_stuck_verifying_race", document_id=doc_id)
+        logger.info("recover_stuck_verifying_done", found=len(ids), restored=restored)
+        return ids
 
     async def count_by_language(self) -> dict[str, int]:
         rows = await self.db.fetchall(
@@ -286,14 +364,44 @@ class TasksRepository:
         ON CONFLICT (type, payload_hash) DO UPDATE SET
             status = 'pending',
             attempts = 0,
+            priority = excluded.priority,
+            max_attempts = excluded.max_attempts,
             run_after = excluded.run_after,
             updated_at = excluded.updated_at,
             lease_expires_at = NULL,
             lease_token = NULL
-        WHERE tasks.status = 'done'
+        WHERE tasks.status IN ('done', 'failed')
         """
-        cursor = await self.db.execute(sql, (task_type, payload_json, payload_hash, priority, max_attempts, run_after, now, now))
-        return cursor.lastrowid if cursor.lastrowid else None
+        cursor = await self.db.execute(
+            sql,
+            (task_type, payload_json, payload_hash, priority, max_attempts, run_after, now, now),
+        )
+        # SQLite lastrowid після upsert-конфлікту не гарантовано: наприклад,
+        # після no-op конфлікту він може залишити значення попереднього INSERT.
+        # Читаємо id за унікальним ключем лише коли upsert справді оновив рядок.
+        if getattr(cursor, "rowcount", 0) <= 0:
+            # No-op конфлікту: задача з таким payload уже у pending/running.
+            # Це штатна ідемпотентність, але раніше None повертався без
+            # сліду — не було видно, чи це дубль, чи збій запису.
+            logger.debug(
+                "task_insert_deduped", task_type=task_type, payload_hash=payload_hash[:12]
+            )
+            return None
+        row = await self.db.fetchone(
+            "SELECT id FROM tasks WHERE type = ? AND payload_hash = ?",
+            (task_type, payload_hash),
+        )
+        if row is None:
+            # Upsert відбувся, але рядок не читається — означає, що
+            # підміна діалайту/транзакції дала неочікуваний результат.
+            # Тримаємо lastrowid, але фіксуємо аномалію.
+            logger.warning(
+                "task_insert_id_read_failed",
+                task_type=task_type,
+                payload_hash=payload_hash[:12],
+                lastrowid=getattr(cursor, "lastrowid", None),
+            )
+        return int(row["id"]) if row else cursor.lastrowid
 
     async def pick_next(
         self, lease_duration_s: int = 300, task_types: list[str] | None = None
@@ -331,7 +439,12 @@ class TasksRepository:
             (lease_expires, lease_token, now, task["id"]),
         )
         if cursor.rowcount == 0:
+            # Інший воркер випередив нас між SELECT і UPDATE. Це нормальна
+            # гонка, але без журналу незрозуміло, чому черга «порожніла»
+            # попри наявність pending-задач.
+            logger.debug("task_pick_lost_race", task_id=task.get("id"), task_type=task.get("type"))
             return None
+        task["attempts"] = int(task.get("attempts", 0)) + 1
         task["lease_token"] = lease_token
         return task
 
@@ -378,7 +491,11 @@ class TasksRepository:
         return cursor.rowcount > 0
 
     async def return_to_pending(
-        self, task_id: int, delay_s: int = 0, lease_token: str | None = None
+        self,
+        task_id: int,
+        delay_s: int = 0,
+        lease_token: str | None = None,
+        reset_attempts: bool = False,
     ) -> bool:
         now = datetime.utcnow().isoformat()
         run_after = (datetime.utcnow() + timedelta(seconds=delay_s)).isoformat()
@@ -387,8 +504,10 @@ class TasksRepository:
         if lease_token is not None:
             where += " AND lease_token = ?"
             params.append(lease_token)
+        attempts_sql = ", attempts = 0" if reset_attempts else ""
         cursor = await self.db.execute(
-            f"UPDATE tasks SET status = 'pending', run_after = ?, lease_expires_at = NULL, lease_token = NULL, updated_at = ? WHERE {where}",
+            f"UPDATE tasks SET status = 'pending', run_after = ?, lease_expires_at = NULL, "
+            f"lease_token = NULL, updated_at = ?{attempts_sql} WHERE {where}",
             tuple(params),
         )
         return cursor.rowcount > 0
@@ -398,7 +517,8 @@ class TasksRepository:
         cursor = await self.db.execute(
             """
             UPDATE tasks SET status = 'pending', lease_expires_at = NULL, lease_token = NULL, updated_at = ?
-            WHERE status = 'running' AND lease_expires_at < ?
+            WHERE status = 'running'
+              AND (lease_expires_at IS NULL OR lease_expires_at < ?)
             """,
             (now, now),
         )
@@ -409,6 +529,32 @@ class TasksRepository:
             "SELECT status, COUNT(*) as count FROM tasks GROUP BY status"
         )
         return {row["status"]: row["count"] for row in rows}
+
+    async def wake_deferred(self, task_type: str, limit: int = 100) -> int:
+        """Прокинути bounded-порцію відкладених (pending у майбутньому) задач.
+
+        Використовується лише для явного bounded-відновлення після збою
+        процесу/БД. Не виконує mass requeue: обмеження задано параметром.
+        """
+        now = utc_now_iso()
+        cursor = await self.db.execute(
+            """
+            UPDATE tasks SET run_after = ?, updated_at = ?
+            WHERE id IN (
+                SELECT id FROM tasks
+                WHERE type = ? AND status = 'pending' AND run_after > ?
+                ORDER BY run_after ASC, id ASC
+                LIMIT ?
+            )
+            """,
+            (now, now, task_type, now, max(int(limit), 1)),
+        )
+        woken = max(getattr(cursor, "rowcount", 0), 0)
+        if woken:
+            logger.info(
+                "deferred_tasks_woken", task_type=task_type, woken=woken, run_after=now
+            )
+        return woken
 
 
 class DomainsRepository:
@@ -630,9 +776,16 @@ class SystemEventsRepository:
         INSERT INTO system_events (ts, level, component, message, context)
         VALUES (?, ?, ?, ?, ?)
         """
-        return await self.db.insert(
+        event_id = await self.db.insert(
             sql, (now, level, component, message, json.dumps(context) if context else None)
         )
+        if event_id is None:
+            # NULL означає відсутність автоінкременту або відсутність рядка —
+            # подія фактично записана, але без id, тож її важко знайти.
+            logger.warning(
+                "system_event_insert_returned_null", component=component, level=level
+            )
+        return event_id
 
     async def get_recent(self, limit: int = 50) -> list[dict]:
         rows = await self.db.fetchall(
@@ -643,6 +796,11 @@ class SystemEventsRepository:
 
 
 class SearchQueriesRepository:
+    """Пошуковий пул з обмеженим cooldown замість необмеженого retirement."""
+
+    _MAX_ZERO_COOLDOWN_HOURS = 24
+    _REACTIVATION_BATCH_SIZE = 1000
+
     def __init__(self, db: Database):
         self.db = db
 
@@ -656,8 +814,55 @@ class SearchQueriesRepository:
         """
         cursor = await self.db.execute(sql, (text, engine, region, topic_hint, priority))
         if cursor.rowcount == 0:
+            # Seed-сесія може знайти старий retired рядок після відновлення або
+            # зміни теми. Реактивуємо його, але не видаємо новий id: це не
+            # новий query і не повинно збільшувати лічильник seed-прогресу.
+            row = await self.db.fetchone(
+                "SELECT id, priority FROM search_queries "
+                "WHERE text = ? AND engine = ? AND region = ?",
+                (text, engine, region),
+            )
+            if row:
+                # MAX(x, y) у PostgreSQL — агрегат, а не скалярна функція,
+                # тому пріоритет обчислюємо в Python.
+                merged_priority = max(int(row["priority"] or 0), int(priority or 0))
+                await self.db.execute(
+                    """
+                    UPDATE search_queries
+                    SET status = 'active', cooldown_until = NULL, zero_streak = 0,
+                        topic_hint = COALESCE(topic_hint, ?), priority = ?
+                    WHERE id = ? AND status = 'retired'
+                    """,
+                    (topic_hint, merged_priority, row["id"]),
+                )
             return None
         return cursor.lastrowid
+
+    async def reactivate_retired(self, limit: int | None = None) -> int:
+        """Повернути bounded-порцію retired-запитів у активний пул.
+
+        Retirement більше не використовується для нових записів, але залишається
+        сумісним зі старими базами. Поступова реактивація не створює масовий
+        requeue і дозволяє продовжувати-discovery для всіх тем.
+        """
+        batch = min(
+            max(int(limit or self._REACTIVATION_BATCH_SIZE), 1),
+            self._REACTIVATION_BATCH_SIZE,
+        )
+        cursor = await self.db.execute(
+            """
+            UPDATE search_queries
+            SET status = 'active', cooldown_until = NULL, zero_streak = 0
+            WHERE id IN (
+                SELECT id FROM search_queries
+                WHERE status = 'retired'
+                ORDER BY priority DESC, last_run_at IS NOT NULL, last_run_at, id
+                LIMIT ?
+            )
+            """,
+            (batch,),
+        )
+        return max(getattr(cursor, "rowcount", 0), 0)
 
     async def count(self) -> int:
         row = await self.db.fetchone("SELECT COUNT(*) as c FROM search_queries")
@@ -675,6 +880,10 @@ class SearchQueriesRepository:
             """,
             (now,),
         )
+        if row is None:
+            # Активний пул порожній або все на cooldown. Discovery без
+            # запитів мовчки зупиняється, тому це фіксується.
+            logger.warning("search_query_pool_exhausted", at=now)
         return dict(row) if row else None
 
     async def record_run(self, query_id: int, new_results: int) -> None:
@@ -684,29 +893,71 @@ class SearchQueriesRepository:
                 """
                 UPDATE search_queries
                 SET last_run_at = ?, runs = runs + 1, zero_streak = 0,
-                    results_yield = results_yield + ?, cooldown_until = NULL
+                    results_yield = results_yield + ?, cooldown_until = NULL,
+                    status = 'active'
                 WHERE id = ?
                 """,
                 (now, new_results, query_id),
             )
-        else:
-            row = await self.db.fetchone(
-                "SELECT zero_streak, runs FROM search_queries WHERE id = ?", (query_id,)
+            return
+
+        row = await self.db.fetchone(
+            "SELECT zero_streak, runs, text FROM search_queries WHERE id = ?", (query_id,)
+        )
+        if not row:
+            # Запит зник (видалено/перезасіяно) або БД повернула порожній
+            # рядок: раніше це мовчки обривало оновлення статистики.
+            logger.warning("search_query_record_run_missing", query_id=query_id)
+            return
+        # Нульовий результат лише відкладає запит. Нескінченне retired-стан
+        # зупиняло discovery для цілих тем після кількох невдалих спроб.
+        zero_streak = min(int(row["zero_streak"] or 0) + 1, 30)
+        cooldown_hours = min(24 * zero_streak, self._MAX_ZERO_COOLDOWN_HOURS)
+        cooldown = (datetime.utcnow() + timedelta(hours=cooldown_hours)).isoformat()
+        if zero_streak in (1, 5, 15) or zero_streak == 30:
+            # Логуємо лише характерні точки: інакше кожен нульовий запит
+            # плодить рядок, а зростання streak не видно.
+            logger.info(
+                "search_query_zero_result",
+                query_id=query_id,
+                text=(row["text"] or "")[:80],
+                zero_streak=zero_streak,
+                cooldown_h=cooldown_hours,
             )
-            if not row:
-                return
-            zero_streak = row["zero_streak"] + 1
-            cooldown = (datetime.utcnow() + timedelta(hours=24 * zero_streak)).isoformat()
-            status = "retired" if (zero_streak >= 3 and row["runs"] >= 5) else "active"
-            await self.db.execute(
-                """
-                UPDATE search_queries
-                SET last_run_at = ?, runs = runs + 1, zero_streak = ?,
-                    cooldown_until = ?, status = ?
-                WHERE id = ?
-                """,
-                (now, zero_streak, cooldown, status, query_id),
-            )
+        await self.db.execute(
+            """
+            UPDATE search_queries
+            SET last_run_at = ?, runs = runs + 1, zero_streak = ?,
+                cooldown_until = ?, status = 'active'
+            WHERE id = ?
+            """,
+            (now, zero_streak, cooldown, query_id),
+        )
+
+    async def record_error(self, query_id: int, cooldown_s: int = 1800) -> None:
+        """Відкласти запит після технічної помилки каналу (rate-limit, таймаут).
+
+        Помилка не є «нульовим результатом» запиту, тому zero_streak не
+        змінюється: після відновлення каналу запит повернеться в пул без
+        тривалих cooldown.
+        """
+        now = datetime.now(UTC).replace(tzinfo=None)
+        cooldown = (now + timedelta(seconds=max(cooldown_s, 60))).isoformat()
+        logger.info(
+            "search_query_error_cooldown",
+            query_id=query_id,
+            cooldown_s=max(cooldown_s, 60),
+            cooldown_until=cooldown,
+        )
+        await self.db.execute(
+            """
+            UPDATE search_queries
+            SET last_run_at = ?, runs = runs + 1, cooldown_until = ?,
+                status = 'active'
+            WHERE id = ?
+            """,
+            (now.isoformat(), cooldown, query_id),
+        )
 
     async def get_top(self, limit: int = 20) -> list[dict]:
         rows = await self.db.fetchall(

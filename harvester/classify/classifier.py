@@ -2,7 +2,13 @@ import json
 
 import structlog
 
-from harvester.classify.llm import AllLimitsExhausted, LLMClient, LLMUnavailable
+from harvester.classify.llm import (
+    AllLimitsExhausted,
+    LLMClient,
+    LLMUnavailable,
+    log_raw_response,
+    log_throttled,
+)
 from harvester.classify.taxonomy import load_topics
 from harvester.config import get_settings
 from harvester.db.connection import Database
@@ -91,8 +97,16 @@ class Classifier:
                 try:
                     from harvester.core.notify import notify_llm_failure
                     await notify_llm_failure("classify", "unknown", str(e), doc_id=doc.get("id"), service="Classify")
-                except Exception:
-                    pass
+                except Exception as notify_err:  # noqa: BLE001
+                    # Втрата сповіщення не повинна губити діагностику самої
+                    # помилки: без неї не видно, чому пошта не прийшла.
+                    log_throttled(
+                        logger,
+                        "classify_notify_failed",
+                        "notify_classify",
+                        doc_id=doc.get("id"),
+                        error=str(notify_err)[:200],
+                    )
 
         total = sum(scores.values())
         min_score = self.settings.classify.min_score
@@ -133,9 +147,16 @@ class Classifier:
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, ValueError) as e:
-            # Помилка парсингу JSON — повертаємо пусту відповідь замість крашу
-            logger.warning("llm_json_parse_error", doc_id=doc.get("id"),
-                          model=resp.model, error_msg=str(e)[:100], raw_preview=raw[:200])
+            # Помилка парсингу JSON — повертаємо пусту відповідь замість крашу.
+            # Обов'язково з діагностикою відповіді: finish_reason і
+            # thinking-бюджет пояснюють, чому JSON не розібрався.
+            log_raw_response(
+                logger,
+                "llm_json_parse_error",
+                resp,
+                doc_id=doc.get("id"),
+                detail=str(e)[:120],
+            )
             return {"topics": [], "confidence": 0.0}
 
         logger.info(

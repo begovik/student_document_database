@@ -12,6 +12,7 @@ from typing import Any
 import structlog
 
 from harvester.config import FilterRules, get_filter_rules, get_settings
+from harvester.classify.llm import log_raw_response
 from harvester.curator.availability import check_availability
 from harvester.db.failover import build_database
 
@@ -60,13 +61,20 @@ async def find_replacement_candidates(
         f"""
         SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
                d.canonical_url, d.language, d.udc, d.page_count,
-               d.has_text_layer, d.size_bytes, d.sha256, d.status,
+               d.has_text_layer, d.size_bytes, d.sha256, d.status, d.extra,
+               d.text_sample, d.verifier_status, d.verifier_checked_at,
+               vr.status AS verifier_result_status,
+               vr.llm_status AS llm_status,
                dt.score as topic_score,
                t.id as topic_id, t.name_uk as topic_name
         FROM documents d
         LEFT JOIN document_topics dt ON dt.document_id = d.id
         LEFT JOIN topics t ON t.id = dt.topic_id
+        LEFT JOIN verifier_results vr ON vr.document_id = d.id AND vr.profile = 'strict'
         WHERE d.status = 'verified'
+          AND d.verifier_status = 'pass'
+          AND vr.status = 'pass'
+          AND vr.llm_status = 'pass'
           AND d.title IS NOT NULL AND d.title != ''
           AND d.authors IS NOT NULL
           AND d.language IS NOT NULL
@@ -102,6 +110,13 @@ async def find_replacement_candidates(
             "has_text_layer": row["has_text_layer"],
             "size_bytes": row["size_bytes"],
             "sha256": row["sha256"],
+            "status": row["status"],
+            "extra": row["extra"],
+            "text_sample": row["text_sample"],
+            "verifier_status": row["verifier_status"],
+            "verifier_checked_at": row["verifier_checked_at"],
+            "verifier_result_status": row["verifier_result_status"],
+            "llm_status": row["llm_status"],
         })
 
     return candidates
@@ -177,10 +192,14 @@ async def call_llm_for_fix(
                 result = candidate
                 break
         if not isinstance(result, dict):
+            # Без сирої відповіді не видно, чи модель повернула текст замість
+            # JSON, чи вивід обрізало, чи це was thinking-бюджет.
+            log_raw_response(logger, "llm_fix_no_action_json", response)
             return None
 
         action = str(result.get("action") or "skip").strip().lower()
         if action not in {"replace", "retry", "skip"}:
+            logger.info("llm_fix_unknown_action", raw_action=action[:60], response=response.model)
             action = "skip"
         replacement_id = result.get("replacement_id")
         if isinstance(replacement_id, bool):
@@ -189,6 +208,13 @@ async def call_llm_for_fix(
             try:
                 replacement_id = int(replacement_id) if replacement_id is not None else None
             except (TypeError, ValueError):
+                # Модель повернула не число: раніше це тихо перетворювалося
+                # на None і документ просто лишався без заміни.
+                logger.info(
+                    "llm_fix_invalid_replacement_id",
+                    value=repr(replacement_id)[:60],
+                    response=response.model,
+                )
                 replacement_id = None
         return {
             "action": action,
@@ -198,9 +224,9 @@ async def call_llm_for_fix(
     except LLMUnavailable as e:
         logger.warning("llm_fix_unavailable", error=str(e)[:200])
     except (json.JSONDecodeError, TypeError, ValueError) as e:
-        logger.warning("llm_fix_invalid_json", error=str(e)[:200])
+        logger.warning("llm_fix_invalid_json", error=str(e)[:200], error_type=type(e).__name__)
     except Exception as e:  # noqa: BLE001
-        logger.warning("llm_fix_failed", error=str(e)[:200])
+        logger.warning("llm_fix_failed", error=str(e)[:200], error_type=type(e).__name__)
     return None
 
 
@@ -262,6 +288,34 @@ def _catalog_validation_error(doc: dict[str, Any]) -> str | None:
     if not _has_catalog_extraction_data(doc):
         return "відсутні quotations і summary"
     return None
+
+
+async def _load_extraction_fields(db, document_id: int) -> dict[str, Any]:
+    """Прочитати збережену extraction (quotes/summary) документа з БД."""
+    row = await db.fetchone(
+        "SELECT quotations, summary FROM extractions WHERE document_id = ?",
+        (document_id,),
+    )
+    if not row:
+        return {}
+    fields: dict[str, Any] = {}
+    quotations = row["quotations"]
+    if quotations:
+        try:
+            parsed = json.loads(quotations)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, list):
+            fields["quotations"] = parsed
+    summary = row["summary"]
+    if summary:
+        try:
+            parsed_summary = json.loads(summary)
+        except (json.JSONDecodeError, TypeError):
+            parsed_summary = None
+        if isinstance(parsed_summary, dict):
+            fields["summary"] = parsed_summary
+    return fields
 
 
 async def mark_unavailable_in_db(db, doc_id: int, reason: str, replacement_id: int | None = None, catalog_name: str | None = None):
@@ -356,7 +410,14 @@ async def verify_catalog(
 
     settings = get_settings()
     db = build_database(settings)
-    await db.initialize(sync_mirror=False)
+    try:
+        await db.initialize(sync_mirror=False)
+    except Exception as e:  # noqa: BLE001
+        # Раніше падіння ініціалізації БД проходило як трасировка у
+        # stderr без повідомлення в журналі подій — не було видно, чи
+        # вдалося відкрити каталог узагалі.
+        logger.exception("curator_verify_db_init_failed", error=str(e)[:200])
+        return None
 
     try:
         documents = catalog.get("documents", [])
@@ -426,8 +487,30 @@ async def verify_catalog(
                 replacement = next((c for c in candidates if c["id"] == replacement_id), None)
                 if replacement:
                     # Перевірити доступність заміни
-                    avail, _ = await check_availability(replacement["canonical_url"])
+                    avail, avail_reason = await check_availability(
+                        replacement["canonical_url"]
+                    )
+                    if not avail:
+                        # Причину відкидання заміни раніше викидали (`_`),
+                        # тому в журналі лишалося лише «replacement_unavailable».
+                        logger.info(
+                            "replacement_not_available",
+                            doc_id=doc_id,
+                            replacement_id=replacement_id,
+                            reason=avail_reason,
+                        )
                     if avail:
+                        # Заміна без extraction-даних не є якісним джерелом:
+                        # вона одразу провалить catalog validation.
+                        extraction = await _load_extraction_fields(db, replacement["id"])
+                        if not _has_catalog_extraction_data(extraction):
+                            logger.warning(
+                                "replacement_without_extraction",
+                                doc_id=replacement_id,
+                            )
+                            skipped += 1
+                            errors += 1
+                            continue
                         # Замінити в каталозі
                         new_doc = {
                             "id": replacement["id"],
@@ -443,7 +526,10 @@ async def verify_catalog(
                             "size_bytes": replacement["size_bytes"],
                             "sha256": replacement["sha256"],
                             "has_text_layer": replacement["has_text_layer"],
+                            "verifier_status": replacement.get("verifier_status"),
+                            "verifier_checked_at": replacement.get("verifier_checked_at"),
                             "topics": [{"topic_id": replacement["topic_id"], "topic_name": replacement["topic_name"], "score": replacement["topic_score"]}] if replacement.get("topic_id") else doc.get("topics", []),
+                            **extraction,
                         }
 
                         documents[orig_idx] = new_doc

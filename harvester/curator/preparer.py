@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import tempfile
 from datetime import datetime
 from typing import Any
@@ -41,6 +42,12 @@ def _parse_authors(value: Any) -> list[str]:
 
 # Мінімальні вимоги до документа для відбору
 REQUIRED_STATUS = "verified"
+REQUIRED_VERIFIER_STATUS = "pass"
+# Strict-pass має підтверджений LLM-вердикт. Запис, де llm_status='error',
+# не є доказом якості: до 2026-09-25 fail-open логіка записувала такі
+# документи як pass (135 658 з 137 252 у production). Curator не має
+# випускати їх у каталог.
+REQUIRED_LLM_STATUS = "pass"
 REQUIRED_FIELDS = {
     "title": "Назва має бути непорожньою",
     "authors": "Автори мають бути задані",
@@ -51,8 +58,16 @@ REQUIRED_FIELDS = {
 }
 
 
-def is_document_complete(doc: dict[str, Any], rules: FilterRules | None = None) -> tuple[bool, str | None]:
-    """Перевірити, чи документ має повний набір даних і є повноцінним цілісним джерелом."""
+def is_document_complete(
+    doc: dict[str, Any],
+    rules: FilterRules | None = None,
+    require_strict_pass: bool = False,
+) -> tuple[bool, str | None]:
+    """Перевірити повноту документа та, за потреби, strict-верифікацію.
+
+    ``require_strict_pass`` використовується curator-ом. Звичайний verifier
+    викликає цю функцію до LLM, тому сам verifier-status тут не потрібен.
+    """
     import re
 
     if rules is None:
@@ -71,6 +86,23 @@ def is_document_complete(doc: dict[str, Any], rules: FilterRules | None = None) 
     }
     if doc.get("status") != REQUIRED_STATUS:
         return False, f"status={doc.get('status')} (потрібно {REQUIRED_STATUS})"
+
+    if require_strict_pass:
+        if doc.get("verifier_status") != REQUIRED_VERIFIER_STATUS:
+            return False, (
+                f"strict verifier_status={doc.get('verifier_status')} "
+                f"(потрібно {REQUIRED_VERIFIER_STATUS})"
+            )
+        if doc.get("verifier_result_status") != REQUIRED_VERIFIER_STATUS:
+            return False, (
+                f"strict verifier_results.status={doc.get('verifier_result_status')} "
+                f"(потрібно {REQUIRED_VERIFIER_STATUS})"
+            )
+        if doc.get("llm_status") != REQUIRED_LLM_STATUS:
+            return False, (
+                f"strict LLM-вердикт={doc.get('llm_status')} "
+                f"(потрібно {REQUIRED_LLM_STATUS})"
+            )
 
     for field, reason in required_fields.items():
         value = doc.get(field)
@@ -265,14 +297,21 @@ async def get_candidates_for_topic(
             f"""
             SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
                    d.canonical_url, d.language, d.udc, d.page_count, d.has_text_layer,
-                   d.size_bytes, d.sha256, d.status, d.extra,
+                   d.size_bytes, d.sha256, d.status, d.extra, d.text_sample,
+                   d.verifier_status, d.verifier_checked_at,
+                   vr.status AS verifier_result_status,
+                   vr.llm_status AS llm_status,
                    d.verified_at, d.first_seen_at,
                    dt.score as topic_score,
                    t.id as topic_id, t.name_uk as topic_name
             FROM documents d
             LEFT JOIN document_topics dt ON dt.document_id = d.id
             LEFT JOIN topics t ON t.id = dt.topic_id
+            LEFT JOIN verifier_results vr ON vr.document_id = d.id AND vr.profile = 'strict'
             WHERE d.status = 'verified'
+              AND d.verifier_status = 'pass'
+              AND vr.status = 'pass'
+              AND vr.llm_status = 'pass'
               AND d.title IS NOT NULL AND d.title != ''
               AND d.authors IS NOT NULL
               AND d.language IS NOT NULL
@@ -292,19 +331,26 @@ async def get_candidates_for_topic(
             (topic_id, limit),
         )
     elif udc_prefixes:
-        udc_conditions = " OR ".join(f"d.udc LIKE '{p}%'" for p in udc_prefixes)
+        udc_conditions = " OR ".join("d.udc LIKE ?" for _ in udc_prefixes)
         rows = await repo.db.fetchall(
             f"""
             SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
                    d.canonical_url, d.language, d.udc, d.page_count, d.has_text_layer,
-                   d.size_bytes, d.sha256, d.status, d.extra,
+                   d.size_bytes, d.sha256, d.status, d.extra, d.text_sample,
+                   d.verifier_status, d.verifier_checked_at,
+                   vr.status AS verifier_result_status,
+                   vr.llm_status AS llm_status,
                    d.verified_at, d.first_seen_at,
                    COALESCE(dt.score, 0) as topic_score,
                    t.id as topic_id, t.name_uk as topic_name
             FROM documents d
             LEFT JOIN document_topics dt ON dt.document_id = d.id
             LEFT JOIN topics t ON t.id = dt.topic_id
+            LEFT JOIN verifier_results vr ON vr.document_id = d.id AND vr.profile = 'strict'
             WHERE d.status = 'verified'
+              AND d.verifier_status = 'pass'
+              AND vr.status = 'pass'
+              AND vr.llm_status = 'pass'
               AND d.title IS NOT NULL AND d.title != ''
               AND d.authors IS NOT NULL
               AND d.language IS NOT NULL
@@ -318,21 +364,28 @@ async def get_candidates_for_topic(
             ORDER BY dt.score DESC NULLS LAST, d.year DESC NULLS LAST
             LIMIT ?
             """,
-            (limit,),
+            tuple([f"{prefix}%" for prefix in udc_prefixes] + [limit]),
         )
     else:
         rows = await repo.db.fetchall(
             f"""
             SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
                    d.canonical_url, d.language, d.udc, d.page_count, d.has_text_layer,
-                   d.size_bytes, d.sha256, d.status, d.extra,
+                   d.size_bytes, d.sha256, d.status, d.extra, d.text_sample,
+                   d.verifier_status, d.verifier_checked_at,
+                   vr.status AS verifier_result_status,
+                   vr.llm_status AS llm_status,
                    d.verified_at, d.first_seen_at,
                    COALESCE(dt.score, 0) as topic_score,
                    t.id as topic_id, t.name_uk as topic_name
             FROM documents d
             LEFT JOIN document_topics dt ON dt.document_id = d.id
             LEFT JOIN topics t ON t.id = dt.topic_id
+            LEFT JOIN verifier_results vr ON vr.document_id = d.id AND vr.profile = 'strict'
             WHERE d.status = 'verified'
+              AND d.verifier_status = 'pass'
+              AND vr.status = 'pass'
+              AND vr.llm_status = 'pass'
               AND d.title IS NOT NULL AND d.title != ''
               AND d.authors IS NOT NULL
               AND d.language IS NOT NULL
@@ -373,6 +426,11 @@ async def get_candidates_for_topic(
             "verified_at": row["verified_at"],
             "first_seen_at": row["first_seen_at"],
             "extra": row["extra"],
+            "text_sample": row["text_sample"],
+            "verifier_status": row["verifier_status"],
+            "verifier_checked_at": row["verifier_checked_at"],
+            "verifier_result_status": row["verifier_result_status"],
+            "llm_status": row["llm_status"],
         })
 
     return candidates
@@ -399,7 +457,7 @@ async def find_replacement(
     available = [
         c for c in candidates
         if c["id"] not in selected_ids
-        and is_document_complete(c)[0]
+        and is_document_complete(c, rules, require_strict_pass=True)[0]
         and (await check_availability(c["canonical_url"]))[0]
     ]
 
@@ -540,8 +598,17 @@ async def prepare_catalog(
         if topic_info and topic_info.get("udc_prefixes"):
             try:
                 udc_prefixes = json.loads(topic_info["udc_prefixes"])
-            except (TypeError, json.JSONDecodeError):
-                pass
+            except (TypeError, json.JSONDecodeError) as e:
+                # UDC-фільтр мовчки вимикається для теми → кандидати
+                # відбираються без урахування індексу. Це змінює склад
+                # каталогу, тож має бути видимим.
+                logger.warning(
+                    "curator_udc_prefixes_parse_failed",
+                    topic=topic_name_uk,
+                    raw=str(topic_info["udc_prefixes"])[:80],
+                    error=str(e)[:120],
+                    impact="UDC-фільтр вимкнено для теми",
+                )
 
         if not topic_id and not udc_prefixes:
             logger.warning("topic_not_found_in_db", topic=topic_name)
@@ -577,17 +644,35 @@ async def prepare_catalog(
 
         complete_candidates = []
         incomplete_count = 0
+        # Розподіл причин відхилення: без нього «0 кандидатів» не дає
+        # зрозуміти, чи бракує LLM-вердиктів (llm_status), чи полів
+        # (автори/мова), чи сторінок. Це основне питання якості пулу.
+        reject_reasons: dict[str, int] = {}
         for c in candidates:
-            ok, reason = is_document_complete(c, rules)
+            ok, reason = is_document_complete(c, rules, require_strict_pass=True)
             if ok:
                 complete_candidates.append(c)
             else:
                 incomplete_count += 1
+                # Групуємо схожі причини, щоб лічильник був читабельним.
+                key = re.sub(r"[=:].*$", "", (reason or "unknown"))[:60]
+                reject_reasons[key] = reject_reasons.get(key, 0) + 1
 
-        logger.info("candidates_found", total=len(candidates), complete=len(complete_candidates), incomplete=incomplete_count)
+        logger.info(
+            "candidates_found",
+            total=len(candidates),
+            complete=len(complete_candidates),
+            incomplete=incomplete_count,
+            reject_reasons=reject_reasons,
+        )
 
         if not complete_candidates:
-            logger.warning("no_complete_candidates", topic=topic_name_uk)
+            logger.warning(
+                "no_complete_candidates",
+                topic=topic_name_uk,
+                total=len(candidates),
+                reject_reasons=reject_reasons,
+            )
             return None
 
         # 3. LLM-відбір
@@ -605,7 +690,11 @@ async def prepare_catalog(
                 reasoning="LLM недоступний, обрано перші N документів",
             )
 
-        selected_ids = set(selection.selected_ids)
+        # LLM може запропонувати більше документів, ніж потрібно для каталогу.
+        # Обмежуємо кількість, зберігаючи порядок відбору LLM.
+        candidate_ids = {c["id"] for c in complete_candidates}
+        ordered_ids = [i for i in selection.selected_ids if i in candidate_ids]
+        selected_ids = set(ordered_ids[:min_count])
         selected_docs = [c for c in complete_candidates if c["id"] in selected_ids]
 
         logger.info("selection_done", suggested=selection.suggested_count, actual=len(selected_docs))
@@ -696,6 +785,8 @@ async def prepare_catalog(
                 "has_text_layer": doc["has_text_layer"],
                 "verified_at": doc["verified_at"],
                 "first_seen_at": doc["first_seen_at"],
+                "verifier_status": doc.get("verifier_status"),
+                "verifier_checked_at": doc.get("verifier_checked_at"),
             }
             if doc.get("topic_id") and doc.get("topic_name"):
                 doc_data["topics"] = [{

@@ -6,7 +6,11 @@ import json
 
 import structlog
 
+from harvester.classify.llm import AllLimitsExhausted, log_raw_response, redact_secrets
+
 logger = structlog.get_logger()
+
+MIN_LLM_CONFIDENCE = 0.5
 
 DOC_TYPES = ["article", "book", "textbook", "methodical", "thesis", "dissertation", "report", "preprint", "other"]
 
@@ -31,7 +35,9 @@ PROMPT = """\
 Правила для verdict:
 - 1-2 стор без структури → fail ("фрагмент, відсутня структура")
 - Немає вступу/висновків/списку джерел → fail
+- Дипломна робота, автореферат дисертації або інша нецільова праця → fail
 - Повна структура (титул, 3+ розділи, висновки, 5+ джерел) → pass
+- Впевненість у pass нижче {min_confidence} → fail; не вигадуй дані
 Для extracted_title/extracted_authors:
 - Витягни точну назву та авторів з фрагменту (титул, шапка статті). Якщо автори є — перелічи всіх (до 5).
 - Якщо в фрагменті немає авторів/назви — поверни null.
@@ -51,7 +57,15 @@ async def verify_with_llm(doc: dict, llm_client, topics: list[dict] | None = Non
             authors = ", ".join(authors_raw[:3]) if authors_raw else "невідомі"
             if len(authors_raw) == 1 and isinstance(authors_raw[0], str) and authors_raw[0].startswith("["):
                 authors = authors_raw[0]
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            # authors у БД — не список. Fallback дає моделі некоректне
+            # представлення авторів, тож вердикт може бути спотворений.
+            logger.debug(
+                "verifier_authors_format_invalid",
+                doc_id=doc.get("id"),
+                got_type=type(authors_raw).__name__,
+                error=str(e)[:120],
+            )
             authors = ", ".join(authors_raw[:3]) if isinstance(authors_raw, list) else str(authors_raw)
     else:
         authors = str(authors_raw)
@@ -77,6 +91,7 @@ async def verify_with_llm(doc: dict, llm_client, topics: list[dict] | None = Non
         structure=json.dumps(structure, ensure_ascii=False, sort_keys=True)[:1500],
         topics_list=topics_list,
         doc_types=", ".join(DOC_TYPES),
+        min_confidence=MIN_LLM_CONFIDENCE,
     )
     try:
         resp = await llm_client.complete(prompt)
@@ -97,7 +112,12 @@ async def verify_with_llm(doc: dict, llm_client, topics: list[dict] | None = Non
                 data = candidate
                 break
         if data is None:
-            raise ValueError("LLM не повернув JSON-об'єкт")
+            # Обов'язково пишемо сиру відповідь: без неї «не JSON-об'єкт»
+            # не відрізняє обрізаний вивід, thinking-бюджет і HTML-помилку.
+            # Саме через відсутність цього логу дефект thinking-моделі
+            # протримався непомітним і мовчки псував якість пулу.
+            log_raw_response(logger, "verifier_llm_no_json", resp, doc_id=doc.get("id"))
+            return "error", "LLM не повернув JSON-об'єкт", 0.0, None, None, [], "other"
         verdict = data.get("verdict", "fail")
         if verdict not in ("pass", "fail"):
             verdict = "fail"
@@ -107,6 +127,9 @@ async def verify_with_llm(doc: dict, llm_client, topics: list[dict] | None = Non
         except (TypeError, ValueError):
             conf = 0.0
         conf = max(0.0, min(1.0, conf))
+        if verdict == "pass" and conf < MIN_LLM_CONFIDENCE:
+            verdict = "fail"
+            comment = comment or "LLM не досяг достатньої впевненості"
         extracted_title = data.get("extracted_title")
         if isinstance(extracted_title, str):
             extracted_title = extracted_title.strip() or None
@@ -135,17 +158,27 @@ async def verify_with_llm(doc: dict, llm_client, topics: list[dict] | None = Non
         if doc_type not in DOC_TYPES:
             doc_type = "other"
 
-        logger.info(
-            "verifier_llm_ok",
-            doc_id=doc.get("id"),
+        # Повний лог вердикту пише worker (він знає doc_id і контекст батчу);
+        # тут лишаємо лише рівень debug, щоб не дублювати подію двічі.
+        logger.debug(
+            "verifier_llm_parsed",
             verdict=verdict,
             confidence=conf,
-            extracted_title=(extracted_title[:60] if extracted_title else None),
-            extracted_authors=extracted_authors,
             tags=tags,
             doc_type=doc_type,
         )
         return verdict, comment, conf, extracted_title, extracted_authors, tags, doc_type
+    except AllLimitsExhausted:
+        # Добове вичерпання квоти не є помилкою якості документа: дозволити
+        # worker-у відкласти батч і спробувати знову після відновлення.
+        raise
     except Exception as e:  # noqa: BLE001
-        logger.warning("verifier_llm_error", doc_id=doc.get("id"), error=str(e)[:150])
+        # Тип помилки потрібен для діагностики: ValueError від парсера JSON
+        # означає «формат відповіді», httpx/HTTPStatusError — «провайдер».
+        logger.warning(
+            "verifier_llm_error",
+            doc_id=doc.get("id"),
+            error=redact_secrets(str(e))[:150],
+            error_type=type(e).__name__,
+        )
         return "error", str(e)[:200], 0.0, None, None, [], "other"

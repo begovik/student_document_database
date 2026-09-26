@@ -94,7 +94,18 @@ class BibliographySearcher:
                                 result.accessibility = "accessible"
                                 result.relevance_score = 1.0
                                 return result
-                except Exception:
+                except Exception as e:  # noqa: BLE001
+                    # Мовний фільтр упав → джерело приймається як знайдене
+                    # в БД. Це компроміс на користь повноти, але раніше
+                    # про нього не лишалося жодного сліду.
+                    logger.warning(
+                        "db_result_lang_check_failed",
+                        document_id=db_result.get("id"),
+                        title=ref.title[:60],
+                        error=str(e)[:150],
+                        error_type=type(e).__name__,
+                        impact="джерело прийнято без перевірки на російську",
+                    )
                     result.found = True
                     result.in_database = True
                     result.document_id = db_result["id"]
@@ -166,8 +177,14 @@ class BibliographySearcher:
                     )
                     if rows:
                         return dict(rows[0])
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # Нормалізований URL не знайдено або запит впав —
+                    # далі спрацює пошук за назвою, але причину треба бачити.
+                    logger.debug(
+                        "db_search_normalized_url_failed",
+                        url=url[:150],
+                        error=str(e)[:150],
+                    )
 
             if title and len(title.strip()) >= 10:
                 # Пошук за підстрокою назви (перші 80 символів, без лапок)
@@ -286,7 +303,15 @@ class BibliographySearcher:
                         best["accessibility"] = "restricted"
                     else:
                         best["accessibility"] = "unknown"
-                except Exception:
+                except Exception as e:  # noqa: BLE001
+                    # «unknown» виглядає як нейтральний результат, хоча
+                    # насправді перевірку не виконано.
+                    logger.debug(
+                        "title_search_accessibility_failed",
+                        url=best.get("url", "")[:150],
+                        error=str(e)[:150],
+                        error_type=type(e).__name__,
+                    )
                     best["accessibility"] = "unknown"
                 return best
         except Exception as e:

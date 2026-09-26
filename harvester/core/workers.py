@@ -34,6 +34,12 @@ DEFAULT_PRIORITY = 10
 
 RETRYABLE_CODES = {"HTTP_ERROR", "TIMEOUT", "DOWNLOAD_ERROR", "ERROR", "PARSE_ERROR"}
 
+# Bounded-реактивація старих retired search-запитів. Відновлення пулу потрібне
+# для покриття всіх тем, але не має перетворитися на mass requeue: порція
+# мала, а інтервал обмежує темп (3 discovery-воркери × 50 запитів / 15 хв).
+QUERY_REACTIVATION_BATCH = 50
+QUERY_REACTIVATION_INTERVAL_S = 900.0
+
 
 def lang_to_priority(language: str | None) -> int:
     return LANG_PRIORITY.get(language or "", DEFAULT_PRIORITY)
@@ -57,6 +63,7 @@ class DiscoveryWorker:
             "api_iter": OpenAlexChannel(),
         }
         self._running = True
+        self._last_reactivation_at = 0.0
 
     async def run(self) -> None:
         log = logger.bind(worker=f"discovery-{self.worker_id}")
@@ -91,9 +98,26 @@ class DiscoveryWorker:
         """Якщо немає активних search-задач — запланувати LRU-запит."""
         if not self.settings.channels.ddgs.enabled:
             return
+
         pending = await self.scheduler.pending_count("search")
         if pending > 0:
             return
+
+        # Старі бази могли вже містити тисячі retired-запитів. Повертаємо
+        # лише невелику bounded-порцію й не частіше ніж раз на інтервал, щоб
+        # поступово відновити покриття тем без mass requeue та сплеску.
+        now = time.monotonic()
+        if now - self._last_reactivation_at >= QUERY_REACTIVATION_INTERVAL_S:
+            self._last_reactivation_at = now
+            reactivated = await self.queries_repo.reactivate_retired(
+                limit=QUERY_REACTIVATION_BATCH
+            )
+            if reactivated:
+                logger.info(
+                    "search_queries_reactivated",
+                    count=reactivated,
+                    batch=QUERY_REACTIVATION_BATCH,
+                )
 
         query = await self.queries_repo.pick_lru()
         if query is None:
@@ -118,6 +142,12 @@ class DiscoveryWorker:
 
         channel = self.channels.get(task_type)
         if channel is None:
+            # Невідомий тип задачі: раніше задача мовчки падала у failed без
+            # жодного запису, тому такий тип можна було виявити лише
+            # вручну по журналу tasks.
+            logger.warning(
+                "discovery_task_unknown_channel", task_id=task_id, task_type=task_type
+            )
             await self.scheduler.fail_task(task_id, lease_token=task.get("lease_token"))
             return
         if not channel.enabled:
@@ -162,6 +192,11 @@ class DiscoveryWorker:
             await self.scheduler.fail_task(
                 task_id, delay_s=300, lease_token=task.get("lease_token")
             )
+            if task_type == "search" and payload.get("query_id"):
+                # Канал не відпрацював — відкладаємо саме запит, щоб після
+                # max_attempts він не опинився в гарячому LOU-циклі.
+                await self.queries_repo.record_error(payload["query_id"], cooldown_s=1800)
+                await self._ensure_search_task()
             await self.events.error("discovery", "task_failed", {"task_id": task_id, "error": str(e)})
 
     async def _schedule_next_search(self, payload: dict) -> None:
@@ -189,8 +224,19 @@ class DiscoveryWorker:
 
     async def _register_candidate(self, candidate) -> bool:
         canonical = normalize_url(candidate.url)
-        allowed, _reason = await is_url_allowed(canonical)
+        allowed, guard_reason = await is_url_allowed(canonical)
         if not allowed:
+            # Раніше відсікані URL-guard-ом кандидати просто зникали:
+            # у журналі не було видно, скільки знайденого конвеєр
+            # викидає за SSRF/чорний список, тому нульове зростання
+            # пулу лишалося непоясненим. Тепер причина видно в лозі.
+            logger.info(
+                "candidate_url_blocked",
+                url=canonical[:200],
+                reason=guard_reason,
+                channel=candidate.channel,
+                query_text=(candidate.query_text or "")[:80],
+            )
             return False
 
         doc_id = await self.docs_repo.insert_or_ignore(
@@ -301,6 +347,15 @@ class VerifyWorker:
     async def stop(self) -> None:
         self._running = False
 
+    async def _restore_queued(self, doc_id: int, reason: str) -> None:
+        """Повернути документ із 'verifying' у чергу після аварійного виходу."""
+        try:
+            await self.docs_repo.update_status(doc_id, "queued")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "verify_status_restore_failed", doc_id=doc_id, reason=reason, error=str(e)
+            )
+
     async def _process_task(self, task: dict, pipeline: VerifyPipeline) -> None:
         task_id = task["id"]
         payload = json.loads(task["payload"])
@@ -330,48 +385,115 @@ class VerifyWorker:
 
         await self.docs_repo.update_status(doc_id, "verifying")
 
-        result = await pipeline.verify_document(
-            doc_id, doc["canonical_url"], title_hint=doc.get("title_hint")
-        )
+        try:
+            result = await pipeline.verify_document(
+                doc_id, doc["canonical_url"], title_hint=doc.get("title_hint")
+            )
+        except asyncio.CancelledError:
+            # Перезапуск/зупинка не повинні залишати документ назавжди у
+            # 'verifying': lease задачі спливе і recovery поверне її в чергу.
+            await self._restore_queued(doc_id, "cancelled")
+            raise
+        except Exception as e:
+            await self._restore_queued(doc_id, "error")
+            log.exception("verify_pipeline_error", error=str(e))
+            await self.scheduler.fail_task(
+                task_id, delay_s=300, lease_token=task.get("lease_token")
+            )
+            await self.events.error(
+                "verify", "pipeline_failed", {"doc_id": doc_id, "error": str(e)}
+            )
+            return
 
         duration_s = round((datetime.utcnow() - started).total_seconds(), 1)
 
+        # Книжкова частина (complete/stats/status/schedule) тепер у try:
+        # раніше падіння тут (напр. БД недоступна) піднімалося в цикл воркера
+        # й залишало документ у 'verifying' + задачу у 'running' — без
+        # жодного рядка про те, WHICH документ застряг, бо єдиний лог був
+        # лише загальний verify_worker_error. Зараз видно точний doc_id.
+        try:
+            await self._finalize_verification(task, doc, result, doc_id, duration_s, log)
+        except asyncio.CancelledError:
+            await self._restore_queued(doc_id, "cancelled_during_finalize")
+            raise
+        except Exception as e:  # noqa: BLE001
+            await self._restore_queued(doc_id, "finalize_error")
+            log.exception(
+                "verify_finalize_failed",
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+                verify_code=result.code,
+            )
+            await self.scheduler.fail_task(
+                task_id, delay_s=300, lease_token=task.get("lease_token")
+            )
+            await self.events.error(
+                "verify", "finalize_failed", {"doc_id": doc_id, "error": str(e)[:200]}
+            )
+
+    async def _finalize_verification(
+        self,
+        task: dict,
+        doc: dict,
+        result,
+        doc_id: int,
+        duration_s: float,
+        log,
+    ) -> None:
+        """Зафіксувати результат верифікації: статус, статистика, наступна задача."""
+        task_id = task["id"]
+        lease = task.get("lease_token")
+
         if result.success:
-            await self.scheduler.complete_task(task_id, task.get("lease_token"))
+            await self.scheduler.complete_task(task_id, lease)
             await self.stats.increment("verify", requests=1, ok=1, items_new=1)
             log.info("verify_task_done", code=result.code, duration_s=duration_s)
             await self.scheduler.schedule_task(
                 "classify", {"document_id": doc_id}, priority=5
             )
-        else:
-            attempts = doc["verify_attempts"] + 1
-            await self.db.execute(
-                "UPDATE documents SET verify_attempts = ? WHERE id = ?", (attempts, doc_id)
+            return
+
+        attempts = doc["verify_attempts"] + 1
+        await self.db.execute(
+            "UPDATE documents SET verify_attempts = ? WHERE id = ?", (attempts, doc_id)
+        )
+        await self.stats.increment("verify", requests=1, errors=1)
+
+        # Retry delays: 10 хв, 30 хв, потім — жодних ретраїв
+        RETRY_DELAYS = [600, 1800]
+
+        if result.code in RETRYABLE_CODES and attempts <= len(RETRY_DELAYS):
+            delay = RETRY_DELAYS[attempts - 1]
+            log.warning("verify_retry_scheduled", code=result.code, attempt=attempts, delay_s=delay)
+            await self.docs_repo.update_status(doc_id, "queued")
+            await self.scheduler.complete_task(task_id, lease)
+            retry_at = (datetime.utcnow() + timedelta(seconds=delay)).isoformat()
+            await self.scheduler.schedule_task(
+                "probe", {"document_id": doc_id}, priority=5, run_after=retry_at
             )
-            await self.stats.increment("verify", requests=1, errors=1)
+            return
 
-            # Retry delays: 10 хв, 30 хв, потім — жодних ретраїв
-            RETRY_DELAYS = [600, 1800]
-
-            if result.code in RETRYABLE_CODES and attempts <= len(RETRY_DELAYS):
-                delay = RETRY_DELAYS[attempts - 1]
-                log.warning("verify_retry_scheduled", code=result.code, attempt=attempts, delay_s=delay)
-                await self.docs_repo.update_status(doc_id, "queued")
-                await self.scheduler.complete_task(task_id, task.get("lease_token"))
-                retry_at = (datetime.utcnow() + timedelta(seconds=delay)).isoformat()
-                await self.scheduler.schedule_task(
-                    "probe", {"document_id": doc_id}, priority=5, run_after=retry_at
-                )
-            else:
-                final_status = "broken" if result.code in RETRYABLE_CODES else result.code.lower()
-                await self.docs_repo.update_status(doc_id, final_status)
-                await self.scheduler.complete_task(task_id, task.get("lease_token"))
-                log.warning("verify_task_failed", code=result.code, duration_s=duration_s)
-                await self.events.error(
-                    "verify", "document_verify_failed",
-                    {"doc_id": doc_id, "url": doc["canonical_url"], "code": result.code,
-                     "message": result.message},
-                )
+        final_status = "broken" if result.code in RETRYABLE_CODES else result.code.lower()
+        await self.docs_repo.update_status(doc_id, final_status)
+        await self.scheduler.complete_task(task_id, lease)
+        log.info(
+            "verify_task_filtered",
+            code=result.code,
+            final_status=final_status,
+            duration_s=duration_s,
+            attempt=attempts,
+            reason=(result.message or "")[:120],
+        )
+        # Це очікувана фільтрація (NOT_PDF, HTTP 403, чорний домен), а не
+        # збій сервісу: тому WARN у structlog, але подія рівня info у
+        # system_events. Раніше все це йшло як error, через що реальні
+        # збої на тлі тисяч «нормальних» відхилень губилися.
+        await self.events.info(
+            "verify", "document_filtered",
+            {"doc_id": doc_id, "url": doc["canonical_url"], "code": result.code,
+             "status": final_status, "message": (result.message or "")[:200]},
+        )
 
 
 class ClassifyWorker:
@@ -439,25 +561,70 @@ class ClassifyWorker:
             if is_transient:
                 logger.warning("classify_transient_error", worker=f"classify-{self.worker_id}",
                              error_msg=error_str[:200])
-                await asyncio.sleep(10)
-                await self.scheduler.complete_task(task_id, task.get("lease_token"))
+                await self.scheduler.defer_task(
+                    task_id,
+                    delay_s=30,
+                    lease_token=task.get("lease_token"),
+                    reset_attempts=True,
+                )
                 return
             global _last_classify_exhausted_log
             if time.monotonic() - _last_classify_exhausted_log >= _CLASSIFY_EXHAUSTED_LOG_INTERVAL:
                 _last_classify_exhausted_log = time.monotonic()
                 logger.critical("classify_worker_all_limits_exhausted", worker=f"classify-{self.worker_id}")
                 await self.events.error("classify", "all_limits_exhausted", {"worker": f"classify-{self.worker_id}"})
-            await self.scheduler.complete_task(task_id, task.get("lease_token"))
-            retry_at = (datetime.utcnow() + timedelta(hours=1)).isoformat()
-            await self.scheduler.schedule_task(
-                "classify",
-                {"document_id": doc_id},
-                priority=5,
-                run_after=retry_at,
+            # Не завершуємо task: повертаємо його з тим самим lease-token у
+            # pending. Спроба застосовується знову після паузи, а лічильник
+            # спроб не витрачається на добове очікування.
+            self.classifier.llm.reset_exhausted_state()
+            await self.scheduler.defer_task(
+                task_id,
+                delay_s=3600,
+                lease_token=task.get("lease_token"),
+                reset_attempts=True,
+            )
+            return
+        except Exception as e:
+            logger.exception(
+                "classify_task_error",
+                worker=f"classify-{self.worker_id}",
+                error=str(e),
+            )
+            await self.scheduler.fail_task(
+                task_id,
+                delay_s=300,
+                lease_token=task.get("lease_token"),
+            )
+            await self.events.error(
+                "classify", "task_failed", {"task_id": task_id, "error": str(e)}
             )
             return
 
-        await self.scheduler.complete_task(task_id, task.get("lease_token"))
+        # Класифікація записана, але завершення задачі — окремий крок:
+        # якщо він падає, документ лишається без класифікації в черзі
+        #'running' до спливу lease. Логуємо окремо, щоб це було видно.
+        try:
+            completed = await self.scheduler.complete_task(task_id, task.get("lease_token"))
+        except Exception as e:  # noqa: BLE001
+            logger.exception(
+                "classify_task_completion_failed",
+                worker=f"classify-{self.worker_id}",
+                task_id=task_id,
+                doc_id=doc_id,
+                error=str(e)[:200],
+            )
+            await self.events.error(
+                "classify", "completion_failed", {"task_id": task_id, "doc_id": doc_id}
+            )
+            return
+        if not completed:
+            logger.warning(
+                "classify_task_completion_rejected",
+                worker=f"classify-{self.worker_id}",
+                task_id=task_id,
+                doc_id=doc_id,
+                reason="lease вже сплив або задачу перехопив інший воркер",
+            )
         logger.info(
             "classify_task_done",
             task_id=task_id,

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import os
@@ -13,6 +14,42 @@ from harvester.config import get_settings
 from harvester.core.ratelimit import BandwidthLimiter, GlobalRateLimiter, HostRateLimiter
 
 logger = structlog.get_logger()
+
+# Відповідь довша за цей час вказує на проблемний домен (або на зависання
+# мережі) — такі випадки раніше не лишали жодного сліду.
+SLOW_HTTP_MS = 20_000
+
+# Лімітер для повторних HTTP-попереджень за одним ключем (host+клас коду).
+# Без нього один домен, що повертає 403 на кожен запит, засмичує журнал
+# тисячами однакових рядків.
+_HTTP_THROTTLE_S = 300.0
+_http_throttle: dict[str, float] = {}
+
+
+def _log_http_throttled(event: str, key: str, **extra) -> None:
+    now = time.monotonic()
+    last = _http_throttle.get(key, 0.0)
+    if now - last < _HTTP_THROTTLE_S:
+        return
+    _http_throttle[key] = now
+    if len(_http_throttle) > 1000:
+        cutoff = now - _HTTP_THROTTLE_S
+        for stale in [k for k, v in _http_throttle.items() if v < cutoff]:
+            del _http_throttle[stale]
+    logger.warning(event, throttle_key=key, **extra)
+
+
+def _log_http_failure(host: str, method: str, url: str, exc: BaseException) -> None:
+    """Зафіксувати мережеву помилку запиту, прив'язавши її до домену."""
+    _log_http_throttled(
+        "http_request_failed",
+        f"fail:{host}:{type(exc).__name__}",
+        host=host,
+        method=method,
+        error_type=type(exc).__name__,
+        error=str(exc)[:200],
+        url=url[:150],
+    )
 
 
 class HttpClient:
@@ -97,11 +134,22 @@ class HttpClient:
                 await self._assert_url_allowed(current_url)
                 host = urlparse(current_url).hostname or ""
                 await self.host_limiter.wait(host)
-                response = await self._client.request(
-                    current_method,
-                    current_url,
-                    follow_redirects=False,
-                    **kwargs,
+                started = time.monotonic()
+                try:
+                    response = await self._client.request(
+                        current_method,
+                        current_url,
+                        follow_redirects=False,
+                        **kwargs,
+                    )
+                except Exception as e:
+                    # Мережеві збої домену не лишали сліду: у логах було
+                    # видно лише підсумкову помилку verify-а, звідки не
+                    # зрозуміло, який саме хост падає і з якою частотою.
+                    _log_http_failure(host, current_method, current_url, e)
+                    raise
+                self._log_http_result(
+                    host, current_method, current_url, response.status_code, started
                 )
                 location = response.headers.get("location")
                 if response.status_code not in (301, 302, 303, 307, 308) or not location:
@@ -121,6 +169,13 @@ class HttpClient:
                     current_method = "GET"
                     for key in ("content", "data", "json"):
                         kwargs.pop(key, None)
+                logger.debug(
+                    "http_redirect",
+                    host=host,
+                    status=response.status_code,
+                    to_url=next_url[:200],
+                    depth=redirect_count,
+                )
                 current_url = next_url
         finally:
             self.global_limiter.release()
@@ -155,7 +210,11 @@ class HttpClient:
                     follow_redirects=False,
                     **kwargs,
                 )
+                started = time.monotonic()
                 response = await context.__aenter__()
+                self._log_http_result(
+                    host, current_method, current_url, response.status_code, started
+                )
                 location = response.headers.get("location")
                 if response.status_code not in (301, 302, 303, 307, 308) or not location:
                     yield response
@@ -186,7 +245,40 @@ class HttpClient:
 
         allowed, reason = await is_url_allowed(url)
         if not allowed:
+            # Перенаправлення на заборонений URL (напр. на localhost) — це
+            # спроба SSRF, тому фіксується окремо від звичайного 4xx.
+            logger.warning("http_url_blocked", reason=reason, url=url[:200])
             raise httpx.InvalidURL(f"URL заборонено ({reason}): {url}")
+
+    def _log_http_result(
+        self, host: str, method: str, url: str, status: int, started: float
+    ) -> None:
+        """Зафіксувати повільні та помилкові відповіді за доменом.
+
+        Раніше жоден запит не логувався, тому з журналу було неможливо
+        зрозуміти, який домен починаємоє 403/429 або сповільнюється —
+        найчастішу причину падіння швидкості збирання.
+        """
+        duration_ms = int((time.monotonic() - started) * 1000)
+        if status in (429, 401, 403) or status >= 500:
+            _log_http_throttled(
+                "http_bad_status",
+                f"status:{host}:{status // 100}xx",
+                host=host,
+                method=method,
+                status=status,
+                duration_ms=duration_ms,
+                url=url[:150],
+            )
+        elif duration_ms >= SLOW_HTTP_MS:
+            logger.warning(
+                "http_slow_response",
+                host=host,
+                method=method,
+                status=status,
+                duration_ms=duration_ms,
+                url=url[:150],
+            )
 
     async def stream_download(
         self,

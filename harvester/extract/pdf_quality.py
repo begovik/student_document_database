@@ -10,6 +10,10 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import structlog
+
+logger = structlog.get_logger()
+
 
 @dataclass
 class PDFQualityResult:
@@ -88,6 +92,13 @@ def _parse_pdf(pdf_path: Path) -> dict:
             "subject_from_meta": subject or "",
         }
     except Exception as e:
+        # Аналіз не виконано, але повертається dict, який виглядає як
+        # результат. Без логу не видно, скільки PDF не проаналізовано.
+        logger.warning(
+            "pdf_quality_analysis_failed",
+            error=str(e)[:200],
+            error_type=type(e).__name__,
+        )
         return {"error": str(e)}
 
 
@@ -644,6 +655,12 @@ def analyze_catalog(catalog_dir: Path) -> list[dict]:
             report = analyze_and_report(pdf_file)
             results.append(report)
         except Exception as e:
+            logger.warning(
+                "pdf_quality_catalog_item_failed",
+                file=pdf_file.name,
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+            )
             results.append({
                 "file": pdf_file.name,
                 "decision": "ERROR",

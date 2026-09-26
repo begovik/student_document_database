@@ -134,12 +134,18 @@ async def seed_blacklist(db) -> int:
 
     repo = BlacklistRepository(db)
     inserted = 0
+    failed: list[str] = []
     for domain in DEFAULT_BLACKLIST_DOMAINS:
         try:
             await repo.add(domain, "domain", "default seed: russian/pirate resource")
             inserted += 1
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            # Дублікат — нормально, але реальна помилка БД зникала мовчки:
+            # чорний список міг лишитись неповним без жодного сліду.
+            failed.append(domain)
+            logger.debug(
+                "blacklist_seed_failed", domain=domain, error=str(e)[:150]
+            )
     if inserted:
-        logger.info("blacklist_seeded", inserted=inserted)
+        logger.info("blacklist_seeded", inserted=inserted, failed=len(failed))
     return inserted

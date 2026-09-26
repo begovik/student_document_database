@@ -319,7 +319,18 @@ class VerifyPipeline:
                 error=error,
             )
         except Exception as e:
-            logger.error("log_attempt_error", error=str(e))
+            # Тут важливий контекст: без doc_id/kind не видно, для якого
+            # кроку і документа зникла телеметрія у fetch_attempts — а це
+            # єдине джерело історії спроб верифікації.
+            logger.warning(
+                "log_attempt_error",
+                doc_id=doc_id,
+                kind=kind,
+                result_code=result_code,
+                url=url[:150],
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+            )
 
 
 def _detect_structure(text: str) -> dict[str, object]:
