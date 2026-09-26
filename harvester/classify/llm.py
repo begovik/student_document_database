@@ -492,7 +492,12 @@ class LLMClient:
                 # Критична помилка — відправити на пошту
                 try:
                     from harvester.core.notify import notify_llm_failure
-                    await notify_llm_failure(phase, model, f"[{error_type}] {error_msg[:200]}", error_type=error_type, service=self.service)
+                    # error_type уже вбудований у текст помилки. Окремим
+                    # аргументом не передаємо: notify_llm_failure() такого
+                    # параметра не має, і виклик падав би з TypeError —
+                    # тобто сповіщення про збої LDM ніколи не доходили б
+                    # (через try/except помилка ковталася як llm_notify_failed).
+                    await notify_llm_failure(phase, model, f"[{error_type}] {error_msg[:200]}", service=self.service)
                 except Exception as notify_err:  # noqa: BLE001
                     log_throttled(
                         logger,

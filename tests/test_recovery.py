@@ -904,6 +904,56 @@ def test_ddgs_search_error_only_when_backend_actually_failed():
     assert "_is_no_results" in source
 
 
+def test_notify_calls_match_signatures():
+    """Усі виклики notify_* мають відповідати сигнатурам функцій.
+
+    Регресія: classify/llm.py передавав notify_llm_failure(..., error_type=...),
+    але параметра такого немає. Виняток ковтався обгорткою try/except, тому
+    конвеєр працював, але сповіщення про збої LLM не надходили НІКОЛИ — про
+    це дізнатися можна було лише зі стороннього лічильника llm_notify_failed.
+
+    Перевірка статична (AST), тож не потребує ні БД, ні мережі.
+    """
+    import ast
+    import inspect
+    import pathlib
+
+    from harvester.core import notify
+
+    funcs = {
+        name: fn
+        for name, fn in vars(notify).items()
+        if callable(fn)
+        and name.startswith("notify_")
+        and getattr(fn, "__module__", "") == "harvester.core.notify"
+    }
+    assert funcs, "не знайдено жодної notify_* функції — перевірка втратила сенс"
+
+    problems: list[str] = []
+    root = pathlib.Path(notify.__file__).resolve().parents[1]
+    for path in root.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), str(path))):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name not in funcs:
+                continue
+            sig = inspect.signature(funcs[name])
+            max_pos = sum(
+                1
+                for p in sig.parameters.values()
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            )
+            if len(node.args) > max_pos:
+                problems.append(f"{path.name}:{node.lineno} {name} — зайві позиційні аргументи")
+            for kw in node.keywords:
+                if kw.arg and kw.arg not in sig.parameters:
+                    problems.append(f"{path.name}:{node.lineno} {name} — невідомий аргумент {kw.arg!r}")
+
+    assert not problems, "розбіжності сигнатур notify_*:\n" + "\n".join(problems)
+
+
 @pytest.mark.asyncio
 async def test_sqlite_migration_version_and_tables(tmp_path):
     db = SqliteDatabase(str(tmp_path / "plain.db"))
