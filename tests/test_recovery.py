@@ -872,6 +872,38 @@ async def test_recover_stuck_verifying_ignores_similar_ids(db):
     assert recovered == [12]
 
 
+def test_ddgs_empty_result_is_not_treated_as_backend_error():
+    """«No results found.» — це валідний нуль, а не збій backend-а.
+
+    ddgs піднімає DDGSException("No results found.") коли всі engine-и
+    відпрацювали чисто, але нічого не знайшли. Якщо вважати це помилкою,
+    запит отримує 30-хв error-cooldown замість zero_streak-сходинки, і на
+    пулі з тисяч запитів реальні збої пошуку губилися в шумі.
+    """
+    from ddgs.exceptions import DDGSException, RatelimitException, TimeoutException
+
+    from harvester.discovery.ddgs_search import _is_no_results
+
+    assert _is_no_results(DDGSException("No results found.")) is True
+    # Збіг має бути точним: помилка engine-а зі словами «no results» —
+    # це реальний збій, і його не можна вважати нормою.
+    assert _is_no_results(DDGSException("Error in engine brave: no results attribute")) is False
+    assert _is_no_results(RatelimitException("rate limit")) is False
+    assert _is_no_results(TimeoutException("timed out")) is False
+
+
+def test_ddgs_search_error_only_when_backend_actually_failed():
+    """DDGSSearchError лише коли є справжній збій, не при нульовому результаті."""
+    import inspect
+
+    from harvester.discovery.ddgs_search import DDGSSearchChannel
+
+    source = inspect.getsource(DDGSSearchChannel.discover)
+    assert "if not results and (errors or rate_limited):" in source
+    assert "ddgs_all_backends_empty" in source
+    assert "_is_no_results" in source
+
+
 @pytest.mark.asyncio
 async def test_sqlite_migration_version_and_tables(tmp_path):
     db = SqliteDatabase(str(tmp_path / "plain.db"))
