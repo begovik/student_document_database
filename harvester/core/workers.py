@@ -207,17 +207,35 @@ class DiscoveryWorker:
         """OpenAlex курсорна пагінація: плануємо наступну сторінку або відкладений рестарт циклу."""
         if not self.settings.channels.openalex.enabled:
             return
+
+        filters = payload.get("filters", {})
+
+        # Тематичний прохід (filters.search) — скінченний: дійшли до останньої
+        # сторінки, і задачу можна вважати виконаною. Без цієї гілки вона
+        # падала б у ту саму добову перезапуск-гілку, що й курсорне сканування,
+        # і через UNIQUE(type, payload_hash) наступного дня отримала б той
+        # самий payload із cursor="*" — тобто повторно проганяла б ті самі
+        # результати ще раз, спалюючи квоту OpenAlex (10 req/s ліміт) і
+        # місця в черзі без жодної нової знахідки.
+        if filters.get("search") and not next_cursor:
+            logger.info(
+                "openalex_search_exhausted",
+                search=str(filters["search"])[:80],
+                filters={k: v for k, v in filters.items() if k != "search"},
+            )
+            return
+
         if next_cursor:
             await self.scheduler.schedule_task(
                 "api_iter",
-                {"filters": payload.get("filters", {}), "cursor": next_cursor},
-                priority=15,
+                {"filters": filters, "cursor": next_cursor},
+                priority=payload.get("priority", 15),
             )
         else:
             restart_at = (datetime.utcnow() + timedelta(hours=24)).isoformat()
             await self.scheduler.schedule_task(
                 "api_iter",
-                {"filters": payload.get("filters", {}), "cursor": "*"},
+                {"filters": filters, "cursor": "*"},
                 priority=5,
                 run_after=restart_at,
             )

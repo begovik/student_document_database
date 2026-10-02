@@ -904,6 +904,160 @@ def test_ddgs_search_error_only_when_backend_actually_failed():
     assert "_is_no_results" in source
 
 
+def test_verifier_focus_first_seen_after_default_is_off():
+    """Фокус вимкнено за замовчуванням — інакше він зміниться для всіх.
+
+    Null має перетворитися на '1970-01-01' (умова завжди справжня), а не
+    на поточну дату: інакше документи, знайдені до вмикання фокусу,
+    раптом перестали б перевірятися.
+    """
+    from harvester.config import VerifierConfig
+
+    assert VerifierConfig().focus_first_seen_after is None
+
+    import inspect
+
+    from harvester.verifier import worker
+
+    source = inspect.getsource(worker)
+    assert '(focus or "1970-01-01").strip()' in source, (
+        "focus_first_seen_after=None має давати нейтральну відсічку 1970-01-01"
+    )
+
+
+def test_verifier_focus_filters_by_first_seen_and_logs_empty_pool():
+    """Фокус має фільтрувати SQL і явно логувати порожній пул.
+
+    Мовчання при активному фокусі виглядає так само, як «все перевірено»,
+    і легко приймається за зависання воркера — тому потрібен
+    verifier_focus_pool_empty.
+    """
+    import inspect
+
+    from harvester.verifier import worker
+
+    source = inspect.getsource(worker)
+    assert "AND d.first_seen_at >= ?" in source, "фокус не потрапив у SELECT"
+    assert "verifier_focus_pool_empty" in source
+    # Параметр має йти саме в порядку плейсхолдерів у запиті
+    assert "(now_iso, cutoff, focus_after, batch_size)" in source
+
+
+def test_openalex_search_is_query_param_not_filter():
+    """`search` — окремий параметр OpenAlex, а НЕ частина filter.
+
+    Заміряно 02.10.2026: запит виду `?search=X&filter=search:X` відповідає
+    HTTP 400, тобто кожна тематична задача падала б у failed і конвеєр
+    не отримав би жодної знахідки. Тому `_build_filter` не має права
+    пропускати search, а discover() має виносити його в params окремо.
+    """
+    from harvester.discovery.openalex import OpenAlexChannel
+
+    ch = OpenAlexChannel()
+
+    filters = {"search": "неповнолітній договір", "language": "uk", "is_oa": True}
+    built = ch._build_filter(dict(filters))
+
+    assert "search:" not in built, f"search просочився у filter: {built}"
+    assert "language:uk" in built
+    assert "open_access.is_oa:true" in built
+
+
+def test_openalex_title_and_abstract_filter_strips_commas():
+    """Кома — роздільник фільтрів OpenAlex, її не можна пропустити у значенні.
+
+    Інакше `title_and_abstract.search:"a,b"` розпадеться на два фільтри й API
+    поверне 400 замість передбачуваного результату.
+    """
+    from harvester.discovery.openalex import OpenAlexChannel
+
+    ch = OpenAlexChannel()
+    built = ch._build_filter({"title_and_abstract": '"minor, contract"', "is_oa": True})
+
+    assert "title_and_abstract.search:" in built
+    assert built.count(",") == 1, f"кома змінила структуру filter: {built}"
+    assert '"minor contract"' in built
+
+    # Порожнє значення не має створювати dangling-фільтр
+    assert ch._build_filter({"title_and_abstract": "  ,  "}) == "open_access.is_oa:true"
+
+
+def test_openalex_search_task_is_not_restarted_when_exhausted():
+    """Тематичний прохід скінченний — не перезапускати безкінечно.
+
+    Без цієї гілки задача з filters.search падала б у ту саму добову
+    перезапуск-гілку, що й курсорне сканування. Наступного дня payload
+    з cursor="*" збігся б з уже існуючим (UNIQUE(type, payload_hash)) —
+    і запит знову проганяв би ті самі результати, витрачаючи квоту OpenAlex
+    (10 req/s) і місце в черзі без жодної нової знахідки.
+    """
+    import inspect
+
+    from harvester.core.workers import DiscoveryWorker
+
+    source = inspect.getsource(DiscoveryWorker._schedule_next_openalex_page)
+    assert "openalex_search_exhausted" in source
+    assert "filters.get(\"search\")" in source
+    # Порядок перевірок важливий: гілка «курсор скінчився» має передувати
+    # добовому перезапуску, інакше умова search ніколи не спрацює.
+    assert source.index("search") < source.index("restart_at")
+
+
+def test_openalex_bulk_scan_still_restarts_daily():
+    """Регресія: режим сканування без search має лишатись добовим циклом.
+
+    Іначе зміна для кампанії зупинила б основне наповнення пулу.
+    """
+    from harvester.core.workers import DiscoveryWorker
+
+    scheduled: list[dict] = []
+
+    class _FakeScheduler:
+        async def schedule_task(self, task_type, payload, priority=10,
+                                run_after=None, max_attempts=5):
+            scheduled.append({"payload": payload, "run_after": run_after})
+            return 1
+
+    class _FakeSettings:
+        class channels:
+            class openalex:
+                enabled = True
+
+    worker = DiscoveryWorker.__new__(DiscoveryWorker)
+    worker.settings = _FakeSettings()
+    worker.scheduler = _FakeScheduler()
+
+    bulk_filters = {"language": "uk", "is_oa": True}
+    asyncio.run(
+        DiscoveryWorker._schedule_next_openalex_page(worker, {"filters": bulk_filters}, None)
+    )
+    assert len(scheduled) == 1
+    assert scheduled[0]["run_after"] is not None, "курсорне сканування має перезапускатися"
+    assert scheduled[0]["payload"]["cursor"] == "*"
+
+    # Тематичний: без перезапуску і без нової задачі
+    scheduled.clear()
+    asyncio.run(
+        DiscoveryWorker._schedule_next_openalex_page(
+            worker, {"filters": {**bulk_filters, "search": "неповнолітній"}}, None
+        )
+    )
+    assert scheduled == [], "пошуковий прохід не має перезапускатися"
+
+    # Тематичний із наступним курсором — має продовжитись, з пріоритетом задачі
+    scheduled.clear()
+    asyncio.run(
+        DiscoveryWorker._schedule_next_openalex_page(
+            worker,
+            {"filters": {**bulk_filters, "search": "неповнолітній"}, "priority": 100},
+            "CUR1",
+        )
+    )
+    assert len(scheduled) == 1
+    assert scheduled[0]["payload"]["cursor"] == "CUR1"
+    assert scheduled[0]["payload"]["filters"]["search"] == "неповнолітній"
+
+
 def test_llm_alert_only_when_whole_chain_fails():
     """Помилка однієї моделі не має сповіщати — ланцюг і далі працює.
 

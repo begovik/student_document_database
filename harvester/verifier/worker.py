@@ -115,6 +115,12 @@ class VerifierWorker:
                     cutoff = (datetime.utcnow() - timedelta(days=recheck_days)).isoformat()
                     now_iso = datetime.utcnow().isoformat()
 
+                    # Фокус кампанії: беремо лише документи, знайдені після
+                    # відсічки. Без фокусу ('1970-01-01') умова завжди справжня,
+                    # тож окремий SQL не потрібен і поведінка не змінюється.
+                    focus = getattr(self.settings.verifier, "focus_first_seen_after", None)
+                    focus_after = (focus or "1970-01-01").strip()
+
                     # next_check_at — реальний розклад повторної перевірки.
                     # Раніше селектор ігнорував його й кожні recheck_days
                     # перевіряв увесь пул заново, витрачаючи денну квоту LLM на
@@ -134,16 +140,24 @@ class VerifierWorker:
                               OR (vr.next_check_at IS NOT NULL AND vr.next_check_at <= ?)
                               OR (vr.next_check_at IS NULL AND vr.checked_at < ?)
                           )
+                          AND d.first_seen_at >= ?
                         ORDER BY (vr.checked_at IS NULL) DESC,
                                  COALESCE(vr.next_check_at, vr.checked_at, '1970-01-01') ASC,
                                  d.verified_at DESC
                         LIMIT ?
                         """,
-                        (now_iso, cutoff, batch_size),
+                        (now_iso, cutoff, focus_after, batch_size),
                     )
 
                     if not rows:
-                        log.info("verifier_batch_empty_sleep", interval_s=interval_s)
+                        # Мовчання з фокусом небезпечне: воно виглядає так
+                        # само, як «все перевірено», і легко прийняти за
+                        # зависання воркера. Тому позначаємо явно.
+                        if focus:
+                            log.info("verifier_focus_pool_empty",
+                                     focus_after=focus_after, interval_s=interval_s)
+                        else:
+                            log.info("verifier_batch_empty_sleep", interval_s=interval_s)
                         await asyncio.sleep(interval_s)
                         continue
 
