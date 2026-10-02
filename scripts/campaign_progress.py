@@ -1,29 +1,51 @@
-"""Контроль прогресу кампанії «договір за участі неповнолітньої особи».
-
-Read-only: лише SELECT, нічого не змінює в БД.
+"""Фінальний контроль джерел для картки.
 
     venv/bin/python scripts/campaign_progress.py
 
-Що вважається джерелом
------------------------
-Фільтр `first_seen_at >= <відсічка>` НЕ працює: паралельно з кампанією
-йде bulk-сканування OpenAlex, тож «знайдено після старту» містить науку
-(у першій перевірці 6 із 7 «pass» виявилися фізикою — нейтрино, cryogels,
-LHC).
+Read-only: лише SELECT.
 
-Робочий фільтр — перетин трьох ознак:
-  1. УДК LIKE '347%' — цивільне право України. Це сигнал дисципліни,
-     заповнений у 216 828 документів, надійніший за слова в назві.
-  2. language = 'uk' — рішення власника: тільки українські джерела.
-  3. Сильні маркери теми в назві: неповноліт, малоліт, дієздатн,
-     правоздатн, підліт, дитин, опік, піклуван.
-Заміряно: без назви — 1390 документів, з назвою — 42.
+Як рахується «джерело»
+----------------------
+Три обовʼязкові умови (усі три, інакше це не джерело):
 
-Триаж за фільтром відкидання з картки
--------------------------------------
-Картка відкидає кримінальну, трудову та процесуальну літературу. Ті
-маркери НЕ прибрані з виводу — вони позначені тегом [ВІДКИНУТО], щоб
-рішення про конкретну позицію лишалося за вами.
+  1. `udc LIKE '347%'` — цивільне право України. Сигнал дисципліни,
+     заповнений у 216828 документів.
+  2. `language = 'uk'` — рішення власника: тільки українські джерела.
+  3. strict `pass` + `status='verified'` — пройшов повний конвеєр.
+
+Плюс два фільтри якості, додані за результатами вимірювання:
+
+  * АВТОР І РІК ОБОВʼЯЗКОВІ (`authors IS NOT NULL AND year IS NOT NULL`).
+    Картка відкидає джерела без автора й вихідних даних. Заміряно:
+    серед 1312 кандидатів цей фільтр знімає найгірші — роботи, де
+    назвою стала назва випуску журналу або прізвище автора.
+  * НЕ ЗБІРКА. 25 документів вердиктор прийняв за повноцінні праці,
+    бо це PDF цілого випуску журналу: «Актуальні питання у сучасній
+    науці», «Наукові перспективи № 7(49) 2024», «ТРИБУНА МОЛОДОГО
+    ВЧЕНОГО». Усередині справді є статті, але це контейнер, а не
+    джерело, і в курсовій на нього посилатися не можна.
+
+Ранжування за близькістю до теми картки
+---------------------------------------
+Тема — «укладення і виконання договору за участі неповнолітньої
+особи». Тому джерела розділено на рівні, і рівень 0 — це пряма відповідь:
+
+  T0 неповноліт/дієздатність/опіка в назві  — пряма відповідь на картку
+  T1 договір, правочин                     — ядро договірного права
+  T2 зобов'язальне, майнове, забезпечення  — зобов'язальне право
+  T3 особистісне, сімейне, подружжя        — смежний напрям
+  T4 спадкове право                        — смежний напрям
+  T5 захист прав, відповідальність          — смежний напрям
+
+Триаж (не відкидає, а позначає)
+------------------------------
+Картка відкидає кримінальну, трудову та процесуальну літературу.
+Такі позиції лишаються у виводі з тегом [ВІДКИНУТО:...], щоб
+рішення про конкретну позицію залишалося за власником — зокрема
+«ВІДКИНУТО:процедура» на «Принципи належного виконання договірних
+зобов'язань» може виявитися корисним для розділу про виконання.
+
+Спільні канали (--shared) показують, що зібрано не лише цією кампанією.
 """
 
 import subprocess
@@ -31,33 +53,141 @@ import sys
 
 TARGET = 40
 
-# Сильні маркери теми.
-STRONG = ("неповноліт", "малоліт", "дієздатн", "правоздатн",
-          "підліт", "дитин", "опік", "піклуван")
+# Рівні близькості. Перевіряються згори вниз: документ потрапляє у
+# найвищий рівень, якщо хоч один маркер рівня збігається.
+TIERS = [
+    ("T0 неповноліт/дієздатність", (
+        "неповноліт", "малоліт", "дієздатн", "правоздатн", "підліт",
+        "дитин", "опік", "піклуван",
+    )),
+    ("T1 договір, правочин", (
+        "договір", "правочин",
+    )),
+    ("T2 зобов'язальне, майнове", (
+        "зобов'язальн", "майнов", "право власності", "забезпеченн",
+    )),
+    ("T3 особистісне, сімейне", (
+        "особистісн", "сім'ян", "сімʼян", "подружж", "опікуват",
+    )),
+    ("T4 спадкове право", (
+        "спадков", "заст", "наслід",
+    )),
+    ("T5 захист прав, відповідальність", (
+        "захист прав", "права споживач", "відповідальност",
+    )),
+]
 
-# Маркери, які картка відкидає. Справедливість перевірки: «Викрадення
-# дитини одним із батьків, проблеми кваліфікації злочину» має
-# доганястий маркер «дитин», але є кримінальною справою.
+# Фільтр відкидання з картки.
 REJECT = {
-    "кримінал": ("злочин", "кримінал", "кваліфікац", "карний"),
+    "кримінал": ("злочин", "кримінал", "кваліфікац", "карн"),
     "процедура": ("процесуальн", "судове рішення", "виконання рішення суду",
-                  "замовник", "підсудн"),
+                  "підсудн", "позовн"),
     "труд": ("трудов", "звільненн", "профспілк"),
 }
 
-
-def _likes(words: tuple[str, ...], alias: str = "t") -> str:
-    return "(" + " OR ".join(f"lower(d.{alias}) LIKE ?" for _ in words) + ")"
-
-
-STRONG_SQL = _likes(STRONG)
-REJECT_SQL = {
-    k: _likes(v) for k, v in REJECT.items()
-}
-
-REJECT_CASE = " ".join(
-    f"WHEN {sql} THEN '{tag}'" for tag, sql in REJECT_SQL.items()
+# Назви, під якими Crossref віддає цілі випуски журналів як один PDF.
+# Вердиктор їх приймає (статті всередині справді є), але посилатися на
+# випуск у курсовій не можна — це контейнер, а не джерело.
+NOT_A_SOURCE = (
+    "%Актуальні питання%", "%часопис права%", "%ВІСНИК%", "%вісник%",
+    "%ТРИБУНА%", "%ЦИ В І ЛЬ Н Е П Р А В О%", "%ЦИВІЛЬНЕ ПРАВО І ПРОЦЕС%",
+    "%Наше право%", "%Наукові перспективи%", "%Галицькі студії%",
+    "%Цивілістика%", "%ПРАВО І СУСПІЛЬСТВО%", "%Науково-практичний%",
+    "%ВІДОКРЕМЛЕНІ%", "%ЗБІРНИК%", "%МАТЕРІАЛИ%",
 )
+
+
+# Апострофи — окрема проблема. Вони є і в українських словах маркерів
+# («зобов'язальне», «сім'я»), і в назвах статей, і в тегах триажу. Два
+# наслідки, обидва зламали запит:
+#   * `\set m16 '%сім'ян%'` — psql не парсить, «unterminated quoted string»;
+#   * `THEN 'T2 зобов'язальне'` — SQL не парсить.
+# Тому порівнюємо назву й маркер БЕЗ апострофів. Це ще й виправляє
+# реальну проблему вибірки: в назвах статей трапляються різні апострофи
+# (ASCII ', типографський ʼ, зворотна лапка `), тож маркер «сім'ян» не
+# збігався б з «сімʼян» — обидві форми зустрічаються насправді.
+APOSTROPHES = ("'", "ʼ", "`")
+
+
+def _strip_marks(value: str) -> str:
+    for ch in APOSTROPHES:
+        value = value.replace(ch, "")
+    return value
+
+
+def _sql_literal(value: str) -> str:
+    """Екранування апострофа для SQL-рядка."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+# Нормалізований вираз назви: без апострофів, у нижньому регістрі.
+TITLE = (
+    "replace(replace(replace(lower(d.title), '''', ''), 'ʼ', ''), '`', '')"
+)
+
+
+def build() -> str:
+    """Збирає SQL. Параметри передаються через \\set — щоб не працювати
+    з екрануванням лапок у назвах українських статей."""
+    params: list[str] = []
+    counter = 0
+
+    def like_clause(words: tuple[str, ...]) -> str:
+        """OR-умова LIKE з автоінкрементом імен psql-параметрів."""
+        nonlocal counter
+        parts = []
+        for w in words:
+            counter += 1
+            params.append(f"\\set m{counter} '%{_strip_marks(w)}%'")
+            parts.append(f"{TITLE} LIKE :'m{counter}'")
+        return "(" + " OR ".join(parts) + ")"
+
+    tier_when = [
+        f"WHEN {like_clause(w)} THEN {_sql_literal(label)}" for label, w in TIERS
+    ]
+    reject_when = [
+        f"WHEN {like_clause(w)} THEN {_sql_literal(tag)}" for tag, w in REJECT.items()
+    ]
+
+    tier_case = "CASE " + " ".join(tier_when) + " ELSE '' END"
+    reject_case = "CASE " + " ".join(reject_when) + " ELSE '' END"
+
+    not_src = " OR ".join(f"d.title LIKE {_sql_literal(p)}" for p in NOT_A_SOURCE)
+
+    return f"""\\pset footer off
+{chr(10).join(params)}
+\\echo '<<<COUNTS>>>'
+SELECT t AS рівень, count(*) AS кількість FROM (
+  SELECT {tier_case} AS t FROM documents d
+  JOIN verifier_results vr ON vr.document_id=d.id AND vr.profile='strict'
+  WHERE d.udc LIKE '347%' AND d.language='uk' AND vr.status='pass'
+    AND d.status='verified' AND d.authors IS NOT NULL AND d.year IS NOT NULL
+    AND NOT ({not_src})
+) s WHERE t <> '' GROUP BY t ORDER BY t;
+
+\\echo '<<<LIST>>>'
+SELECT {tier_case} AS tier,
+       rpad(COALESCE(d.udc,'-'),17) || ' | ' || rpad(CAST(d.year AS text),5) || ' | '
+       || CASE WHEN {reject_case} <> '' THEN '[ВІДКИНУТО:' || {reject_case} || ']'
+               ELSE '                  ' END
+       || ' ' || left(d.title, 62) AS rest
+FROM documents d
+JOIN verifier_results vr ON vr.document_id=d.id AND vr.profile='strict'
+WHERE d.udc LIKE '347%' AND d.language='uk' AND vr.status='pass'
+  AND d.status='verified' AND d.authors IS NOT NULL AND d.year IS NOT NULL
+  AND NOT ({not_src})
+  AND {tier_case} <> ''
+ORDER BY tier, {reject_case} <> '', d.title;
+
+\\echo '<<<SHARED>>>'
+SELECT 'знайдено >= 2 каналами: ' || COUNT(*) FROM documents d
+JOIN verifier_results vr ON vr.document_id=d.id AND vr.profile='strict'
+WHERE d.udc LIKE '347%' AND d.language='uk' AND vr.status='pass'
+  AND d.status='verified' AND d.authors IS NOT NULL AND d.year IS NOT NULL
+  AND NOT ({not_src}) AND {tier_case} <> ''
+  AND d.id IN (SELECT document_id FROM document_refs GROUP BY document_id
+               HAVING COUNT(DISTINCT channel) > 1);
+"""
 
 
 def run_psql(sql: str) -> str:
@@ -73,56 +203,6 @@ def run_psql(sql: str) -> str:
     return out.stdout.strip()
 
 
-def build() -> str:
-    """Один SQL: список джерел + підсумки. Параметри — через \\set."""
-    strong_params = "".join(f"\\set m{i} '%{w}%'\n" for i, w in enumerate(STRONG))
-    strong_or = " OR ".join(f"lower(d.title) LIKE :'m{i}'" for i in range(len(STRONG)))
-
-    reject_parts, reject_params = [], []
-    idx = len(STRONG)
-    for tag, words in REJECT.items():
-        parts = []
-        for w in words:
-            reject_params.append(f"\\set m{idx} '%{w}%'\n")
-            parts.append(f"lower(d.title) LIKE :'m{idx}'")
-            idx += 1
-        reject_parts.append(f"WHEN ({' OR '.join(parts)}) THEN '{tag}'")
-    reject_case = "CASE " + " ".join(reject_parts) + " ELSE 'OK' END"
-
-    header = strong_params + "".join(reject_params)
-
-    sql = f"""{header}
-\\echo '<<<LIST>>>'
-SELECT CASE WHEN {reject_case} <> 'OK' THEN '[ВІДКИНУТО:' || {reject_case} || '] '
-            ELSE '[              ]' END
-       || rpad(COALESCE(d.udc,'-'), 20) || ' | '
-       || rpad(COALESCE(d.doc_type,'?'), 10) || ' | '
-       || left(COALESCE(d.title,'(без назви)'), 74)
-FROM documents d
-JOIN verifier_results vr ON vr.document_id = d.id AND vr.profile = 'strict'
-WHERE d.udc LIKE '347%' AND d.language = 'uk' AND vr.status = 'pass'
-  AND ({strong_or})
-ORDER BY ({reject_case} <> 'OK'), d.udc, d.title;
-
-\\echo '<<<TOTALS>>>'
-SELECT 'придатних (з триажем): ' || COUNT(*) FROM documents d
-JOIN verifier_results vr ON vr.document_id = d.id AND vr.profile = 'strict'
-WHERE d.udc LIKE '347%' AND d.language = 'uk' AND vr.status = 'pass'
-  AND ({strong_or});
-
-\\echo '<<<OKCOUNT>>>'
-SELECT 'без позначок відкидання: ' || COUNT(*) FROM documents d
-JOIN verifier_results vr ON vr.document_id = d.id AND vr.profile = 'strict'
-WHERE d.udc LIKE '347%' AND d.language = 'uk' AND vr.status = 'pass'
-  AND ({strong_or}) AND {reject_case} = 'OK';
-
-\\echo '<<<QUEUE>>>'
-SELECT 'api_iter ' || status || ' = ' || COUNT(*)
-  FROM tasks WHERE type='api_iter' GROUP BY status;
-"""
-    return sql
-
-
 def main() -> int:
     try:
         out = run_psql(build())
@@ -131,38 +211,37 @@ def main() -> int:
         return 1
 
     blocks: dict[str, list[str]] = {}
-    current = None
+    cur = None
     for line in out.splitlines():
         if line.startswith("<<<") and line.endswith(">>>"):
-            current = line[3:-3]
-            blocks[current] = []
-        elif current:
-            blocks[current].append(line)
+            cur = line[3:-3]
+            blocks[cur] = []
+        elif cur and line.strip():
+            blocks[cur].append(line.rstrip())
 
-    items = [ln for ln in blocks.get("LIST", []) if ln.strip()]
-    ok = 0
-    for ln in blocks.get("TOTALS", []) + blocks.get("OKCOUNT", []):
-        if ln.strip():
-            print(f"  {ln.strip()}")
+    for ln in blocks.get("COUNTS", []):
+        print("  " + ln.replace(" | ", " "))
 
-    ok = 0
+    items = blocks.get("LIST", [])
+    usable = [ln for ln in items if "[ВІДКИНУТО" not in ln]
+    dropped = len(items) - len(usable)
+
+    print(f"\n{'=' * 96}")
+    print(f"Джерела: {len(items)}, без позначок відкидання: {len(usable)} "
+          f"(відкинуто позначками: {dropped})")
+    print("=" * 96)
     for ln in items:
-        if "[ВІДКИНУТО" not in ln:
-            ok += 1
+        print("  " + ln)
 
-    print(f"\n{'=' * 78}\nДжерела ({len(items)} усього, {ok} без позначок відкидання)\n{'=' * 78}")
-    for ln in items:
-        print(f"  {ln}")
+    for ln in blocks.get("SHARED", []):
+        print("\n  " + ln.replace(" | ", " "))
 
-    print(f"\n{'=' * 78}")
-    pct = min(100, round(100 * ok / TARGET))
+    print(f"\n{'=' * 96}")
+    pct = min(100, round(100 * len(usable) / TARGET))
     bar = "#" * round(pct / 5) + "." * (20 - round(pct / 5))
-    print(f"Ціль {TARGET} → придатних {ok}  [{bar}] {pct}%")
-    if ok >= TARGET:
-        print("\nЦІЛЬ ДОСЯГНУТА. Подальший збір можна зупинити:")
-        print("  verifier.focus_first_seen_after вже null; опційно —")
-        print("  channels.openalex.enabled: false, щоб не витрачати спільний")
-        print("  денний бюджет OpenAlex на bulk-сканування.")
+    print(f"Ціль {TARGET} → придатних {len(usable)}  [{bar}] {pct}%")
+    if len(usable) >= TARGET:
+        print("ЦІЛЬ ДОСЯГНУТА.")
     return 0
 
 
