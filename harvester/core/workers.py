@@ -18,6 +18,7 @@ from harvester.db.repositories import (
     SearchQueriesRepository,
 )
 from harvester.dedup.urlnorm import normalize_url
+from harvester.discovery.crossref import CrossrefChannel
 from harvester.discovery.ddgs_search import DDGSSearchChannel
 from harvester.discovery.openalex import OpenAlexBudgetExhausted, OpenAlexChannel
 from harvester.net.guards import is_url_allowed
@@ -61,6 +62,10 @@ class DiscoveryWorker:
         self.channels = {
             "search": DDGSSearchChannel(),
             "api_iter": OpenAlexChannel(),
+            # Crossref має власний тип задачі: пагінація в ньому не
+            # курсорна (offset), а прохід навмисно скінченний, тож
+            # спільна гілка _schedule_next_openalex_page для нього не годиться.
+            "crossref_iter": CrossrefChannel(),
         }
         self._running = True
         self._last_reactivation_at = 0.0
@@ -72,7 +77,9 @@ class DiscoveryWorker:
 
         while self._running and self.scheduler._running:
             try:
-                task = await self.scheduler.pick_task(task_types=["search", "api_iter"])
+                task = await self.scheduler.pick_task(
+                    task_types=["search", "api_iter", "crossref_iter"]
+                )
                 if task is None:
                     idle_streak += 1
                     await self._ensure_search_task()
@@ -182,6 +189,22 @@ class DiscoveryWorker:
             elif task_type == "api_iter":
                 next_cursor = getattr(channel, "last_next_cursor", None)
                 await self._schedule_next_openalex_page(payload, next_cursor)
+            elif task_type == "crossref_iter":
+                # Наступна сторінка лише якщо канал сам вирішив, що
+                # прохід ще не дійшов до max_offset: інакше задача
+                # завершується й більше не планується (скінченний прохід).
+                next_offset = getattr(channel, "last_next_offset", None)
+                if next_offset is not None:
+                    await self.scheduler.schedule_task(
+                        "crossref_iter",
+                        {**payload, "offset": next_offset},
+                        priority=payload.get("priority", 15),
+                    )
+                else:
+                    logger.info(
+                        "crossref_pass_exhausted",
+                        query=str(payload.get("query", ""))[:80],
+                    )
 
             if hasattr(channel, "wait_interval"):
                 await channel.wait_interval()

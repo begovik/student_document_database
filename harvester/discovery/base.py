@@ -4,10 +4,9 @@ from typing import Any, Protocol
 
 # Зарезервовані канали можуть бути присутніми в YAML, але не повинні
 # запускатися, доки для них немає адаптера та тестів.
-IMPLEMENTED_DISCOVERY_CHANNELS = frozenset({"ddgs", "openalex"})
+IMPLEMENTED_DISCOVERY_CHANNELS = frozenset({"ddgs", "openalex", "crossref"})
 PLANNED_DISCOVERY_CHANNELS = frozenset(
     {
-        "crossref",
         "unpaywall",
         "semanticscholar",
         "arxiv",
