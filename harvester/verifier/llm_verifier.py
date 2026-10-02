@@ -12,6 +12,21 @@ logger = structlog.get_logger()
 
 MIN_LLM_CONFIDENCE = 0.5
 
+# Скільки тексту реально показувати LLM. Раніше тут було жорстко 3000
+# знаків, а `llm_max_chars` з конфігу не використовувався ніде — тобто
+# налаштування мовчки нічого не робило.
+#
+# Чому 3000 було недостатньо: українська наукова стаття відкривається
+# УДК + назвою + анотацією (200-400 слів) + ключовими словами, тобто
+# перші ~2500 знаків — це титул і анотація. LLM, бачивши лише їх,
+# писав у вердикті «наданий фрагмент є лише анотацією» — і відхиляв
+# повні статті. Виміряно на 16 тематичних правових документах: усі
+# відхилені з таким коментарем мали рівно цю причину.
+#
+# 12000 знаків — це приблизно 6-8 сторінок, тобто вже видно основний
+# текст, а не лише аннотацію.
+DEFAULT_LLM_MAX_CHARS = 12000
+
 DOC_TYPES = ["article", "book", "textbook", "methodical", "thesis", "dissertation", "report", "preprint", "other"]
 
 PROMPT = """\
@@ -23,8 +38,9 @@ PROMPT = """\
 - Мова: {language}
 - УДК: {udc}
 - Сторінок: {page_count}
-- Початковий фрагмент тексту (до 3000 знаків; це НЕ весь документ): \"\"\"{text_sample}\"\"\"
+- Початковий фрагмент тексту (до {max_chars} знаків; це НЕ весь документ): \"\"\"{text_sample}\"\"\"
 - Структурні ознаки, обчислені парсером усього PDF: {structure}
+- Чи зібрані структурні ознаки: {structure_missing}
 
 Доступні теги (коди тем, обери 1-3):
 {topics_list}
@@ -34,10 +50,21 @@ PROMPT = """\
 {{"verdict": "pass" | "fail", "comment": "1-2 речення укр чому", "confidence": 0.0-1.0, "extracted_title": "точна назва з титулу/першої сторінки або null", "extracted_authors": ["Прізвище І.О.", ...] | null, "tags": ["код_теми", ...], "doc_type": "тип"}}
 Правила для verdict:
 - 1-2 стор без структури → fail ("фрагмент, відсутня структура")
-- Немає вступу/висновків/списку джерел → fail
 - Дипломна робота, автореферат дисертації або інша нецільова праця → fail
 - Повна структура (титул, 3+ розділи, висновки, 5+ джерел) → pass
 - Впевненість у pass нижче {min_confidence} → fail; не вигадуй дані
+
+ВАЖЛИВО — не плутай відсутнє у фрагменті з відсутнім у документі:
+Фрагмент — це лише початок тексту. Ти НЕ бачиш кінця документа, де
+зазвичай і лежать висновки та список джерел. Тому:
+- якщо у фрагменті немає висновків або списку джерел — це НЕ підстава для fail;
+- якщо `Чи зібрані структурні ознаки` = "ТАК" — це означає, що парсер не
+  відпрацював (документ перевірено до впровадження цієї перевірки), і
+  порожня структура НЕ довід відсутності розділів;
+- підстава для fail — коли видно, що документ обривається: лише титул
+  і анотація без жодного основного тексту, або 1-2 сторінки;
+- спирайся на `Сторінок`: 3+ сторінки з непустим основним текстом у
+  фрагменті — це сильний доказ на користь повноцінної праці.
 Для extracted_title/extracted_authors:
 - Витягни точну назву та авторів з фрагменту (титул, шапка статті). Якщо автори є — перелічи всіх (до 5).
 - Якщо в фрагменті немає авторів/назви — поверни null.
@@ -46,6 +73,16 @@ PROMPT = """\
 - Обери 1-3 коди з переліку вище за змістом фрагменту. Якщо жодна не підходить — [].
 Для doc_type: обери один з {doc_types} за змістом (article — стаття, book — монографія/книга, textbook — підручник, methodical — метод. вказівки, thesis — диплом/магістерська, dissertation — дисертація/автореферат дисертації, report — звіт/тези доповіді, preprint — препринт, other — інше). Якщо не впевнений — other.
 """
+
+
+def _max_chars() -> int:
+    """Скільки символів тексту показувати LLM (verifier.llm_max_chars)."""
+    try:
+        from harvester.config import get_settings
+
+        return get_settings().verifier.llm_max_chars
+    except Exception:  # noqa: BLE001 — конфіг не критичний для промпта
+        return DEFAULT_LLM_MAX_CHARS
 
 
 async def verify_with_llm(doc: dict, llm_client, topics: list[dict] | None = None) -> tuple[str, str, float, str | None, list[str] | None, list[str], str]:
@@ -80,15 +117,27 @@ async def verify_with_llm(doc: dict, llm_client, topics: list[dict] | None = Non
             extra = json.loads(extra)
         except json.JSONDecodeError:
             extra = {}
-    structure = extra.get("structure", {}) if isinstance(extra, dict) else {}
+    structure = extra.get("structure") if isinstance(extra, dict) else None
+    # Документи, перевірені до появи `structure` у extra, не мають цього
+    # поля взагалі. Для них відсутність структурних ознак НЕ є доказом
+    # відсутності структури, і промпт має це сказати прямо — інакше LLM
+    # читає порожній словник як «розділів немає».
+    structure_missing = not structure
+    if structure_missing:
+        structure = {}
+
+    max_chars = _max_chars()
+
     prompt = PROMPT.format(
         title=title,
         authors=authors,
         language=doc.get("language") or "невідома",
         udc=doc.get("udc") or "—",
         page_count=doc.get("page_count") or "?",
-        text_sample=(doc.get("text_sample") or "")[:3000],
+        text_sample=(doc.get("text_sample") or "")[:max_chars],
+        max_chars=max_chars,
         structure=json.dumps(structure, ensure_ascii=False, sort_keys=True)[:1500],
+        structure_missing="ТАК — структурні ознаки НЕ ЗІБРАНО" if structure_missing else "ні",
         topics_list=topics_list,
         doc_types=", ".join(DOC_TYPES),
         min_confidence=MIN_LLM_CONFIDENCE,

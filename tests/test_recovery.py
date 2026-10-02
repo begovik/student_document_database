@@ -997,6 +997,90 @@ def test_openalex_budget_error_is_not_swallowed_by_generic_handler():
     assert not issubclass(OpenAlexBudgetExhausted, (asyncio.CancelledError,))
 
 
+def test_verifier_llm_max_chars_is_actually_used():
+    """verifier.llm_max_chars не має бути мертвою конфігурацією.
+
+    Було: промпт жорстко обрізав текст до 3000 знаків, а поле
+    llm_max_chars=15000 не читалося ніде — тобто його зміна в config.yaml
+    не робила нічого, і про це не сигнализував ніхто.
+    """
+    import inspect
+
+    from harvester.verifier import llm_verifier
+
+    source = inspect.getsource(llm_verifier.verify_with_llm)
+    assert "[:3000]" not in source, "лишився жорсткий обріз 3000 символів"
+    assert "[:max_chars]" in source, "текст має обрізатися через max_chars"
+
+    # Значення з конфігу має реально доходити до промпта
+    from harvester.config import VerifierConfig
+
+    cfg = VerifierConfig()
+    assert cfg.llm_max_chars >= 8000, (
+        "менше 8000 символів у sampled-тексті для української статті — це "
+        "знову анотація, і вердикт знову буде хибним"
+    )
+    assert llm_verifier._max_chars() == cfg.llm_max_chars
+
+
+def _render_prompt(structure: dict | None, text_sample: str = "x" * 500) -> str:
+    """Відрендерити промпт так, як це робить verify_with_llm."""
+    from harvester.verifier.llm_verifier import PROMPT
+
+    return PROMPT.format(
+        title="t", authors="a", language="uk", udc="347.1", page_count=10,
+        text_sample=text_sample, max_chars=12000,
+        structure=json.dumps(structure, ensure_ascii=False, sort_keys=True)[:1500],
+        structure_missing="ТАК — структурні ознаки НЕ ЗІБРАНО" if not structure else "ні",
+        topics_list="t", doc_types="article", min_confidence=0.5,
+    )
+
+
+def test_verifier_prompt_tells_llm_sample_is_partial():
+    """Промпт має прямо забороняти ототожнювати фрагмент із документом.
+
+    Інакше LLM читає «у фрагменті немає висновків» як «у документі немає
+    висновків» і відхиляє повні статті. Саме так з'явилися 16 хибних
+    відхилень серед правових документів (усі з коментарем «фрагмент є
+    лише анотацією»).
+    """
+    rendered = _render_prompt(structure={})
+    assert "не плутай відсутнє у фрагменті з відсутнім у документі" in rendered
+    assert "це НЕ підстава для fail" in rendered
+    # Старі правило «немає вступу/висновків/списку джерел → fail» зникло:
+    # воно й викликало хибні відхилення.
+    assert "Немає вступу/висновків/списку джерел → fail" not in rendered
+    # Шаблон має підставляти max_chars, а не містити літерал 3000
+    assert "{max_chars}" not in rendered and "3000 знаків" not in rendered
+
+
+def test_verifier_prompt_flags_missing_structure():
+    """Порожня structure має позначатися як «не зібрано», а не «структури немає»."""
+    rendered = _render_prompt(structure=None)
+    assert "структурні ознаки НЕ ЗІБРАНО" in rendered
+    assert "порожня структура НЕ довід відсутності розділів" in rendered
+
+    # Коли структура є — маркер має бути відсутній, інакше LLM ігноруватиме
+    # справжні дані парсера
+    with_struct = _render_prompt(structure={"has_references": True})
+    assert "структурні ознаки НЕ ЗІБРАНО" not in with_struct
+    assert "has_references" in with_struct
+
+
+def test_pipeline_stores_enough_text_for_verdict():
+    """documents.text_sample має вистачати для вердикта, а не лише для мови.
+
+    Якщо збережений зразок коротший за verifier.llm_max_chars, LLM
+    отримує менше тексту, ніж обіцяє конфіг, — тобто налаштування знову
+    стає неправдою, тільки тепер непомітно.
+    """
+    from harvester.config import VerifierConfig
+    from harvester.verify import pipeline
+
+    assert pipeline.TEXT_SAMPLE_CHARS >= 8000
+    assert pipeline.TEXT_SAMPLE_CHARS >= VerifierConfig().llm_max_chars
+
+
 def test_openalex_search_is_query_param_not_filter():
     """`search` — окремий параметр OpenAlex, а НЕ частина filter.
 

@@ -21,6 +21,17 @@ from harvester.verify.titlematch import match_title
 
 logger = structlog.get_logger()
 
+# Скільки початкового тексту зберігати в documents.text_sample.
+#
+# Було 4000 — цього вистачало для визначення мови, але не для вердикта
+# якості: verifier показував LLM лише перші 3000 символів, а в українській
+# правовій статті це УДК + назва + анотація + ключові слова. LLM не бачив
+# основного тексту й писав «наданий фрагмент є лише анотацією».
+#
+# 12000 символів ≈ 6-8 сторінок: це вже основний текст. Приріст ~
+# 8 КБ на новий документ; за темпом ~1700 док/день це ~14 МБ/день.
+TEXT_SAMPLE_CHARS = 12000
+
 
 class VerifyResult:
     def __init__(self, success: bool, code: str, message: str | None = None):
@@ -168,7 +179,7 @@ class VerifyPipeline:
                 await self._log_attempt(doc_id, "parse", url, "INSUFFICIENT_TEXT", started_at)
                 return VerifyResult(False, "INSUFFICIENT_TEXT", "PDF не містить достатнього повного тексту")
 
-            text_sample = (parse_result.text_sample or parse_result.text[:4000])[:4000]
+            text_sample = (parse_result.text_sample or parse_result.text)[:TEXT_SAMPLE_CHARS]
             lang_text = parse_result.text[:20000]
 
             lang_result = await detect_language(lang_text)

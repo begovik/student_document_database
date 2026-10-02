@@ -114,7 +114,7 @@ class VerifierConfig(BaseModel):
     recheck_days: int = Field(default=7, ge=1, le=365)
     llm_enabled: bool = True
     llm_model: str = "gemini-3.1-flash-lite"
-    llm_max_chars: int = Field(default=15000, ge=1000, le=100000)
+    llm_max_chars: int = Field(default=12000, ge=1000, le=100000)
     # Фокус на документах, знайдених після цієї відсічки (ISO, UTC).
     #
     # Навіщо: селектор віддає перевагу документам, які ніколи не перевірялись,
