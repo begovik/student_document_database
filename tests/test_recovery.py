@@ -943,6 +943,60 @@ def test_verifier_focus_filters_by_first_seen_and_logs_empty_pool():
     assert "(now_iso, cutoff, focus_after, batch_size)" in source
 
 
+def test_openalex_429_raises_budget_error_not_generic():
+    """429 має бути окремим типом помилки, а не загальним Exception.
+
+    Заміряно 02.10.2026: без API-ключа OpenAlex відповідає 429 з тілом
+    "Insufficient budget ... resets at midnight UTC". Загальним шляхом
+    помилки кожна задача витрачала б спробу, тож за ~25 хвилин ретраїв
+    увесь пул задач перейшов би у failed — до сбросу бюджету.
+    """
+    from harvester.discovery.openalex import OpenAlexBudgetExhausted
+
+    err = OpenAlexBudgetExhausted(5230)
+    assert err.retry_after_s == 5230
+    # Нижня межа: сервер може не прислати retry-after, і тоді нуль або
+    # від'ємне значення відклали б задачу на миттєво — вона знову впала б
+    # у 429 і зациклилась би з порожнім очікуванням.
+    assert OpenAlexBudgetExhausted(0).retry_after_s >= 60
+    assert OpenAlexBudgetExhausted(-5).retry_after_s >= 60
+
+
+def test_openalex_429_does_not_consume_retry_budget():
+    """defer_task має викликатися на вичерпання бюджету, fail_task — ні.
+
+    fail_task витрачає спробу і за 5 × 300 с переводить задачу у failed.
+    Тому різниця між defer і fail тут — не стиль, а те, чи переживе
+    пул кампанії ніч до сбросу бюджету.
+    """
+    import inspect
+
+    from harvester.core.workers import DiscoveryWorker
+
+    source = inspect.getsource(DiscoveryWorker._process_task)
+    assert "except OpenAlexBudgetExhausted" in source
+    assert "defer_task" in source
+    # Обробка 429 має бути ПЕРЕД загальним except, інакше вона не досягається
+    assert source.index("except OpenAlexBudgetExhausted") < source.index(
+        "discovery_task_error"
+    )
+    # Лог має бути дросованим: 26 задач помилкається одночасно
+    assert "log_throttled" in source
+
+
+def test_openalex_budget_error_is_not_swallowed_by_generic_handler():
+    """Впевнюємось, що OpenAlexBudgetExhausted не підміняється під час імпорту.
+
+    `except Exception` перехопив би його, якби клас не імпортувався або
+    перейменувався — тоді тест на порядок except-ів був би марним.
+    """
+    from harvester.core.workers import DiscoveryWorker  # noqa: F401
+    from harvester.discovery.openalex import OpenAlexBudgetExhausted
+
+    assert issubclass(OpenAlexBudgetExhausted, Exception)
+    assert not issubclass(OpenAlexBudgetExhausted, (asyncio.CancelledError,))
+
+
 def test_openalex_search_is_query_param_not_filter():
     """`search` — окремий параметр OpenAlex, а НЕ частина filter.
 

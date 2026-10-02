@@ -10,6 +10,24 @@ from harvester.net.client import get_http_client
 
 logger = structlog.get_logger()
 
+# Без API-ключа OpenAlex рахує запити проти безкоштовного денного бюджету,
+# спільного для всього IP. Заміряно 02.10.2026 о 22:32 UTC: 429 з тілом
+# "Insufficient budget ... $0.0005 remaining; resets at midnight UTC".
+#
+# Це НЕ наша частотна помилка й не дефект каналу: о 03:00 бюджет буде
+# знову повний. Тому 429 не має проходити загальним шляхом помилки, де
+# кожна задача витрачає спробу з max_attempts і за 5 хвилин ретраїв
+# переходить у failed — тобто 26 задач кампанії померли б до сбросу
+# бюджету, не добравши жодної знахідки.
+class OpenAlexBudgetExhausted(Exception):
+    """Денний безкоштовний бюджет OpenAlex вичерпано; тимчасово."""
+
+    def __init__(self, retry_after_s: int):
+        self.retry_after_s = max(60, retry_after_s)
+        super().__init__(
+            f"OpenAlex daily budget exhausted; retry_after={self.retry_after_s}s"
+        )
+
 
 class OpenAlexChannel:
     name = "openalex"
@@ -117,6 +135,17 @@ class OpenAlexChannel:
             )
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                # retry-after у секундах; за відсутності — консервативна
+                # година, бо бюджет скидається саме опівночі UTC.
+                try:
+                    retry_after = int(e.response.headers.get("retry-after", "3600"))
+                except ValueError:
+                    retry_after = 3600
+                logger.info(
+                    "openalex_budget_exhausted", retry_after_s=retry_after
+                )
+                raise OpenAlexBudgetExhausted(retry_after) from None
             logger.error("openalex_http_error", status=e.response.status_code, error=str(e))
             raise
         except Exception as e:

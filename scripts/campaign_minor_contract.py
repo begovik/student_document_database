@@ -134,6 +134,7 @@ async def main() -> int:
         return 0
 
     db = build_database()
+    await db.initialize()
     scheduler = Scheduler(db)
     inserted = deduped = 0
     for task in tasks:

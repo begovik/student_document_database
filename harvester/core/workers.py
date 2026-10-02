@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import structlog
 
 from harvester.classify.classifier import Classifier
-from harvester.classify.llm import AllLimitsExhausted
+from harvester.classify.llm import AllLimitsExhausted, log_throttled
 from harvester.config import Settings
 from harvester.core.events import EventLogger
 from harvester.core.scheduler import Scheduler
@@ -19,7 +19,7 @@ from harvester.db.repositories import (
 )
 from harvester.dedup.urlnorm import normalize_url
 from harvester.discovery.ddgs_search import DDGSSearchChannel
-from harvester.discovery.openalex import OpenAlexChannel
+from harvester.discovery.openalex import OpenAlexBudgetExhausted, OpenAlexChannel
 from harvester.net.guards import is_url_allowed
 from harvester.verify.pipeline import VerifyPipeline
 
@@ -185,6 +185,22 @@ class DiscoveryWorker:
 
             if hasattr(channel, "wait_interval"):
                 await channel.wait_interval()
+
+        except OpenAlexBudgetExhausted as e:
+            # Денний бюджет OpenAlex вичерпано до сбросу о 00:00 UTC.
+            # Це очікуваний стан, а не дефект, тому відкладаємо задачу
+            # без витрати retry-бюджету: інакше 26 задач кампанії
+            # вичерпали б max_attempts за ~25 хвилин і померли до сбросу.
+            log_throttled(
+                log,
+                "openalex_budget_exhausted_task_deferred",
+                key="openalex_budget",
+                retry_after_s=e.retry_after_s,
+                task_type=task_type,
+            )
+            await self.scheduler.defer_task(
+                task_id, e.retry_after_s, lease_token=task.get("lease_token")
+            )
 
         except Exception as e:
             log.error("discovery_task_error", error=str(e), exc_info=True)
