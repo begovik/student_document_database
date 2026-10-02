@@ -14,7 +14,12 @@ from harvester.classify.taxonomy import load_disciplines, load_topics, seed_topi
 from harvester.db.connection import SqliteDatabase
 from harvester.db.failover import FailoverDatabase
 from harvester.db.migrations import apply_migrations
-from harvester.discovery.querygen import seed_discipline_topics, seed_queries
+from harvester.discovery.querygen import (
+    DISCIPLINE_TOPIC_ALIASES,
+    parse_discipline_catalog,
+    seed_discipline_topics,
+    seed_queries,
+)
 
 
 @pytest.fixture
@@ -52,15 +57,32 @@ async def test_seed_discipline_topics(plain_sqlite):
     inserted = await seed_topics(plain_sqlite)
     assert inserted == 25
 
+    # Кількість беремо з каталогу і з реально засіяних тем, а не як магічне
+    # число: додавання дисципліни в docs/discipline_catalog.md або зміна
+    # списку тем не повинні ламати тести.
+    catalog = parse_discipline_catalog()
+    assert catalog, "каталог дисциплін не розібрався — тест не має сенсу"
+
+    broad = await load_topics(plain_sqlite)
+    catalog_names = {name.lower() for _, name in catalog}
+    broad_names = {t["name_uk"].lower() for t in broad}
+    # seed_discipline_topics пропускає дисципліну, коли її назва вже є
+    # широкою темою, або коли тема покриває дисципліну через alias.
+    alias_disciplines = {d.lower() for d in DISCIPLINE_TOPIC_ALIASES.values()}
+    expected = len(catalog_names - broad_names - alias_disciplines)
+
     n = await seed_discipline_topics(plain_sqlite)
-    assert n == 252  # 277 - 25 покритих широких тем
+    assert n == expected, (
+        f"каталог={len(catalog_names)}, широких={len(broad_names)}, "
+        f"очікували {expected}, отримали {n}"
+    )
 
     # Повторне засівання ідемпотентне
     n2 = await seed_discipline_topics(plain_sqlite)
     assert n2 == 0
 
     total = (await plain_sqlite.fetchone("SELECT COUNT(*) c FROM topics"))["c"]
-    assert total == 25 + 252
+    assert total == len(broad) + expected
 
     # Покриті теми залишились kind='topic' і без dis_* дублікатів
     econ = await plain_sqlite.fetchone("SELECT * FROM topics WHERE code='econ'")
@@ -78,7 +100,7 @@ async def test_load_disciplines_and_topics(plain_sqlite):
     assert len(broad) == 25  # за замовчуванням лише kind='topic'
 
     disciplines = await load_disciplines(plain_sqlite)
-    assert len(disciplines) == 277
+    assert len(disciplines) == len(parse_discipline_catalog())
 
     by_code = {t["code"]: t for t in disciplines}
     assert by_code["econ"]["name_uk"] == "Економіка"
