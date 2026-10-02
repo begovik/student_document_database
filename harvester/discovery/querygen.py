@@ -112,6 +112,7 @@ CATEGORY_CODES: dict[str, str] = {
     "мистецтво": "art_media",
     "мови": "philology",
     "філософія": "soc_phil",
+    "право": "law",
     "педагогіка": "education",
     "соціологія": "sociology",
     "медицина": "med_bio_health",
