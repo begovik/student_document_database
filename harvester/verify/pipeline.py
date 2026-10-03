@@ -125,6 +125,7 @@ class VerifyPipeline:
         tmp_dir.mkdir(parents=True, exist_ok=True)
         tmp_file: Path | None = None
 
+        handed_over = False
         try:
             import os
 
@@ -145,13 +146,22 @@ class VerifyPipeline:
                 return VerifyResult(False, "NOT_PDF", "No PDF magic bytes")
 
             await self._log_attempt(doc_id, "download", url, "OK", started_at, bytes=size)
+            # Файл передається далі: розбирає й видаляє його той, хто
+            # викликав _step_download.
+            handed_over = True
             return VerifyResult(True, "OK", f"{tmp_file}|{size}|{sha256}")
 
         except Exception as e:
-            if tmp_file is not None:
-                await asyncio.to_thread(tmp_file.unlink, missing_ok=True)
             await self._log_attempt(doc_id, "download", url, "DOWNLOAD_ERROR", started_at, error=str(e))
             return VerifyResult(False, "DOWNLOAD_ERROR", str(e))
+
+        finally:
+            # Кожен ранній return має прибирати файл за собою. Раніше
+            # цеrobв лише except, тому гілки TOO_SMALL і NOT_PDF
+            # залишали його назавжди: виміряно 96 not_pdf + 14 too_small
+            # із 131 протікання в data/tmp.
+            if tmp_file is not None and not handed_over:
+                await asyncio.to_thread(tmp_file.unlink, missing_ok=True)
 
     async def _step_parse_and_verify(
         self,
