@@ -428,6 +428,33 @@ async def test_tpm_reservation_blocks_and_reconciles():
         )
 
 
+def test_secret_filter_redacts_api_key_in_httpx_logs():
+    """httpx логує повний URL із ключем — фільтр має його приховати."""
+    import logging
+
+    from harvester.core.events import RedactSecretsFilter
+
+    f = RedactSecretsFilter()
+    record = logging.LogRecord(
+        name="httpx", level=logging.INFO, pathname="", lineno=0,
+        msg="HTTP Request: POST %s", args=("https://x/models/m:generateContent?key=SECRET123",),
+        exc_info=None,
+    )
+    assert f.filter(record) is True
+    assert "SECRET123" not in record.getMessage()
+    assert "key=***" in record.getMessage()
+
+    # Той самий фільтр має витримати й заголовок авторизації, якщо він
+    # колись потрапить у повідомлення (захист на майбутнє).
+    bearer = logging.LogRecord(
+        name="httpx", level=logging.INFO, pathname="", lineno=0,
+        msg="HTTP Request: POST %s",
+        args=("https://x/ Authorization: Bearer TOKEN456",), exc_info=None,
+    )
+    assert f.filter(bearer) is True
+    assert "TOKEN456" not in bearer.getMessage()
+
+
 def test_ddgs_backend_filter_drops_unknown_names():
     """Недійсний backend (bing) не має з'їдати слот спроби на кожному запиті."""
     from harvester.discovery.ddgs_search import _filter_backends

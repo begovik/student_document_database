@@ -1,4 +1,5 @@
 import logging
+import re
 import sys
 import time
 from datetime import datetime
@@ -32,6 +33,42 @@ _shared_processors = [
 ]
 
 
+# httpx логує повний URL на рівні INFO, а він містить `?key=<API-ключ>`.
+# Наш redact_secrets тут не допомагає: це лог самої бібліотеки, а не
+# наших повідомлень, тому секрети відсікаємо вже на рівні логера.
+_SECRET_IN_LOG = (
+    re.compile(r"([?&]key=)[^&\s'\"]+"),
+    re.compile(r"(?i)(authorization:\s*bearer\s+)\S+"),
+)
+
+
+class RedactSecretsFilter(logging.Filter):
+    """Приховує API-ключі в повідомленнях сторонніх логерів (httpx)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Редагуємо ЛИШЕ args: record.msg — це шаблон формату ("HTTP Request:
+        # %s"), і секретів у немає. Якщо підмінити в ньому %s, форматування
+        # впаде з "not all arguments converted".
+        if isinstance(record.args, dict):
+            record.args = {k: self._redact(str(v)) for k, v in record.args.items()}
+        elif record.args:
+            record.args = tuple(self._redact(str(a)) for a in record.args)
+        return True
+
+    @staticmethod
+    def _redact(text: str) -> str:
+        for pattern in _SECRET_IN_LOG:
+            text = pattern.sub(r"\1***", text)
+        return text
+
+
+def _install_secret_filter() -> None:
+    """Поставити фільтр секретів на логери, що пишуть повні URL."""
+    secret_filter = RedactSecretsFilter()
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).addFilter(secret_filter)
+
+
 def setup_logging(level: str = "INFO", log_file: str | Path | None = None) -> None:
     """Налаштування логування: консоль (читабельно) + файл (JSON, ротація 20MB x 5)."""
     log_level = getattr(logging, level.upper(), logging.INFO)
@@ -61,6 +98,7 @@ def setup_logging(level: str = "INFO", log_file: str | Path | None = None) -> No
         handlers.append(file_handler)
 
     logging.basicConfig(level=log_level, handlers=handlers, force=True)
+    _install_secret_filter()
 
     structlog.configure(
         processors=_shared_processors + [structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
