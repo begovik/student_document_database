@@ -20,6 +20,7 @@ from harvester.db.repositories import (
 from harvester.dedup.urlnorm import normalize_url
 from harvester.discovery.crossref import CrossrefChannel
 from harvester.discovery.ddgs_search import DDGSSearchChannel
+from harvester.discovery.host_trust import HostTrust
 from harvester.discovery.openalex import OpenAlexBudgetExhausted, OpenAlexChannel
 from harvester.net.guards import is_url_allowed
 from harvester.verify.pipeline import VerifyPipeline
@@ -59,6 +60,10 @@ class DiscoveryWorker:
         self.docs_repo = DocumentsRepository(db)
         self.refs_repo = DocumentRefsRepository(db)
         self.queries_repo = SearchQueriesRepository(db)
+        # Хости, чия видача майже ніколи не стає документом (HTML-обгортки
+        # замість PDF). Без цього фільтра вони нескінченно плодять чергу
+        # верифікації, яка потім відкидає ті самі сторінки як not_pdf.
+        self.host_trust = HostTrust(db)
         self.channels = {
             "search": DDGSSearchChannel(),
             "api_iter": OpenAlexChannel(),
@@ -291,6 +296,18 @@ class DiscoveryWorker:
                 "candidate_url_blocked",
                 url=canonical[:200],
                 reason=guard_reason,
+                channel=candidate.channel,
+                query_text=(candidate.query_text or "")[:80],
+            )
+            return False
+
+        if await self.host_trust.is_demoted(canonical):
+            # Хост з історією «майже завжди not_pdf». DEBUG на кандидата:
+            # агрегат видно в host_trust_refreshed, інакше журнал роздувався б
+            # на кожному HTML-посиланні.
+            logger.debug(
+                "candidate_host_demoted",
+                url=canonical[:200],
                 channel=candidate.channel,
                 query_text=(candidate.query_text or "")[:80],
             )

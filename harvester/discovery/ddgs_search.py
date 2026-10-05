@@ -37,13 +37,57 @@ def _is_no_results(exc: BaseException) -> bool:
     return str(exc).strip().lower() == _NO_RESULTS_MESSAGE
 
 
+def _text_backends() -> list[str]:
+    """Перелік пошукових backend-ів, які підтримує встановлена ddgs.
+
+    Конфігурація може містити застарілі назви (напр. `bing`), яких ddgs
+    більше не знає. Кожен такий backend марно витрачав один із трьох слотів
+    спроби на запит і плодив WARNING від самої бібліотеки. Список беремо з
+    реєстру ddgs, а не хардкодом: він змінюється між версіями.
+    """
+    try:
+        from ddgs.engines import ENGINES
+
+        return sorted(ENGINES["text"].keys())
+    except Exception:  # noqa: BLE001
+        # Реєстр — внутрішня деталь ddgs. Якщо він зникне, фільтрувати нічого
+        # не можна: краще працювати з конфігурацією як є, ніж мовчки відкинути
+        # всі backend-и й зупинити discovery.
+        logger.warning("ddgs_backends_registry_unavailable")
+        return []
+
+
+def _filter_backends(configured: list[str]) -> list[str]:
+    """Відкинути назви backend-ів, яких немає у встановленій ddgs."""
+    supported = _text_backends()
+    if not supported:
+        return configured
+    valid = [b for b in configured if b in supported]
+    invalid = [b for b in configured if b not in supported]
+    if invalid:
+        logger.warning(
+            "ddgs_unsupported_backends_ignored",
+            ignored=invalid,
+            supported=supported,
+        )
+    if not valid:
+        # Усе налаштоване виявилося недійсним. Підставляти «щось інше» не
+        # можна: це мовчки увімкнуло б backend, якого власник не обирав.
+        # Лишаємо конфігурацію як є — канал голосно повідомить про помилку.
+        logger.error("ddgs_no_supported_backends", configured=configured, supported=supported)
+        return configured
+    return valid
+
+
 class DDGSSearchChannel:
     name = "ddgs"
 
     def __init__(self):
         settings = get_settings()
         self.enabled = settings.channels.ddgs.enabled
-        self.backends = settings.channels.ddgs.backends
+        # Фільтруємо назви, яких немає в ddgs: мертвий backend коштує слот
+        # спроби на КОЖНОМУ запиті (MAX_BACKENDS_PER_QUERY = 3).
+        self.backends = _filter_backends(settings.channels.ddgs.backends)
         self.query_interval = settings.channels.ddgs.query_interval_s
         self._current_backend_idx = 0
 

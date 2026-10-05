@@ -47,7 +47,7 @@ class DDGSChannelConfig(BaseModel):
     enabled: bool = True
     backends: list[str] = Field(
         min_length=1,
-        default=["duckduckgo", "bing", "brave", "mojeek", "startpage", "yahoo", "wikipedia"]
+        default=["duckduckgo", "brave", "mojeek", "startpage", "yahoo", "wikipedia"]
     )
     query_interval_s: tuple[float, float] = (3.0, 10.0)
 
@@ -210,6 +210,9 @@ class LLMConfig(BaseModel):
     gemma_rpm: int = Field(default=50, ge=1, description="Gemma: запитів за хвилину")
     gemma_rpd: int = Field(default=14000, ge=1, description="Gemma: запитів за день")
     gemma_tpm: int = Field(default=16000, ge=1000, description="Gemma: токенів за хвилину")
+    gemini_tpm: int = Field(
+        default=250000, ge=1000, description="Gemini: токенів за хвилину"
+    )
     max_text_chars_for_llm: int = Field(default=80000, ge=10000, le=500000)
     max_pages_for_extraction: int = Field(default=100, ge=10, le=1000)
 

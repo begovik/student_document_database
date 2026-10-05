@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import re
 import time
 from dataclasses import dataclass
@@ -11,6 +12,82 @@ from harvester.classify.ratelimit import DailyLimitExhausted, ModelRateLimiter
 from harvester.config import get_settings
 
 logger = structlog.get_logger()
+
+# Скільки символів промпту припадає на один токен. Для кирилиці це ~3;
+# оцінка потрібна лише на час польоту запиту, бо після відповіді вона
+# замінюється фактичним `totalTokenCount`.
+_CHARS_PER_TOKEN = 3
+
+# Ознаки хвилинного тротлінгу в тілі 429. Google віддає той самий код і на
+# вичерпання денної квоти, і на перевищення TPM/RPM, тому розрізняти їх
+# доводиться за текстом.
+_MINUTE_429_MARKERS = (
+    "per minute",
+    "per-minute",
+    "perminute",
+    "requests per minute",
+    "tokens per minute",
+    "rate limit exceeded",
+    "ratelimitexceeded",
+)
+# Ознаки денної квоти. Якщо збігів немає ані тут, ані вище — вважаємо
+# випадок хвилинним: помилково «забанити» пару ключ/модель до опівночі
+# значно дорожче, ніж зайвий раз зачекати хвилину.
+_DAILY_429_MARKERS = (
+    "per day",
+    "per-day",
+    "perday",
+    "per 24 hours",
+    "daily limit",
+    "dailylimit",
+    "daily quota",
+    "quota_exhausted",
+    "quota exhausted",
+)
+
+
+def estimate_tokens(text: str) -> int:
+    """Оцінити кількість вхідних токенів за довжиною тексту."""
+    return max(1, len(text) // _CHARS_PER_TOKEN)
+
+
+def _key_ref(api_key: str) -> str:
+    """Стабільний знеособлений ідентифікатор ключа для вікон лімітера.
+
+    Сам ключ у журнал не потрапляє: потрібне лише стале ім'я, щоб бачити,
+    який саме ключ тротлиться. Усі клієнти процесу мають рахувати один і
+    той самий ключ одним і тим самим іменем.
+    """
+    return hashlib.sha256(api_key.encode()).hexdigest()[:8]
+
+
+def _retry_after_s(resp: httpx.Response) -> float:
+    """Витягнути Retry-After у секундах, якщо Google його надіслав."""
+    raw = (resp.headers.get("retry-after") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        # Заголовок може бути HTTP-датою; точний розбір тут не потрібен:
+        # невідоме значення просто не дає підказки про очікування.
+        return 0.0
+
+
+def classify_429(resp: httpx.Response) -> tuple[str, float]:
+    """Розрізнити денну квоту й хвилинний тротлінг у відповіді 429.
+
+    Повертає (вид, підказка очікування в секундах). Вид — "daily" або
+    "transient". Помилкове трактування тротлінгу як денної квоти «забанювало»
+    пару (ключ, модель) до опівночі через 60-секундне явище.
+    """
+    body = (resp.text or "").lower()
+    has_daily = any(marker in body for marker in _DAILY_429_MARKERS)
+    has_minute = any(marker in body for marker in _MINUTE_429_MARKERS)
+    retry_after = _retry_after_s(resp)
+    if has_daily and not has_minute:
+        return "daily", retry_after
+    return "transient", retry_after
 
 # Обмеження повторних критичних логів про вичерпання: стан денний,
 # тому дублювання щосекунди лише засмічує лог.
@@ -197,12 +274,17 @@ class LLMClient:
         self._exhausted_date = datetime.now(UTC).date().isoformat()
         self._phase = "gemma" if gemma_only else "gemini"
         self._initialized = False
+        # Лічильник ротації стартового ключа: без нього кожен виклик починав
+        # з key 0, і перший ключ з'їдав усю TPM-межу, поки решта простоювала
+        # (виміряно: 86% відповідей 429 припадали на key_idx 0).
+        self._rotate_counter = 0
         self._rate_limiter = ModelRateLimiter.shared(
             gemini_rpm=self.settings.llm.gemini_rpm,
             gemini_rpd=self.settings.llm.gemini_rpd,
             gemma_rpm=self.settings.llm.gemma_rpm,
             gemma_rpd=self.settings.llm.gemma_rpd,
             gemma_tpm=self.settings.llm.gemma_tpm,
+            gemini_tpm=self.settings.llm.gemini_tpm,
         )
 
     @property
@@ -271,6 +353,18 @@ class LLMClient:
         await self._throttle()
 
         errors: list[str] = []
+
+        # Стан вікон лімітера — один рядок раз на кілька хвилин, не per-doc.
+        # Без цього причину «денного вичерпання» не було видно: TPM-вікна
+        # лишалися невидимими, а назовні було тільки повідомлення про квоту.
+        log_throttled(
+            logger,
+            "llm_pool_stats",
+            f"pool:{self.service}",
+            service=self.service,
+            keys=len(self._keys),
+            windows=self._rate_limiter.snapshot(),
+        )
 
         # === Фаза 1: Gemini ===
         if not self._gemma_only and self._keys and self._models:
@@ -355,7 +449,11 @@ class LLMClient:
         if not self._keys or not models:
             return None
         self._phase = phase
-        self._key_idx = 0
+        # Стартовий ключ зміщується на кожен виклик. Інакше весь трафік
+        # осідав на key 0, поки решта ключів простоювала: саме тому один
+        # ключ мав 28.5K токенів за хвилину при ліміті 16K.
+        self._key_idx = self._rotate_counter % len(self._keys)
+        self._rotate_counter += 1
         self._model_idx = 0
         start_key_idx = self._key_idx
         start_model_idx = self._model_idx
@@ -402,14 +500,20 @@ class LLMClient:
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
             except GeminiRateLimited as e:
-                logger.warning("gemini_rate_limited", phase=phase, key_idx=self._key_idx, model=model)
-                errors.append(str(e))
+                # Хвилинний тротлінг (TPM/RPM): пару НЕ додаємо в exhausted і
+                # НЕ повторюємо той самий ключ. Раніше `continue` бив у ту ж
+                # пару, а потім вона взагалі «банувалась» до опівночі —
+                # 60-секундна межа перетворювалась на добове вичерпання.
+                errors.append(f"[{phase}/{model}] {e}")
                 transient_retries += 1
-                if transient_retries < MAX_TRANSIENT_RETRIES:
-                    await asyncio.sleep(2 * transient_retries)
-                    continue
+                logger.warning(
+                    "gemini_rate_limited_rotate",
+                    phase=phase,
+                    key_idx=self._key_idx,
+                    model=model,
+                    attempt=transient_retries,
+                )
                 self._advance_phase(models)
-                transient_retries = 0
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
             except GeminiAuthError as e:
@@ -522,122 +626,144 @@ class LLMClient:
     async def _call_gemini_with_wait(
         self, prompt: str, api_key: str, model: str, phase: str = "gemini"
     ) -> LLMResponse:
-        """Викликає Gemini/Gemma з очікуванням при rate limit."""
+        """Викликає Gemini/Gemma, бронюючи слоти лімітера до запиту."""
         cfg = self.settings.llm
         url = f"{cfg.gemini_base_url}/models/{model}:generateContent"
         started = time.monotonic()
-        for attempt in range(3):
-            # Per-model rate limiting (RPM, RPD, TPM)
-            await self._rate_limiter.acquire(model, phase)
 
-            async with httpx.AsyncClient(timeout=cfg.timeout_s) as client:
-                resp = await client.post(
-                    url,
-                    params={"key": api_key},
-                    json={
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {
-                            "temperature": cfg.temperature,
-                            "maxOutputTokens": cfg.max_tokens,
-                            # Structured-output режим: модель повертає валідний
-                            # JSON без markdown-обгорток. Перевірено на всіх
-                            # моделях конфігурації (gemini-3.x, gemma-4).
-                            "responseMimeType": "application/json",
-                        },
+        key_ref = _key_ref(api_key)
+        # Бронюємо оцінку входу плюс повний бюджет виводу. Невикористане
+        # повернеться фактичним totalTokenCount після відповіді; на невдалому
+        # запиті броня лишається до кінця хвилинного вікна — це навмисний
+        # гальмівний тиск, а не втрата обліку.
+        estimated = estimate_tokens(prompt) + cfg.max_tokens
+        reservation = await self._rate_limiter.acquire(model, phase, key_ref, estimated)
+
+        async with httpx.AsyncClient(timeout=cfg.timeout_s) as client:
+            resp = await client.post(
+                url,
+                params={"key": api_key},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": cfg.temperature,
+                        "maxOutputTokens": cfg.max_tokens,
+                        # Structured-output режим: модель повертає валідний
+                        # JSON без markdown-обгорток. Перевірено на всіх
+                        # моделях конфігурації (gemini-3.x, gemma-4).
+                        "responseMimeType": "application/json",
                     },
-                )
-
-            if resp.status_code == 429:
-                if "quota" in resp.text.lower() or "exceeded" in resp.text.lower():
-                    raise GeminiQuotaExceeded(f"429 quota: {resp.text[:200]}")
-                if attempt < 2:
-                    wait_s = min(5 * (attempt + 1), cfg.daily_limit_wait_s)
-                    logger.info("gemini_rate_limited_waiting", phase=phase, wait_s=wait_s)
-                    await asyncio.sleep(wait_s)
-                    continue
-                raise GeminiRateLimited(f"429: {resp.text[:200]}")
-            if resp.status_code in (401, 403):
-                raise GeminiAuthError(f"{resp.status_code}: {resp.text[:200]}")
-            resp.raise_for_status()
-
-            data = resp.json()
-            try:
-                parts = data["candidates"][0]["content"]["parts"]
-                # Thinking-моделі (Gemma-4) повертають роздуми окремими parts з
-                # thought=True. Фінальна відповідь — лише не-thought parts, і
-                # вона може бути розбита на кілька частин, тому їх треба
-                # склеїти. Текст роздумів ніколи не є відповіддю: раніше він
-                # потрапляв у JSON-парсер, гарантовано ламав розбір і (за
-                # fail-open логікою) записував документ як pass.
-                text = "".join(
-                    part.get("text", "") for part in parts if not part.get("thought", False)
-                )
-                finish_reason = data["candidates"][0].get("finishReason", "")
-            except (KeyError, IndexError, TypeError) as e:
-                # Тут немає навіть структури відповіді — без сирого тіла
-                # причину (зміна API, помилка провайдера) не відстежити.
-                log_throttled(
-                    logger,
-                    "llm_unexpected_response_shape",
-                    f"shape:{model}",
-                    model=model,
-                    phase=phase,
-                    error=str(e)[:200],
-                    raw=str(data)[:RAW_LOG_LIMIT],
-                )
-                raise LLMUnavailable(
-                    f"несподівана відповідь Gemini ({model}): {e}"
-                ) from e
-
-            usage = data.get("usageMetadata", {})
-            thought_tokens = usage.get("thoughtsTokenCount", 0) or 0
-
-            if not text.strip():
-                # Бюджет з'їдено роздумами або відповідь обрізано. Без
-                # структури parts видно лише «немає відповіді», а не те,
-                # що саме модель повернула і на що пішов бюджет.
-                log_throttled(
-                    logger,
-                    "llm_no_answer",
-                    f"noanswer:{model}:{finish_reason}",
-                    model=model,
-                    phase=phase,
-                    finish_reason=finish_reason,
-                    thought_tokens=thought_tokens,
-                    output_tokens=usage.get("candidatesTokenCount", 0),
-                    parts_total=len(parts),
-                    parts_with_thought=sum(1 for p in parts if p.get("thought", False)),
-                )
-                raise LLMNoAnswer(
-                    f"{model}: немає фінальної відповіді "
-                    f"(finishReason={finish_reason}, thinking={thought_tokens} токенів)"
-                )
-
-            total_tokens = usage.get("totalTokenCount", 0)
-            if total_tokens:
-                self._rate_limiter.record_tokens(model, total_tokens)
-
-            duration_ms = int((time.monotonic() - started) * 1000)
-            log_fn = logger.debug if phase == "gemini" else logger.info
-            log_fn(
-                f"llm_{phase}_ok",
-                model=model,
-                duration_ms=duration_ms,
-                chars=len(text),
-                tokens=total_tokens,
-                finish_reason=finish_reason,
+                },
             )
-            return LLMResponse(
-                text=text,
-                provider=phase,
+
+        if resp.status_code == 429:
+            kind, retry_after_s = classify_429(resp)
+            body = redact_secrets(resp.text[:300])
+            if kind == "daily":
+                logger.warning(
+                    "gemini_quota_exceeded",
+                    phase=phase,
+                    key_idx=self._key_idx,
+                    model=model,
+                    retry_after_s=retry_after_s,
+                    body=body,
+                )
+                raise GeminiQuotaExceeded(f"429 quota: {body}")
+            # Хвилинна межа. Тіло відповіді обов'язково логуємо: саме його
+            # відсутність заважала побачити, що 429 приходить від TPM, а не
+            # від денної квоти.
+            logger.warning(
+                "gemini_rate_limited",
+                phase=phase,
+                key_idx=self._key_idx,
                 model=model,
-                duration_ms=duration_ms,
+                retry_after_s=retry_after_s,
+                body=body,
+            )
+            raise GeminiRateLimited(f"429 throttle: {body}")
+        if resp.status_code in (401, 403):
+            raise GeminiAuthError(f"{resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+
+        data = resp.json()
+        try:
+            parts = data["candidates"][0]["content"]["parts"]
+            # Thinking-моделі (Gemma-4) повертають роздуми окремими parts з
+            # thought=True. Фінальна відповідь — лише не-thought parts, і
+            # вона може бути розбита на кілька частин, тому їх треба
+            # склеїти. Текст роздумів ніколи не є відповіддю: раніше він
+            # потрапляв у JSON-парсер, гарантовано ламав розбір і (за
+            # fail-open логікою) записував документ як pass.
+            text = "".join(
+                part.get("text", "") for part in parts if not part.get("thought", False)
+            )
+            finish_reason = data["candidates"][0].get("finishReason", "")
+        except (KeyError, IndexError, TypeError) as e:
+            # Тут немає навіть структури відповіді — без сирого тіла
+            # причину (зміна API, помилка провайдера) не відстежити.
+            log_throttled(
+                logger,
+                "llm_unexpected_response_shape",
+                f"shape:{model}",
+                model=model,
+                phase=phase,
+                error=str(e)[:200],
+                raw=str(data)[:RAW_LOG_LIMIT],
+            )
+            raise LLMUnavailable(
+                f"несподівана відповідь Gemini ({model}): {e}"
+            ) from e
+
+        usage = data.get("usageMetadata", {})
+        thought_tokens = usage.get("thoughtsTokenCount", 0) or 0
+
+        if not text.strip():
+            # Бюджет з'їдено роздумами або відповідь обрізано. Без
+            # структури parts видно лише «немає відповіді», а не те,
+            # що саме модель повернула і на що пішов бюджет.
+            log_throttled(
+                logger,
+                "llm_no_answer",
+                f"noanswer:{model}:{finish_reason}",
+                model=model,
+                phase=phase,
                 finish_reason=finish_reason,
                 thought_tokens=thought_tokens,
-                part_count=len(parts),
+                output_tokens=usage.get("candidatesTokenCount", 0),
+                parts_total=len(parts),
+                parts_with_thought=sum(1 for p in parts if p.get("thought", False)),
+            )
+            raise LLMNoAnswer(
+                f"{model}: немає фінальної відповіді "
+                f"(finishReason={finish_reason}, thinking={thought_tokens} токенів)"
             )
 
-        raise GeminiRateLimited(f"429: перевищено кількість повторів для {model}")
+        total_tokens = usage.get("totalTokenCount", 0)
+        # Замінюємо попередню бронь фактичною витратою: інакше вікно або
+        # завищувало б навантаження (повний бюджет виводу), або не бачило б
+        # його зовсім.
+        self._rate_limiter.record_tokens(model, key_ref, total_tokens, reservation)
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+        log_fn = logger.debug if phase == "gemini" else logger.info
+        log_fn(
+            f"llm_{phase}_ok",
+            model=model,
+            duration_ms=duration_ms,
+            chars=len(text),
+            tokens=total_tokens,
+            finish_reason=finish_reason,
+        )
+        return LLMResponse(
+            text=text,
+            provider=phase,
+            model=model,
+            duration_ms=duration_ms,
+            finish_reason=finish_reason,
+            thought_tokens=thought_tokens,
+            part_count=len(parts),
+        )
+
 
     async def _call_openrouter(self, prompt: str) -> LLMResponse:
         """Виконує останній фолбек через OpenAI-сумісний OpenRouter API."""

@@ -44,7 +44,6 @@ channels:
     enabled: true
     backends:
       - duckduckgo
-      - bing
       - brave
       - mojeek
       - startpage

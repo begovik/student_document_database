@@ -384,15 +384,143 @@ async def test_daily_limit_resets_on_utc_date_change():
 
 
 @pytest.mark.asyncio
-async def test_quota_is_scaled_by_number_of_keys():
-    limiter = ModelRateLimiter(gemini_rpm=1000, gemini_rpd=2, gemma_rpm=1000, gemma_rpd=1000)
-    limiter.register_phase_keys("gemini", 3)
-    assert limiter.get_stats("m", "gemini")["rpd_limit"] == 6
+async def test_daily_quota_is_isolated_per_key():
+    """Квота належить ключу, а не спільному лічильнику моделі.
 
-    for _ in range(6):
-        await limiter.acquire("m", "gemini")
+    Раніше ліміт множився на кількість ключів, через що сумарний лічильник
+    дозволяв перевищення на кожному окремому ключі.
+    """
+    limiter = ModelRateLimiter(gemini_rpm=1000, gemini_rpd=2, gemma_rpm=1000, gemma_rpd=1000)
+    assert limiter.get_stats("m", "gemini", "key-a")["rpd_limit"] == 2
+
+    await limiter.acquire("m", "gemini", "key-a")
+    await limiter.acquire("m", "gemini", "key-a")
     with pytest.raises(DailyLimitExhausted):
-        await limiter.acquire("m", "gemini")
+        await limiter.acquire("m", "gemini", "key-a")
+
+    # Сусідній ключ має власну квоту й не страждає від вичерпання першого.
+    await limiter.acquire("m", "gemini", "key-b")
+    assert limiter.get_stats("m", "gemini", "key-b")["rpd"] == 1
+
+
+@pytest.mark.asyncio
+async def test_tpm_reservation_blocks_and_reconciles():
+    """TPM рахується до запиту, а після відповіді замінюється фактичним."""
+    limiter = ModelRateLimiter(
+        gemini_rpm=1000, gemini_rpd=1000, gemma_rpm=1000, gemma_rpd=1000, gemma_tpm=100
+    )
+    reservation = await limiter.acquire("m", "gemma", "key-a", estimated_tokens=80)
+    assert reservation > 0
+    assert limiter.get_stats("m", "gemma", "key-a")["tpm"] == 80
+
+    # Фактична витрата виявилась меншою — броня стискається до неї.
+    limiter.record_tokens("m", "key-a", 10, reservation)
+    assert limiter.get_stats("m", "gemma", "key-a")["tpm"] == 10
+
+    # 10 у вікні + 80 оцінки = 90 < 100, тому бронь проходить одразу.
+    await limiter.acquire("m", "gemma", "key-a", estimated_tokens=80)
+    assert limiter.get_stats("m", "gemma", "key-a")["tpm"] == 90
+
+    # 90 + 80 > 100: лімітер змушує чекати, а не пропускає запит.
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            limiter.acquire("m", "gemma", "key-a", estimated_tokens=80), timeout=0.05
+        )
+
+
+def test_ddgs_backend_filter_drops_unknown_names():
+    """Недійсний backend (bing) не має з'їдати слот спроби на кожному запиті."""
+    from harvester.discovery.ddgs_search import _filter_backends
+
+    kept = _filter_backends(["duckduckgo", "bing", "brave"])
+    assert "bing" not in kept
+    assert "duckduckgo" in kept
+    assert "brave" in kept
+
+
+def test_ddgs_backend_filter_keeps_config_when_nothing_valid():
+    """Якщо все налаштоване недійсне — не підставляємо backend, якого не обирали."""
+    from harvester.discovery.ddgs_search import _filter_backends
+
+    assert _filter_backends(["definitely-not-a-backend"]) == ["definitely-not-a-backend"]
+
+
+@pytest.mark.asyncio
+async def test_host_trust_demotes_only_barren_hosts(tmp_path):
+    """Демоція вмикається за статистикою хосу, а не за формою URL."""
+    from harvester.discovery.host_trust import HostTrust
+
+    db = SqliteDatabase(str(tmp_path / "hosts.db"))
+    await db.initialize()
+    await apply_migrations(db)
+    try:
+        now = datetime.utcnow().isoformat()
+        rows = []
+        for i in range(250):  # хост-сміттєгенератор: жодного verified
+            rows.append((f"https://bad.example/{i}", "not_pdf", now))
+        for i in range(250):  # робочий хост: 60% verified
+            status = "verified" if i % 10 < 6 else "not_pdf"
+            rows.append((f"https://good.example/{i}", status, now))
+        for url, status, ts in rows:
+            await db.execute(
+                "INSERT INTO documents (canonical_url, status, first_seen_at) VALUES (?, ?, ?)",
+                (url, status, ts),
+            )
+
+        trust = HostTrust(db, refresh_interval_s=0.0)
+        assert await trust.is_demoted("https://bad.example/anything.pdf") is True
+        assert await trust.is_demoted("https://good.example/paper.pdf") is False
+        # Хост із www. мусить збігатися з нормалізованим ключем.
+        assert await trust.is_demoted("https://www.bad.example/x") is True
+    finally:
+        await db.close()
+
+
+def test_classify_429_separates_daily_from_minute_throttle():
+    """429 на TPM не має ставати добовим вичерпанням пари ключ/модель."""
+    from harvester.classify.llm import classify_429
+
+    class _Resp:
+        def __init__(self, text: str, retry_after: str | None = None):
+            self.text = text
+            self.headers = {"retry-after": retry_after} if retry_after else {}
+
+    minute = _Resp("Resource has been exhausted (e.g. check quota). token rate per minute")
+    assert classify_429(minute)[0] == "transient"
+
+    daily = _Resp("Quota exceeded for quota metric 'requests per day'")
+    assert classify_429(daily)[0] == "daily"
+
+    # Невідоме тіло трактуємо як хвилинне: помилково «забанити» пару на добу
+    # дорожче, ніж зайвий раз зачекати хвилину.
+    unknown = _Resp("429", retry_after="42")
+    kind, wait = classify_429(unknown)
+    assert kind == "transient"
+    assert wait == 42.0
+
+
+@pytest.mark.asyncio
+async def test_minute_throttle_does_not_blacklist_pair():
+    """Після хвилинного тротлінгу пара не потрапляє в exhausted."""
+    from harvester.classify.llm import GeminiRateLimited, LLMClient
+
+    client = LLMClient(keys=["k1"], models=["m1"], service="Test")
+    client._initialized = True
+    calls: list[str] = []
+
+    async def _always_throttled(prompt, key, model, phase="gemini"):
+        calls.append(model)
+        raise GeminiRateLimited("429 throttle: per minute")
+
+    client._call_gemini_with_wait = _always_throttled  # type: ignore[method-assign]
+    errors: list[str] = []
+    exhausted: set[tuple[int, int]] = set()
+    result = await client._run_phase("p", ["m1"], exhausted, "gemini", errors)
+
+    assert result is None
+    assert exhausted == set()
+    assert calls == ["m1"]
+    assert errors
 
 
 # --------------------------------------------------------- verifier worker
