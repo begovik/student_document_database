@@ -105,7 +105,13 @@ class Supervisor:
         reactivated_queries = await queries_repo.reactivate_retired(limit=250)
 
         pending_search = await self.scheduler.pending_count("search")
-        if self.settings.channels.ddgs.enabled and pending_search == 0:
+        classify_only = self.settings.workers.mode == "classify_only"
+        if classify_only:
+            # Збір зупинено: нових пошукових та OpenAlex-проходів не
+            # створюємо, інакше черга знову наповниться кандидатами, які
+            # нікому не потрібні.
+            logger.info("bootstrap_classify_only_skip_discovery")
+        elif self.settings.channels.ddgs.enabled and pending_search == 0:
             query = await queries_repo.pick_lru()
             if query:
                 await self.scheduler.schedule_task(
@@ -123,7 +129,7 @@ class Supervisor:
                 logger.warning("bootstrap_no_active_search_queries")
 
         pending_oai = await self.scheduler.pending_count("api_iter")
-        if self.settings.channels.openalex.enabled and pending_oai == 0:
+        if not classify_only and self.settings.channels.openalex.enabled and pending_oai == 0:
             for it in create_openalex_iterators():
                 await self.scheduler.schedule_task("api_iter", it, priority=15)
 
@@ -192,16 +198,25 @@ class Supervisor:
 
     async def _start_workers(self) -> None:
         w = self.settings.workers
+        # У режимі classify_only не запускаються ані discovery, ані verify,
+        # ані verifier: збір зупинено, а квота LLM лишається класифікаторам.
+        classify_only = w.mode == "classify_only"
+        if classify_only:
+            logger.info(
+                "classify_only_mode_enabled",
+                note="без discovery/verify/verifier; лише classify та discipline_assign",
+            )
 
-        for i in range(w.discovery):
-            worker = DiscoveryWorker(i, self.settings, self.db, self.scheduler)
-            self._worker_objs.append(worker)
-            self._workers.append(self._spawn(f"discovery-{i}", worker.run))
+        if not classify_only:
+            for i in range(w.discovery):
+                worker = DiscoveryWorker(i, self.settings, self.db, self.scheduler)
+                self._worker_objs.append(worker)
+                self._workers.append(self._spawn(f"discovery-{i}", worker.run))
 
-        for i in range(w.verify):
-            worker = VerifyWorker(i, self.settings, self.db, self.scheduler)
-            self._worker_objs.append(worker)
-            self._workers.append(self._spawn(f"verify-{i}", worker.run))
+            for i in range(w.verify):
+                worker = VerifyWorker(i, self.settings, self.db, self.scheduler)
+                self._worker_objs.append(worker)
+                self._workers.append(self._spawn(f"verify-{i}", worker.run))
 
         # Classify воркери: один ключ × одна модель = один воркер
         classify_keys = self.settings.classify_keys
@@ -217,8 +232,9 @@ class Supervisor:
                     worker_id += 1
             logger.info(
                 "workers_started",
-                discovery=w.discovery,
-                verify=w.verify,
+                mode=w.mode,
+                discovery=0 if classify_only else w.discovery,
+                verify=0 if classify_only else w.verify,
                 classify=worker_id,
                 classify_mode="gemma_per_key_model",
             )
@@ -229,13 +245,14 @@ class Supervisor:
                 self._workers.append(self._spawn(f"classify-{i}", worker.run))
             logger.info(
                 "workers_started",
-                discovery=w.discovery,
-                verify=w.verify,
+                mode=w.mode,
+                discovery=0 if classify_only else w.discovery,
+                verify=0 if classify_only else w.verify,
                 classify=w.classify,
             )
 
         # Verifier воркери — 24/7 перевірка джерел за strict-правилами (Gemini 3.1 Flash Lite)
-        if w.verifier > 0 and self.settings.verifier.enabled:
+        if not classify_only and w.verifier > 0 and self.settings.verifier.enabled:
             try:
                 from harvester.verifier.worker import VerifierWorker
 
@@ -253,7 +270,10 @@ class Supervisor:
                 from harvester.classify.discipline_assigner import DisciplineAssigner
 
                 for i in range(w.discipline_assign):
-                    a_worker = DisciplineAssigner(i, db=self.db, settings=self.settings)
+                    a_worker = DisciplineAssigner(
+                        i, db=self.db, settings=self.settings,
+                        worker_count=w.discipline_assign,
+                    )
                     self._worker_objs.append(a_worker)
                     self._workers.append(self._spawn(f"discipline-assign-{i}", a_worker.run))
                 logger.info("discipline_assign_workers_started", count=w.discipline_assign)
@@ -449,8 +469,11 @@ class Supervisor:
                 if self.scheduler:
                     await self.scheduler.recover_stale_tasks()
                 # Невелика bounded-порція щокварталу: документи, які залишилися
-                # в 'verifying' після аварійної зупинки процесу.
-                await self._recover_stuck_verifying(limit=25)
+                # в 'verifying' після аварійної зупинки процесу. У режимі
+                # classify_only перевірки немає — probe-задачі нікому
+                # виконувати, тож вони б лише накопичувалися.
+                if self.settings.workers.mode != "classify_only":
+                    await self._recover_stuck_verifying(limit=25)
             except asyncio.CancelledError:
                 break
             except Exception as e:

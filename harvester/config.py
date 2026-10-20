@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import yaml
 from pydantic import AliasChoices, BaseModel, Field, field_validator
@@ -19,6 +19,11 @@ class PathsConfig(BaseModel):
 
 
 class WorkersConfig(BaseModel):
+    # "full" — повний конвеєр: discovery → verify → classify.
+    # "classify_only" — лише класифікація вже зібраного: без discovery,
+    # verify та verifier. Збір зупинено, а квота LLM звільняється для
+    # класифікаторів, які доганяють накопичений беклог.
+    mode: Literal["full", "classify_only"] = "full"
     verify: int = Field(default=6, ge=1, le=32)
     discovery: int = Field(default=3, ge=1, le=16)
     # Окремого сканер-воркера наразі немає, тому не створюємо фальшивий
@@ -26,7 +31,10 @@ class WorkersConfig(BaseModel):
     scanner: int = Field(default=0, ge=0, le=8)
     classify: int = Field(default=1, ge=1, le=4)
     verifier: int = Field(default=1, ge=0, le=4)
-    discipline_assign: int = Field(default=1, ge=0, le=4)
+    # Присвоєння дисциплін обмежене TPM Gemma, а не потужністю CPU:
+    # кожен документ — це один послідовний LLM-запит. Тому воркерів
+    # потрібно кілька, щоб заповнити мінутинне вікно токенів.
+    discipline_assign: int = Field(default=1, ge=0, le=8)
 
 
 class HttpConfig(BaseModel):

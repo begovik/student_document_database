@@ -81,10 +81,16 @@ class DisciplineAssigner:
         worker_id: int = 0,
         db: Database | None = None,
         settings: Settings | None = None,
+        worker_count: int = 1,
     ):
         self.worker_id = worker_id
         self.settings = settings or get_settings()
         self.db = db
+        # Кількість паралельних воркерів присвоєння. Вони обирають документи
+        # напряму з таблиці, без блокування рядків, тому без розподілу
+        # всі воркери взяли б ТЕ САМІ топ-N документів і продублювали
+        # роботу: кожен документ оброблявся б N разів.
+        self.worker_count = max(1, int(worker_count or 1))
         cfg = self.settings.discipline_assign
 
         keys = self.settings.classify_keys
@@ -97,6 +103,26 @@ class DisciplineAssigner:
             service="DisciplineAssign",
         )
         self._running = True
+
+    async def _fetch_batch(self, db, cutoff: str, batch_size: int) -> list:
+        """Взяти порцію документів, які ще не мають дисципліни.
+
+        Документи розподіляються між воркерами за `id % worker_count`:
+        воркери обирають рядки напряму з таблиці, без блокування, тому
+        без розподілу всі брали б ті самі топ-N документів і дублювали
+        роботу N разів.
+        """
+        return await db.fetchall(
+            """
+            SELECT d.* FROM documents d
+            WHERE d.status='verified'
+              AND (d.discipline_checked_at IS NULL OR d.discipline_checked_at < ?)
+              AND (d.id % ?) = ?
+            ORDER BY COALESCE(d.discipline_checked_at, '1970-01-01') ASC, d.verified_at DESC
+            LIMIT ?
+            """,
+            (cutoff, self.worker_count, self.worker_id, batch_size),
+        )
 
     async def run(self) -> None:
         log = logger.bind(worker=f"discipline_assign-{self.worker_id}")
@@ -162,16 +188,7 @@ class DisciplineAssigner:
                     recheck_days = cfg.recheck_days
                     cutoff = (_utcnow() - timedelta(days=recheck_days)).isoformat()
 
-                    rows = await db.fetchall(
-                        """
-                        SELECT d.* FROM documents d
-                        WHERE d.status='verified'
-                          AND (d.discipline_checked_at IS NULL OR d.discipline_checked_at < ?)
-                        ORDER BY COALESCE(d.discipline_checked_at, '1970-01-01') ASC, d.verified_at DESC
-                        LIMIT ?
-                        """,
-                        (cutoff, batch_size),
-                    )
+                    rows = await self._fetch_batch(db, cutoff, batch_size)
 
                     if not rows:
                         log.info("discipline_assign_batch_empty_sleep", interval_s=interval_s)

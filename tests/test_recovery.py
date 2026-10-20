@@ -455,6 +455,82 @@ def test_secret_filter_redacts_api_key_in_httpx_logs():
     assert "TOKEN456" not in bearer.getMessage()
 
 
+def _supervisor_with_mode(mode: str):
+    """Супервізор у заданому режимі з перехопленим запуском воркерів."""
+    from harvester.config import get_settings
+    from harvester.core.supervisor import Supervisor
+
+    base = get_settings()
+    supervisor = Supervisor.__new__(Supervisor)
+    supervisor.settings = base.model_copy(
+        update={"workers": base.workers.model_copy(update={"mode": mode})}
+    )
+    supervisor.db = None
+    supervisor.scheduler = None
+    supervisor._worker_objs = []
+    supervisor._workers = []
+    supervisor._running = True
+    started: list[str] = []
+
+    def _spawn(name, runner):
+        started.append(name)
+
+        async def _noop():
+            return None
+
+        return asyncio.create_task(_noop())
+
+    supervisor._spawn = _spawn
+    return supervisor, started
+
+
+@pytest.mark.asyncio
+async def test_classify_only_mode_skips_collection_workers():
+    """У режимі classify_only збір і перевірка не запускаються."""
+    supervisor, started = _supervisor_with_mode("classify_only")
+    await supervisor._start_workers()
+
+    assert not any(n.startswith("discovery-") for n in started)
+    assert not any(n.startswith("verify-") for n in started)
+    assert not any(n.startswith("verifier-") for n in started)
+    assert any(n.startswith("classify-") for n in started)
+    assert any(n.startswith("discipline-assign-") for n in started)
+
+
+@pytest.mark.asyncio
+async def test_full_mode_starts_collection_workers():
+    """У звичайному режимі конвеєр збору працює як раніше."""
+    supervisor, started = _supervisor_with_mode("full")
+    await supervisor._start_workers()
+
+    assert any(n.startswith("discovery-") for n in started)
+    assert any(n.startswith("verify-") for n in started)
+
+
+@pytest.mark.asyncio
+async def test_discipline_assign_partitions_documents_between_workers(db):
+    """Паралельні воркери присвоєння не беруть ті самі документи."""
+    from harvester.classify.discipline_assigner import DisciplineAssigner
+
+    now = datetime.utcnow().isoformat()
+    for i in range(40):
+        await db.execute(
+            "INSERT INTO documents (canonical_url, status, first_seen_at) VALUES (?, ?, ?)",
+            (f"https://ex{i}.example/p.pdf", "verified", now),
+        )
+
+    seen: set[int] = set()
+    for worker_id in range(4):
+        assigner = DisciplineAssigner(worker_id, db=db, worker_count=4)
+        rows = await assigner._fetch_batch(db, "1970-01-01T00:00:00", 50)
+        ids = {r["id"] for r in rows}
+        assert ids, "воркер не отримав жодного документа"
+        assert not (ids & seen), "воркери перетинаються за документами"
+        seen |= ids
+
+    assert len(seen) == 40
+
+
 def test_ddgs_backend_filter_drops_unknown_names():
     """Недійсний backend (bing) не має з'їдати слот спроби на кожному запиті."""
     from harvester.discovery.ddgs_search import _filter_backends
@@ -548,6 +624,42 @@ async def test_minute_throttle_does_not_blacklist_pair():
     assert exhausted == set()
     assert calls == ["m1"]
     assert errors
+
+
+@pytest.mark.asyncio
+async def test_repeated_throttle_escalates_to_daily_exhaustion():
+    """Повторний тротлінг однієї пари — це вже вичерпана квота."""
+    from harvester.classify.llm import GeminiRateLimited, LLMClient
+
+    client = LLMClient(keys=["k1"], models=["m1"], service="Test")
+    client._initialized = True
+
+    async def _always_throttled(prompt, key, model, phase="gemini"):
+        raise GeminiRateLimited("429: Resource has been exhausted (e.g. check quota).")
+
+    client._call_gemini_with_wait = _always_throttled  # type: ignore[method-assign]
+    exhausted: set[tuple[int, int]] = set()
+
+    for _ in range(3):
+        await client._run_phase("p", ["m1"], exhausted, "gemini", [])
+
+    assert (0, 0) in exhausted
+
+
+def test_daily_quota_message_is_recognised():
+    """Фраза Google про денну квоту має розпізнаватися як денна, а не хвилинна."""
+    from harvester.classify.llm import classify_429
+
+    class _Resp:
+        def __init__(self, text: str):
+            self.text = text
+            self.headers = {}
+
+    daily = _Resp(
+        '{"error":{"code":429,"message":"You exceeded your current quota, '
+        'please check your plan and billing details.","status":"RESOURCE_EXHAUSTED"}}'
+    )
+    assert classify_429(daily)[0] == "daily"
 
 
 # --------------------------------------------------------- verifier worker

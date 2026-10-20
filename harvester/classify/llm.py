@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -43,7 +44,16 @@ _DAILY_429_MARKERS = (
     "daily quota",
     "quota_exhausted",
     "quota exhausted",
+    "exceeded your current quota",
 )
+
+# Тіло 429 від Google для денної квоти й для TPM однакове:
+# «Resource has been exhausted (e.g. check quota).» Розрізнити їх за текстом
+# неможливо, тому вдаряємо по парі: якщо тротлінг повторюється підряд, це
+# вже не хвилинна межа, а вичерпана квота — і пару треба «забанити» до
+# опівночі, щоб не робити марні спроби перед кожним документом.
+THROTTLE_STRIKE_LIMIT = 3
+THROTTLE_STRIKE_WINDOW_S = 600.0
 
 
 def estimate_tokens(text: str) -> int:
@@ -278,6 +288,9 @@ class LLMClient:
         # з key 0, і перший ключ з'їдав усю TPM-межу, поки решта простоювала
         # (виміряно: 86% відповідей 429 припадали на key_idx 0).
         self._rotate_counter = 0
+        # Удари тротлінгу per (фаза, ключ, модель): щоб відрізнити разову
+        # хвилинну межу від вичерпаної денної квоти.
+        self._throttle_strikes: dict[tuple[str, int, int], list[float]] = defaultdict(list)
         self._rate_limiter = ModelRateLimiter.shared(
             gemini_rpm=self.settings.llm.gemini_rpm,
             gemini_rpd=self.settings.llm.gemini_rpd,
@@ -328,6 +341,7 @@ class LLMClient:
         if self._exhausted_date != today:
             self._daily_limit_exhausted.clear()
             self._gemma_limit_exhausted.clear()
+            self._throttle_strikes.clear()
             self._exhausted_date = today
             self._initialized = False
             logger.info("llm_daily_exhaustion_reset", date=today)
@@ -341,6 +355,7 @@ class LLMClient:
         """
         self._daily_limit_exhausted.clear()
         self._gemma_limit_exhausted.clear()
+        self._throttle_strikes.clear()
         self._exhausted_date = datetime.now(UTC).date().isoformat()
         self._key_idx = 0
         self._model_idx = 0
@@ -500,7 +515,7 @@ class LLMClient:
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
             except GeminiRateLimited as e:
-                # Хвилинний тротлінг (TPM/RPM): пару НЕ додаємо в exhausted і
+                # Хвиминний тротлінг (TPM/RPM): пару НЕ додаємо в exhausted і
                 # НЕ повторюємо той самий ключ. Раніше `continue` бив у ту ж
                 # пару, а потім вона взагалі «банувалась» до опівночі —
                 # 60-секундна межа перетворювалась на добове вичерпання.
@@ -513,6 +528,19 @@ class LLMClient:
                     model=model,
                     attempt=transient_retries,
                 )
+                if self._register_throttle_strike(phase, model):
+                    # Тротлінг повторюється — це не хвилинна межа, а вичерпана
+                    # квота. Пара «забанюється» до опівночі, інакше перед
+                    # кожним документом робилися б марні спроби.
+                    exhausted.add((self._key_idx, self._model_idx))
+                    logger.warning(
+                        "gemini_throttle_escalated",
+                        phase=phase,
+                        key_idx=self._key_idx,
+                        model=model,
+                        strikes=THROTTLE_STRIKE_LIMIT,
+                        window_s=THROTTLE_STRIKE_WINDOW_S,
+                    )
                 self._advance_phase(models)
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
@@ -599,6 +627,24 @@ class LLMClient:
                     checked_all = True
 
         return None
+
+    def _register_throttle_strike(self, phase: str, model: str) -> bool:
+        """Відмітити тротлінг пари; True, якщо їх уже надто багато.
+
+        Тіло 429 однакове для денної квоти й для TPM, тож вирішаємо за
+        повторюваністю: три тротлінги однієї пари за 10 хвилин означають
+        вичерпану квоту, а не разову мінутинну межу.
+        """
+        key = (phase, self._key_idx, self._model_idx)
+        now = time.monotonic()
+        strikes = self._throttle_strikes[key]
+        cutoff = now - THROTTLE_STRIKE_WINDOW_S
+        strikes[:] = [t for t in strikes if t > cutoff]
+        strikes.append(now)
+        if len(strikes) >= THROTTLE_STRIKE_LIMIT:
+            strikes.clear()
+            return True
+        return False
 
     def _advance_phase(self, models: list[str]) -> None:
         """Переходить до наступної моделі або ключа в межах фази."""

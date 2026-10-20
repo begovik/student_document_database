@@ -21,10 +21,16 @@ paths:
   # backup_dir: "backups"
 
 workers:
+  # Збір зупинено: лишаємо тільки класифікацію вже зібраного.
+  # discovery/verify/verifier не запускаються, квота LLM йде класифікаторам.
+  mode: classify_only
   verify: 6
   discovery: 3
   scanner: 0  # окремого scanner-воркера ще немає
   classify: 1
+  # Присвоєння дисциплін — по одному LLM-запиту на документ, тому
+  # воркерів потрібно кілька, щоб заповнити мінутинне вікно токенів Gemma.
+  discipline_assign: 8
 
 http:
   global_concurrency: 32
