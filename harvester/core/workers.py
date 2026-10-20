@@ -574,14 +574,17 @@ class ClassifyWorker:
     """Бере classify-задачі, класифікує документи (правила + УДК + LLM)."""
 
     def __init__(self, worker_id: int, settings: Settings, db: Database, scheduler: Scheduler,
-                 classify_key: str | None = None, classify_model: str | None = None):
+                 classify_key: str | None = None, classify_model: str | None = None,
+                 gemma_only: bool = True):
         self.worker_id = worker_id
         self.db = db
         self.scheduler = scheduler
         self.events = EventLogger(db)
         keys = [classify_key] if classify_key else None
         models = [classify_model] if classify_model else None
-        self.classifier = Classifier(db, keys=keys, models=models, gemma_only=bool(classify_key))
+        # gemma_only визначає, який пул моделей є основним: True — лише Gemma
+        # на ключах класифікації, False — спершу Gemini, Gemma як фолбек.
+        self.classifier = Classifier(db, keys=keys, models=models, gemma_only=gemma_only)
         self._running = True
 
     async def run(self) -> None:

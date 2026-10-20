@@ -219,14 +219,23 @@ class Supervisor:
                 self._workers.append(self._spawn(f"verify-{i}", worker.run))
 
         # Classify воркери: один ключ × одна модель = один воркер
-        classify_keys = self.settings.classify_keys
-        classify_models = self.settings.llm.gemma_models
+        if w.classify_model_pool == "gemini":
+            # Gemini на спільних ключах LLM: їхня добова квота звільнилася,
+            # бо збір зупинено, а відповідь Gemini швидша за Gemma.
+            classify_keys = self.settings.gemini_keys
+            classify_models = self.settings.llm.gemini_models
+            gemma_only = False
+        else:
+            classify_keys = self.settings.classify_keys
+            classify_models = self.settings.llm.gemma_models
+            gemma_only = True
         if classify_keys:
             worker_id = 0
             for key in classify_keys:
                 for model in classify_models:
                     worker = ClassifyWorker(worker_id, self.settings, self.db, self.scheduler,
-                                           classify_key=key, classify_model=model)
+                                           classify_key=key, classify_model=model,
+                                           gemma_only=gemma_only)
                     self._worker_objs.append(worker)
                     self._workers.append(self._spawn(f"classify-{worker_id}", worker.run))
                     worker_id += 1
@@ -236,7 +245,7 @@ class Supervisor:
                 discovery=0 if classify_only else w.discovery,
                 verify=0 if classify_only else w.verify,
                 classify=worker_id,
-                classify_mode="gemma_per_key_model",
+                classify_mode=f"{w.classify_model_pool}_per_key_model",
             )
         else:
             for i in range(w.classify):

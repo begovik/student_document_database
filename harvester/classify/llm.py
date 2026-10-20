@@ -2,7 +2,6 @@ import asyncio
 import hashlib
 import re
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -13,6 +12,19 @@ from harvester.classify.ratelimit import DailyLimitExhausted, ModelRateLimiter
 from harvester.config import get_settings
 
 logger = structlog.get_logger()
+
+# Лічильник ротації стартового ключа, СПІЛЬНИЙ для всіх клієнтів
+# процесу. Коли він був локальним у кожного клієнта, воркери з різними
+# стартовими позиціями сходилися на одному ключі: мінутинне вікно токенів
+# цього ключа вичерпувалося (153K із 250K), поки решта ключів стояли.
+_global_rotate = 0
+
+
+def _next_rotate() -> int:
+    """Наступна позиція ротації ключів (спільна для процесу)."""
+    global _global_rotate
+    _global_rotate += 1
+    return _global_rotate
 
 # Скільки символів промпту припадає на один токен. Для кирилиці це ~3;
 # оцінка потрібна лише на час польоту запиту, бо після відповіді вона
@@ -288,9 +300,6 @@ class LLMClient:
         # з key 0, і перший ключ з'їдав усю TPM-межу, поки решта простоювала
         # (виміряно: 86% відповідей 429 припадали на key_idx 0).
         self._rotate_counter = 0
-        # Удари тротлінгу per (фаза, ключ, модель): щоб відрізнити разову
-        # хвилинну межу від вичерпаної денної квоти.
-        self._throttle_strikes: dict[tuple[str, int, int], list[float]] = defaultdict(list)
         self._rate_limiter = ModelRateLimiter.shared(
             gemini_rpm=self.settings.llm.gemini_rpm,
             gemini_rpd=self.settings.llm.gemini_rpd,
@@ -341,7 +350,7 @@ class LLMClient:
         if self._exhausted_date != today:
             self._daily_limit_exhausted.clear()
             self._gemma_limit_exhausted.clear()
-            self._throttle_strikes.clear()
+            self._rate_limiter.reset_shared_exhaustion()
             self._exhausted_date = today
             self._initialized = False
             logger.info("llm_daily_exhaustion_reset", date=today)
@@ -355,7 +364,7 @@ class LLMClient:
         """
         self._daily_limit_exhausted.clear()
         self._gemma_limit_exhausted.clear()
-        self._throttle_strikes.clear()
+        self._rate_limiter.reset_shared_exhaustion()
         self._exhausted_date = datetime.now(UTC).date().isoformat()
         self._key_idx = 0
         self._model_idx = 0
@@ -464,12 +473,21 @@ class LLMClient:
         if not self._keys or not models:
             return None
         self._phase = phase
-        # Стартовий ключ зміщується на кожен виклик. Інакше весь трафік
-        # осідав на key 0, поки решта ключів простоювала: саме тому один
-        # ключ мав 28.5K токенів за хвилину при ліміті 16K.
-        self._key_idx = self._rotate_counter % len(self._keys)
-        self._rotate_counter += 1
-        self._model_idx = 0
+        # Стартова пара обирається ротацією СЕРЕД ЖИВИХ пар (ключ, модель).
+        # Ротація по всіх парах давала перекос: вичерпані ключі «крали» свої
+        # позиції, тож перший живий ключ отримував більшість трафіку, а
+        # решта стояла (141K токенів/хв з 250K на одному ключі).
+        live = [
+            (ki, mi)
+            for ki in range(len(self._keys))
+            for mi in range(len(models))
+            if not self._rate_limiter.is_daily_exhausted(
+                _key_ref(self._keys[ki]), models[mi]
+            )
+        ]
+        if not live:
+            return None
+        self._key_idx, self._model_idx = live[_next_rotate() % len(live)]
         start_key_idx = self._key_idx
         start_model_idx = self._model_idx
         checked_all = False
@@ -481,8 +499,18 @@ class LLMClient:
         while not checked_all:
             key = self._keys[self._key_idx]
             model = models[self._model_idx]
+            key_ref = _key_ref(key)
 
             if (self._key_idx, self._model_idx) in exhausted:
+                self._advance_phase(models)
+                if self._is_back_to_start(start_key_idx, start_model_idx):
+                    checked_all = True
+                continue
+
+            if self._rate_limiter.is_daily_exhausted(key_ref, model):
+                # Квота цієї пари вже відома як вичерпана — знання спільне
+                # для процесу, тож не витрачаємо ще один запит на перевірку.
+                exhausted.add((self._key_idx, self._model_idx))
                 self._advance_phase(models)
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
@@ -509,6 +537,9 @@ class LLMClient:
                 # 429 з quota/exceeded уже є достовірним сигналом для цієї
                 # пари key/model; додатковий probe лише споживає квоту.
                 exhausted.add((self._key_idx, self._model_idx))
+                # Позначка спільна для процесу: інші воркери одразу
+                # перестануть намагатися цей ключ.
+                self._rate_limiter.mark_daily_exhausted(key_ref, model)
                 errors.append(f"{model}[key{self._key_idx}]: quota")
                 self._advance_phase(models)
                 transient_retries = 0
@@ -528,11 +559,14 @@ class LLMClient:
                     model=model,
                     attempt=transient_retries,
                 )
-                if self._register_throttle_strike(phase, model):
+                if self._rate_limiter.record_throttle_strike(key_ref, model):
                     # Тротлінг повторюється — це не хвилинна межа, а вичерпана
                     # квота. Пара «забанюється» до опівночі, інакше перед
-                    # кожним документом робилися б марні спроби.
+                    # кожним документом робилися б марні спроби. Лічильник
+                    # спільний для процесу: перші тротлінги зупиняють усіх
+                    # воркерів, а не кожен з'ясовує це самостійно.
                     exhausted.add((self._key_idx, self._model_idx))
+                    self._rate_limiter.mark_daily_exhausted(key_ref, model)
                     logger.warning(
                         "gemini_throttle_escalated",
                         phase=phase,
@@ -627,24 +661,6 @@ class LLMClient:
                     checked_all = True
 
         return None
-
-    def _register_throttle_strike(self, phase: str, model: str) -> bool:
-        """Відмітити тротлінг пари; True, якщо їх уже надто багато.
-
-        Тіло 429 однакове для денної квоти й для TPM, тож вирішаємо за
-        повторюваністю: три тротлінги однієї пари за 10 хвилин означають
-        вичерпану квоту, а не разову мінутинну межу.
-        """
-        key = (phase, self._key_idx, self._model_idx)
-        now = time.monotonic()
-        strikes = self._throttle_strikes[key]
-        cutoff = now - THROTTLE_STRIKE_WINDOW_S
-        strikes[:] = [t for t in strikes if t > cutoff]
-        strikes.append(now)
-        if len(strikes) >= THROTTLE_STRIKE_LIMIT:
-            strikes.clear()
-            return True
-        return False
 
     def _advance_phase(self, models: list[str]) -> None:
         """Переходить до наступної моделі або ключа в межах фази."""

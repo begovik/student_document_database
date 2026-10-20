@@ -23,7 +23,7 @@ import pytest
 from pydantic import ValidationError
 
 from harvester.classify.ratelimit import DailyLimitExhausted, ModelRateLimiter
-from harvester.config import DatabaseConfig
+from harvester.config import DatabaseConfig, get_settings
 from harvester.core.scheduler import Scheduler
 from harvester.db.connection import SqliteDatabase
 from harvester.db.failover import FailoverDatabase
@@ -529,6 +529,60 @@ async def test_discipline_assign_partitions_documents_between_workers(db):
         seen |= ids
 
     assert len(seen) == 40
+
+
+def test_discipline_assign_collects_keys_from_both_pools():
+    """Присвоєння дисциплін бере ключі з обох пулів без дублів."""
+    from harvester.classify.discipline_assigner import DisciplineAssigner
+
+    assigner = DisciplineAssigner(0, db=None, worker_count=1)
+    keys = assigner._collect_keys()
+    settings = get_settings()
+    assert set(settings.classify_keys) <= set(keys)
+    assert set(settings.gemini_keys) <= set(keys)
+    assert len(keys) == len(set(keys))
+
+
+@pytest.mark.asyncio
+async def test_classify_model_pool_switches_keys_and_phase():
+    """Пул gemini переводить класифікатор на спільні ключі й фазу Gemini."""
+    from harvester.core.supervisor import Supervisor
+
+    base = get_settings()
+    supervisor = Supervisor.__new__(Supervisor)
+    supervisor.settings = base.model_copy(
+        update={
+            "workers": base.workers.model_copy(
+                update={"mode": "classify_only", "classify_model_pool": "gemini"}
+            )
+        }
+    )
+    supervisor.db = None
+    supervisor.scheduler = None
+    supervisor._worker_objs = []
+    supervisor._workers = []
+    supervisor._running = True
+    started: list[str] = []
+
+    def _spawn(name, runner):
+        started.append(name)
+
+        async def _noop():
+            return None
+
+        return asyncio.create_task(_noop())
+
+    supervisor._spawn = _spawn
+    await supervisor._start_workers()
+
+    classify_workers = [w for w in supervisor._worker_objs if w.__class__.__name__ == "ClassifyWorker"]
+    assert classify_workers
+    assert len(classify_workers) == len(base.gemini_keys) * len(base.llm.gemini_models)
+    for worker in classify_workers:
+        # Фаза Gemini — основна, Gemma лишається фолбеком.
+        assert worker.classifier.llm._gemma_only is False
+        assert worker.classifier.llm._models[0] in base.llm.gemini_models
+        assert worker.classifier.llm._keys[0] in base.gemini_keys
 
 
 def test_ddgs_backend_filter_drops_unknown_names():

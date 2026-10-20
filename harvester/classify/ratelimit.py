@@ -62,6 +62,12 @@ class ModelRateLimiter:
         # перевищення на кожному окремому ключі.
         self._phase_keys: dict[str, int] = {}
         self._last_log: dict[tuple[str, str], float] = {}
+        # Спільне на весь процес знання про вичерпані денні квоти й про
+        # накопичені тротлінги. Колись це було в кожному LLM-клієнті окремо,
+        # тож кожен воркер з'ясовував те саме заново: 32 воркери × 4 ключі
+        # давали сотні марних 429-запитів перед кожним документом.
+        self._daily_exhausted: set[tuple[str, str]] = set()
+        self._throttle_strikes: dict[tuple[str, str], list[float]] = defaultdict(list)
         self._lock = asyncio.Lock()
 
     def register_phase_keys(self, phase: str, keys_count: int) -> None:
@@ -193,6 +199,40 @@ class ModelRateLimiter:
                     return
         if token_count and token_count > 0:
             self._tokens[window].append([time.monotonic(), int(token_count), 0])
+
+    def reset_shared_exhaustion(self) -> None:
+        """Очистити спільні позначки вичерпання й тротлінгу.
+
+        Потрібно на початку нового добового вікна або після ручного
+        скидання стану клієнта.
+        """
+        self._daily_exhausted.clear()
+        self._throttle_strikes.clear()
+
+    def mark_daily_exhausted(self, key_ref: str, model: str) -> None:
+        """Позначити пару (ключ, модель) як таку, що вичерпала денну квоту."""
+        self._daily_exhausted.add((key_ref, model))
+
+    def is_daily_exhausted(self, key_ref: str, model: str) -> bool:
+        """Чи відома вже вичерпана денна квота для цієї пари."""
+        return (key_ref, model) in self._daily_exhausted
+
+    def record_throttle_strike(self, key_ref: str, model: str) -> bool:
+        """Відмітити тротлінг пари; True — їх надто багато (вичерпана квота).
+
+        Лічильник спільний для процесу: перші кілька тротлінгів однієї пари
+        зупиняють усі воркери, а не кожен з'ясовує це самостійно.
+        """
+        key = (key_ref, model)
+        now = time.monotonic()
+        strikes = self._throttle_strikes[key]
+        cutoff = now - 600.0
+        strikes[:] = [t for t in strikes if t > cutoff]
+        strikes.append(now)
+        if len(strikes) >= 3:
+            strikes.clear()
+            return True
+        return False
 
     def snapshot(self, limit: int = 8) -> list[dict]:
         """Стан вікон, у яких була активність — для діагностичного INFO-логу."""

@@ -93,9 +93,7 @@ class DisciplineAssigner:
         self.worker_count = max(1, int(worker_count or 1))
         cfg = self.settings.discipline_assign
 
-        keys = self.settings.classify_keys
-        if not keys:
-            keys = self.settings.gemini_keys  # fallback якщо окремих ключів немає
+        keys = self._collect_keys()
         self.llm = LLMClient(
             keys=keys,
             models=[cfg.model],
@@ -103,6 +101,27 @@ class DisciplineAssigner:
             service="DisciplineAssign",
         )
         self._running = True
+
+    def _collect_keys(self) -> list[str]:
+        """Ключі для присвоєння дисциплін за налаштованими пулами.
+
+        Пул classify — 4 окремі ключі класифікації, пул gemini — 3 спільні
+        ключі LLM. Квота Gemini добова, тому коли збір зупинено, спільні
+        ключі звільняються: саме тоді вони дають додаткову ємність.
+        """
+        keys: list[str] = []
+        for pool in self.settings.discipline_assign.key_pools:
+            if pool == "classify":
+                source = self.settings.classify_keys
+            elif pool == "gemini":
+                source = self.settings.gemini_keys
+            else:
+                logger.warning("discipline_assign_unknown_key_pool", pool=pool)
+                continue
+            for key in source or []:
+                if key not in keys:
+                    keys.append(key)
+        return keys
 
     async def _fetch_batch(self, db, cutoff: str, batch_size: int) -> list:
         """Взяти порцію документів, які ще не мають дисципліни.

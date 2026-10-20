@@ -30,11 +30,16 @@ class WorkersConfig(BaseModel):
     # активний компонент у конфігурації.
     scanner: int = Field(default=0, ge=0, le=8)
     classify: int = Field(default=1, ge=1, le=4)
+    # Який пул моделей використовує класифікатор: "gemma" — Gemma на
+    # окремих ключах класифікації, "gemini" — Gemini на спільних ключах LLM.
+    # Коли збір зупинено, спільні ключі звільняються, і класифікація на
+    # Gemini швидша (коротша відповідь, менше thinking-токенів).
+    classify_model_pool: Literal["gemma", "gemini"] = "gemma"
     verifier: int = Field(default=1, ge=0, le=4)
     # Присвоєння дисциплін обмежене TPM Gemma, а не потужністю CPU:
     # кожен документ — це один послідовний LLM-запит. Тому воркерів
     # потрібно кілька, щоб заповнити мінутинне вікно токенів.
-    discipline_assign: int = Field(default=1, ge=0, le=8)
+    discipline_assign: int = Field(default=1, ge=0, le=48)
 
 
 class HttpConfig(BaseModel):
@@ -144,6 +149,11 @@ class DisciplineAssignConfig(BaseModel):
     """Цілодобове присвоювання дисциплін каталогу verified-документам."""
 
     enabled: bool = True
+    # Які пули ключів використовувати: "classify" — окремі ключі класифікації
+    # (4 шт.), "gemini" — спільні ключі LLM (3 шт.). Квота Gemini добові, тож
+    # коли збір зупинено, ці ключі вільні й дають присвоєнню дисциплін
+    # додаткову ємність.
+    key_pools: list[str] = Field(default=["classify", "gemini"])
     batch_size: int = Field(default=20, ge=1, le=100)
     interval_s: int = Field(default=60, ge=5, le=3600)
     recheck_days: int = Field(default=90, ge=1, le=730)
