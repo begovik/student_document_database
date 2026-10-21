@@ -585,6 +585,59 @@ async def test_classify_model_pool_switches_keys_and_phase():
         assert worker.classifier.llm._keys[0] in base.gemini_keys
 
 
+@pytest.mark.asyncio
+async def test_reservation_uses_realistic_output_budget(monkeypatch):
+    """Бронь TPM не має завищуватись до max_tokens — це стеля, а не тип."""
+    from harvester.classify.llm import LLMClient
+
+    client = LLMClient(keys=["k"], models=["m"], service="Test")
+    client._initialized = True
+    captured: dict = {}
+
+    async def _capture(model, phase, key_ref="", estimated_tokens=0):
+        captured["estimate"] = estimated_tokens
+        return 0
+
+    monkeypatch.setattr(client._rate_limiter, "acquire", _capture)
+
+    payload = {
+        "candidates": [{"content": {"parts": [{"text": "{}"}]}}],
+        "usageMetadata": {"totalTokenCount": 100},
+    }
+
+    class _Resp:
+        status_code = 200
+        text = json.dumps(payload)
+        headers: dict = {}
+
+        def json(self):
+            return payload
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            return _Resp()
+
+    monkeypatch.setattr("harvester.classify.llm.httpx.AsyncClient", _Client)
+
+    await client._call_gemini_with_wait("x" * 3000, "k", "m", "gemma")
+    cfg = client.settings.llm
+    assert captured["estimate"] == 3000 // 3 + cfg.reserve_output_tokens
+    # Броня суттєво менша за броню за стелею max_tokens.
+    assert captured["estimate"] < 3000 // 3 + cfg.max_tokens
+
+
 def test_ddgs_backend_filter_drops_unknown_names():
     """Недійсний backend (bing) не має з'їдати слот спроби на кожному запиті."""
     from harvester.discovery.ddgs_search import _filter_backends

@@ -219,6 +219,12 @@ class LLMConfig(BaseModel):
     # токенів. При 2048 токенах відповіді не залишалося взагалі (finishReason
     # MAX_TOKENS), тож нижня межа піднята, щоб конфіг не відтворив збій.
     max_tokens: int = Field(default=4096, ge=4096, le=8192)
+    # Скільки токенів виводу бронювати в TPM-вікні ДО запиту. max_tokens —
+    # це стеля, а не типове значення: фактично Gemma витрачає ~5.4K токенів
+    # на документ, з них ~0.4K — вивід. Бронювання за стелею завищувало
+    # оцінку на ~60% і через це напряму стримувало пропускну здатність
+    # лімітера. Фактична витрата уточнюється після відповіді.
+    reserve_output_tokens: int = Field(default=1024, ge=128, le=8192)
     temperature: float = Field(default=0.1, ge=0.0, le=2.0)
     min_interval_s: float = Field(default=1.5, ge=0.0)
     daily_limit_wait_s: float = Field(default=120.0, gt=0)

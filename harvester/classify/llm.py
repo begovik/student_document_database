@@ -694,11 +694,12 @@ class LLMClient:
         started = time.monotonic()
 
         key_ref = _key_ref(api_key)
-        # Бронюємо оцінку входу плюс повний бюджет виводу. Невикористане
+        # Бронюємо оцінку входу плюс реалістичний вивід. Невикористане
         # повернеться фактичним totalTokenCount після відповіді; на невдалому
         # запиті броня лишається до кінця хвилинного вікна — це навмисний
         # гальмівний тиск, а не втрата обліку.
-        estimated = estimate_tokens(prompt) + cfg.max_tokens
+        # Резерв виводу — НЕ max_tokens: це стеля, а не типове значення.
+        estimated = estimate_tokens(prompt) + cfg.reserve_output_tokens
         reservation = await self._rate_limiter.acquire(model, phase, key_ref, estimated)
 
         async with httpx.AsyncClient(timeout=cfg.timeout_s) as client:
