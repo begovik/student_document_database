@@ -161,9 +161,13 @@ class DisciplineAssigner:
                 sleep_s = (_tomorrow_midnight_utc() - datetime.now(UTC)).total_seconds()
                 log.critical("discipline_assign_all_keys_exhausted_sleep", sleep_s=int(sleep_s))
                 await asyncio.sleep(max(sleep_s, 60))
-                self.llm._daily_limit_exhausted.clear()
-                self.llm._gemma_limit_exhausted.clear()
-                self.llm._initialized = False
+                # Обов'язково через reset_exhausted_state(): воно чистить і
+                # спільний (на процес) стан лімітера. Ручне очищення лише
+                # локальних set-ів лишало пари «вичерпаними» у спільному
+                # лімітері, і всі наступні документи падали миттєво з
+                # LLMUnavailable — без жодного AllLimitsExhausted і сну
+                # (виміряно 154 тис. таких помилок, 0 успіхів).
+                self.llm.reset_exhausted_state()
 
         if not self._running:
             return
@@ -232,9 +236,9 @@ class DisciplineAssigner:
                                 doc_id=doc_id,
                             )
                             await asyncio.sleep(max(sleep_s, 60))
-                            self.llm._daily_limit_exhausted.clear()
-                            self.llm._gemma_limit_exhausted.clear()
-                            self.llm._initialized = False
+                            # Див. коментар вище: тільки через reset_exhausted_state(),
+                            # інакше спільний лімітер лишається «вичерпаним» назавжди.
+                            self.llm.reset_exhausted_state()
                             break  # перервати батч, дочекатись сну, почати заново
                         except asyncio.CancelledError:
                             raise

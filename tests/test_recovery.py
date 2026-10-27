@@ -753,6 +753,26 @@ async def test_repeated_throttle_escalates_to_daily_exhaustion():
     assert (0, 0) in exhausted
 
 
+def test_success_resets_throttle_strikes():
+    """Тротлінг упереміш з успіхами — здорове насичення, а не вичерпання.
+
+    Без скидання 48 воркерів, що постійно впираються в TPM, за лічені
+    хвилини «ескалювали» б усі пари й зупиняли роботу посеред дня.
+    """
+    from harvester.classify.ratelimit import ModelRateLimiter
+
+    limiter = ModelRateLimiter(gemma_rpm=1000, gemma_rpd=1000, gemma_tpm=100000)
+    assert limiter.record_throttle_strike("k", "m") is False
+    assert limiter.record_throttle_strike("k", "m") is False
+    # Успіх між тротлінгами обнуляє лічильник.
+    limiter.record_tokens("m", "k", 100, 0)
+    assert limiter.record_throttle_strike("k", "m") is False
+    assert limiter.record_throttle_strike("k", "m") is False
+    limiter.record_tokens("m", "k", 100, 0)
+    # Пара ніколи не ескалюється, поки хоч іноді проходять успіхи.
+    assert not limiter.is_daily_exhausted("k", "m")
+
+
 def test_daily_quota_message_is_recognised():
     """Фраза Google про денну квоту має розпізнаватися як денна, а не хвилинна."""
     from harvester.classify.llm import classify_429
