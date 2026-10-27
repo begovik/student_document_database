@@ -60,14 +60,10 @@ _DAILY_429_MARKERS = (
 )
 
 # Тіло 429 від Google для денної квоти й для TPM однакове:
-# «Resource has been exhausted (e.g. check quota).» Розрізнити їх за текстом
-# неможливо, тому вдаряємо по парі: якщо тротлінг повторюється підряд, це
-# вже не хвилинна межа, а вичерпана квота — і пару треба «забанити» до
-# опівночі, щоб не робити марні спроби перед кожним документом.
-THROTTLE_STRIKE_LIMIT = 3
-THROTTLE_STRIKE_WINDOW_S = 600.0
-
-
+# «Resource has been exhausted (e.g. check quota).» Тому неоднозначний
+# тротлінг ніколи не трактується як вичерпана квота: пара лише тимчасово
+# паркується (див. park_pair), а бан до опівночі ставиться тільки за явною
+# ознакою денної квоти в тілі відповіді.
 def estimate_tokens(text: str) -> int:
     """Оцінити кількість вхідних токенів за довжиною тексту."""
     return max(1, len(text) // _CHARS_PER_TOKEN)
@@ -473,20 +469,55 @@ class LLMClient:
         if not self._keys or not models:
             return None
         self._phase = phase
-        # Стартова пара обирається ротацією СЕРЕД ЖИВИХ пар (ключ, модель).
-        # Ротація по всіх парах давала перекос: вичерпані ключі «крали» свої
-        # позиції, тож перший живий ключ отримував більшість трафіку, а
-        # решта стояла (141K токенів/хв з 250K на одному ключі).
-        live = [
+        # Стартова пара обирається ротацією СЕРЕД ЖИВИХ пар (ключ, модель):
+        # виключаються пари з вичерпаною денною квотою та тимчасово
+        # припарковані. Ротація по всіх парах давала перекос: вичерпані ключі
+        # «крали» свої позиції, тож перший живий ключ отримував більшість
+        # трафіку, а решта стояла (141K токенів/хв з 250K на одному ключі).
+        all_pairs = [
             (ki, mi)
             for ki in range(len(self._keys))
             for mi in range(len(models))
+        ]
+        live = [
+            (ki, mi)
+            for ki, mi in all_pairs
             if not self._rate_limiter.is_daily_exhausted(
+                _key_ref(self._keys[ki]), models[mi]
+            )
+            and not self._rate_limiter.is_parked(
                 _key_ref(self._keys[ki]), models[mi]
             )
         ]
         if not live:
-            return None
+            if all_pairs and all(
+                self._rate_limiter.is_daily_exhausted(
+                    _key_ref(self._keys[ki]), models[mi]
+                )
+                for ki, mi in all_pairs
+            ):
+                # Усі пари вичерпали денну квоту по-справжньому: пропускаємо
+                # звичайний цикл, щоб він чесно заповнив локальний exhausted
+                # і підняв AllLimitsExhausted (сон до опівночі), а не мовчки
+                # повернув None.
+                live = all_pairs
+            else:
+                # Усі живі пари лише тимчасово припарковані: чекаємо, поки
+                # паркування спливе, замість миттєвого провалу. Інакше
+                # 48 воркерів крутилися б у щільному циклі помилок.
+                await asyncio.sleep(30)
+                live = [
+                    (ki, mi)
+                    for ki, mi in all_pairs
+                    if not self._rate_limiter.is_daily_exhausted(
+                        _key_ref(self._keys[ki]), models[mi]
+                    )
+                    and not self._rate_limiter.is_parked(
+                        _key_ref(self._keys[ki]), models[mi]
+                    )
+                ]
+                if not live:
+                    return None
         self._key_idx, self._model_idx = live[_next_rotate() % len(live)]
         start_key_idx = self._key_idx
         start_model_idx = self._model_idx
@@ -511,6 +542,16 @@ class LLMClient:
                 # Квота цієї пари вже відома як вичерпана — знання спільне
                 # для процесу, тож не витрачаємо ще один запит на перевірку.
                 exhausted.add((self._key_idx, self._model_idx))
+                self._advance_phase(models)
+                if self._is_back_to_start(start_key_idx, start_model_idx):
+                    checked_all = True
+                continue
+
+            if self._rate_limiter.is_parked(key_ref, model):
+                # Пара тимчасово припаркована після неоднозначного тротлінгу.
+                # На відміну від вичерпаної квоти, це НЕ рахується в локальний
+                # exhausted: інакше тимчасове паркування всіх пар помилково
+                # піднімало б AllLimitsExhausted (сон до опівночі).
                 self._advance_phase(models)
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
@@ -546,12 +587,15 @@ class LLMClient:
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True
             except GeminiRateLimited as e:
-                # Хвиминний тротлінг (TPM/RPM): пару НЕ додаємо в exhausted і
-                # НЕ повторюємо той самий ключ. Раніше `continue` бив у ту ж
-                # пару, а потім вона взагалі «банувалась» до опівночі —
-                # 60-секундна межа перетворювалась на добове вичерпання.
+                # Неоднозначний тротлінг (TPM/RPM або денна квота — тіло 429
+                # однакове): пару НЕ додаємо в exhausted, а тимчасово
+                # паркуємо на 10 хв. Паркування самозаліковується, тому
+                # принципово не може спричинити вічне блокування — на відміну
+                # від бану до опівночі, який хибно спрацьовував під сталим
+                # навантаженням 48 воркерів і зупиняв роботу посеред дня.
                 errors.append(f"[{phase}/{model}] {e}")
                 transient_retries += 1
+                self._rate_limiter.park_pair(key_ref, model)
                 logger.warning(
                     "gemini_rate_limited_rotate",
                     phase=phase,
@@ -559,22 +603,6 @@ class LLMClient:
                     model=model,
                     attempt=transient_retries,
                 )
-                if self._rate_limiter.record_throttle_strike(key_ref, model):
-                    # Тротлінг повторюється — це не хвилинна межа, а вичерпана
-                    # квота. Пара «забанюється» до опівночі, інакше перед
-                    # кожним документом робилися б марні спроби. Лічильник
-                    # спільний для процесу: перші тротлінги зупиняють усіх
-                    # воркерів, а не кожен з'ясовує це самостійно.
-                    exhausted.add((self._key_idx, self._model_idx))
-                    self._rate_limiter.mark_daily_exhausted(key_ref, model)
-                    logger.warning(
-                        "gemini_throttle_escalated",
-                        phase=phase,
-                        key_idx=self._key_idx,
-                        model=model,
-                        strikes=THROTTLE_STRIKE_LIMIT,
-                        window_s=THROTTLE_STRIKE_WINDOW_S,
-                    )
                 self._advance_phase(models)
                 if self._is_back_to_start(start_key_idx, start_model_idx):
                     checked_all = True

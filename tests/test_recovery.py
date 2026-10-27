@@ -734,9 +734,20 @@ async def test_minute_throttle_does_not_blacklist_pair():
 
 
 @pytest.mark.asyncio
-async def test_repeated_throttle_escalates_to_daily_exhaustion():
-    """Повторний тротлінг однієї пари — це вже вичерпана квота."""
+async def test_repeated_throttle_parks_pair_temporarily(monkeypatch):
+    """Повторний тротлінг лише паркує пару — бану до опівночі більше немає.
+
+    Паркування самозаліковується, тому принципово не може спричинити
+    вічне блокування: саме хибна ескалація зупиняла роботу посеред дня.
+    """
+    import asyncio
+
     from harvester.classify.llm import GeminiRateLimited, LLMClient
+
+    async def _no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
 
     client = LLMClient(keys=["k1"], models=["m1"], service="Test")
     client._initialized = True
@@ -747,30 +758,31 @@ async def test_repeated_throttle_escalates_to_daily_exhaustion():
     client._call_gemini_with_wait = _always_throttled  # type: ignore[method-assign]
     exhausted: set[tuple[int, int]] = set()
 
-    for _ in range(3):
+    for _ in range(5):
         await client._run_phase("p", ["m1"], exhausted, "gemini", [])
 
-    assert (0, 0) in exhausted
+    # Жодного бану: ні локального, ні спільного.
+    assert exhausted == set()
+    from harvester.classify.llm import _key_ref
+
+    assert not client._rate_limiter.is_daily_exhausted(_key_ref("k1"), "m1")
+    # ...але пара припаркована, тож наступний виклик її пропускає.
+    assert client._rate_limiter.is_parked(_key_ref("k1"), "m1")
 
 
-def test_success_resets_throttle_strikes():
-    """Тротлінг упереміш з успіхами — здорове насичення, а не вичерпання.
+def test_parking_expires_by_itself():
+    """Паркування спливає за часом без жодного втручання."""
+    import time
 
-    Без скидання 48 воркерів, що постійно впираються в TPM, за лічені
-    хвилини «ескалювали» б усі пари й зупиняли роботу посеред дня.
-    """
     from harvester.classify.ratelimit import ModelRateLimiter
 
     limiter = ModelRateLimiter(gemma_rpm=1000, gemma_rpd=1000, gemma_tpm=100000)
-    assert limiter.record_throttle_strike("k", "m") is False
-    assert limiter.record_throttle_strike("k", "m") is False
-    # Успіх між тротлінгами обнуляє лічильник.
-    limiter.record_tokens("m", "k", 100, 0)
-    assert limiter.record_throttle_strike("k", "m") is False
-    assert limiter.record_throttle_strike("k", "m") is False
-    limiter.record_tokens("m", "k", 100, 0)
-    # Пара ніколи не ескалюється, поки хоч іноді проходять успіхи.
-    assert not limiter.is_daily_exhausted("k", "m")
+    assert not limiter.is_parked("k", "m")
+    limiter.park_pair("k", "m", seconds=3600)
+    assert limiter.is_parked("k", "m")
+    # Прострочене паркування поводиться як відсутнє.
+    limiter._parked[("k", "m")] = time.monotonic() - 1.0
+    assert not limiter.is_parked("k", "m")
 
 
 def test_daily_quota_message_is_recognised():

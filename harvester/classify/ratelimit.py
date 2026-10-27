@@ -67,7 +67,7 @@ class ModelRateLimiter:
         # тож кожен воркер з'ясовував те саме заново: 32 воркери × 4 ключі
         # давали сотні марних 429-запитів перед кожним документом.
         self._daily_exhausted: set[tuple[str, str]] = set()
-        self._throttle_strikes: dict[tuple[str, str], list[float]] = defaultdict(list)
+        self._parked: dict[tuple[str, str], float] = {}
         self._lock = asyncio.Lock()
 
     def register_phase_keys(self, phase: str, keys_count: int) -> None:
@@ -187,13 +187,7 @@ class ModelRateLimiter:
 
         Якщо броні не було, запис додається: інакше навантаження зникло б із
         TPM-вікна і наступний запит не побачив би витрати попереднього.
-
-        Успішна відповідь також обнуляє лічильник тротлінгів пари: тротлінг
-        упереміш з успіхами — це здорове насичення межі, а не вичерпана
-        квота. Інакше 48 воркерів, що постійно впираються в TPM, за лічені
-        хвилини «ескалювали» б усі пари й зупиняли роботу посеред дня.
         """
-        self._throttle_strikes.pop((key_ref, model), None)
         window = (key_ref, model)
         if reservation:
             for entry in self._tokens[window]:
@@ -206,14 +200,41 @@ class ModelRateLimiter:
         if token_count and token_count > 0:
             self._tokens[window].append([time.monotonic(), int(token_count), 0])
 
+    def park_pair(self, key_ref: str, model: str, seconds: float = 600.0) -> None:
+        """Тимчасово припаркувати пару після неоднозначного тротлінгу.
+
+        Тіло 429 однакове для денної квоти й для TPM, тож відрізнити їх
+        неможливо. Замість бану до опівночі пара паркується на кілька
+        хвилин: якщо квота справді вичерпана, наступна спроба знову
+        отримає 429 і пару перепаркують (ціна — 1 марний запит на
+        10 хв); якщо це був хвилинний тротлінг — робота продовжиться
+        сама, без ручного втручання. Стан, що самозаліковується,
+        принципово не може спричинити вічне блокування.
+        """
+        self._parked[(key_ref, model)] = time.monotonic() + max(seconds, 1.0)
+        if len(self._parked) > 2000:
+            now = time.monotonic()
+            for stale in [k for k, v in self._parked.items() if v < now]:
+                del self._parked[stale]
+
+    def is_parked(self, key_ref: str, model: str) -> bool:
+        """Чи припаркована зараз пара (паркування ще не спливло)."""
+        until = self._parked.get((key_ref, model))
+        if until is None:
+            return False
+        if until <= time.monotonic():
+            del self._parked[(key_ref, model)]
+            return False
+        return True
+
     def reset_shared_exhaustion(self) -> None:
-        """Очистити спільні позначки вичерпання й тротлінгу.
+        """Очистити спільні позначки вичерпання й паркування.
 
         Потрібно на початку нового добового вікна або після ручного
         скидання стану клієнта.
         """
         self._daily_exhausted.clear()
-        self._throttle_strikes.clear()
+        self._parked.clear()
 
     def mark_daily_exhausted(self, key_ref: str, model: str) -> None:
         """Позначити пару (ключ, модель) як таку, що вичерпала денну квоту."""
@@ -222,23 +243,6 @@ class ModelRateLimiter:
     def is_daily_exhausted(self, key_ref: str, model: str) -> bool:
         """Чи відома вже вичерпана денна квота для цієї пари."""
         return (key_ref, model) in self._daily_exhausted
-
-    def record_throttle_strike(self, key_ref: str, model: str) -> bool:
-        """Відмітити тротлінг пари; True — їх надто багато (вичерпана квота).
-
-        Лічильник спільний для процесу: перші кілька тротлінгів однієї пари
-        зупиняють усі воркери, а не кожен з'ясовує це самостійно.
-        """
-        key = (key_ref, model)
-        now = time.monotonic()
-        strikes = self._throttle_strikes[key]
-        cutoff = now - 600.0
-        strikes[:] = [t for t in strikes if t > cutoff]
-        strikes.append(now)
-        if len(strikes) >= 3:
-            strikes.clear()
-            return True
-        return False
 
     def snapshot(self, limit: int = 8) -> list[dict]:
         """Стан вікон, у яких була активність — для діагностичного INFO-логу."""
