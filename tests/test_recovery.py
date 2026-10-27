@@ -638,6 +638,47 @@ async def test_reservation_uses_realistic_output_budget(monkeypatch):
     assert captured["estimate"] < 3000 // 3 + cfg.max_tokens
 
 
+def test_model_quotas_override_phase_limits():
+    """Per-модельні ліміти перекривають фазові для зазначених моделей."""
+    from harvester.classify.ratelimit import ModelRateLimiter
+
+    limiter = ModelRateLimiter(
+        gemini_rpm=15, gemini_rpd=500, gemini_tpm=250000,
+        model_limits={"gemini-2.5-flash": {"rpm": 10, "rpd": 20, "tpm": 250000}},
+    )
+    stats_new = limiter.get_stats("gemini-2.5-flash", "gemini")
+    assert (stats_new["rpm_limit"], stats_new["rpd_limit"], stats_new["tpm_limit"]) == (10, 20, 250000)
+
+    # Модель без перекриття лишається на фазових лімітах.
+    stats_old = limiter.get_stats("gemini-3.5-flash-lite", "gemini")
+    assert (stats_old["rpm_limit"], stats_old["rpd_limit"], stats_old["tpm_limit"]) == (15, 500, 250000)
+
+
+@pytest.mark.asyncio
+async def test_rpd_cap_uses_per_model_limit():
+    """Денний ліміт спрацьовує за per-модельним RPD, а не фазовим."""
+    from harvester.classify.ratelimit import DailyLimitExhausted, ModelRateLimiter
+
+    limiter = ModelRateLimiter(
+        gemini_rpm=1000, gemini_rpd=500, gemini_tpm=1000000,
+        model_limits={"gemini-2.5-flash": {"rpm": 1000, "rpd": 3, "tpm": 1000000}},
+    )
+    for _ in range(3):
+        await limiter.acquire("gemini-2.5-flash", "gemini", "k")
+    with pytest.raises(DailyLimitExhausted):
+        await limiter.acquire("gemini-2.5-flash", "gemini", "k")
+
+
+def test_discipline_uses_configured_models():
+    """Призначення дисциплін бере список моделей з конфігу."""
+    from harvester.classify.discipline_assigner import DisciplineAssigner
+
+    assigner = DisciplineAssigner(0, db=None, worker_count=1)
+    assert assigner._gemini_models == assigner.settings.discipline_assign.models
+    assert len(assigner.llm._models) == len(assigner.settings.discipline_assign.models)
+    assert "gemini-3.5-flash-lite" in assigner.llm._models
+
+
 def test_ddgs_backend_filter_drops_unknown_names():
     """Недійсний backend (bing) не має з'їдати слот спроби на кожному запиті."""
     from harvester.discovery.ddgs_search import _filter_backends

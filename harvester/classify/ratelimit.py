@@ -44,11 +44,17 @@ class ModelRateLimiter:
         gemma_rpd: int = 14000,
         gemma_tpm: int = 16000,
         gemini_tpm: int = 250000,
+        model_limits: dict[str, dict[str, int]] | None = None,
     ):
         self._limits: dict[str, dict[str, int]] = {
             "gemini": {"rpm": gemini_rpm, "rpd": gemini_rpd, "tpm": gemini_tpm},
             "gemma": {"rpm": gemma_rpm, "rpd": gemma_rpd, "tpm": gemma_tpm},
         }
+        # Per-модельні ліміти (точна назва моделі -> rpm/rpd/tpm).
+        # Перекривають фазові: напр. нові flash-моделі мають RPD 20/день,
+        # а фазовий ліміт Gemini — 500, без перекриття всі зайві запити
+        # згорали б на справжніх 429.
+        self._model_limits: dict[str, dict[str, int]] = dict(model_limits or {})
         # Вікна за парою (ключ, модель): саме на неї діють квоти Google.
         self._requests: dict[tuple[str, str], list[float]] = defaultdict(list)
         # Записи токенів: [час, токени, id броні]. Бронь id=0 означає
@@ -79,6 +85,18 @@ class ModelRateLimiter:
         """
         self._phase_keys[phase] = max(1, int(keys_count or 1))
 
+    def limits_for(self, model: str, phase: str) -> dict[str, int]:
+        """Ліміти для пари (модель, фаза): per-модельні або фазові."""
+        specific = self._model_limits.get(model)
+        if specific:
+            base = self._limits.get(phase, {})
+            return {
+                "rpm": int(specific.get("rpm") or base.get("rpm") or 0),
+                "rpd": int(specific.get("rpd") or base.get("rpd") or 0),
+                "tpm": int(specific.get("tpm") or base.get("tpm") or 0),
+            }
+        return self._limits.get(phase, {})
+
     @classmethod
     def shared(
         cls,
@@ -88,16 +106,24 @@ class ModelRateLimiter:
         gemma_rpd: int = 14000,
         gemma_tpm: int = 16000,
         gemini_tpm: int = 250000,
+        model_limits: dict[str, dict[str, int]] | None = None,
     ) -> "ModelRateLimiter":
         """Повернути один limiter на процес для однакового набору квот.
 
         Один ключ може обслуговувати кілька worker-ів. Окремі екземпляри
         limiter-а в кожному worker-і дозволяли сумарно перевищити RPD/RPM.
         """
-        key = (gemini_rpm, gemini_rpd, gemma_rpm, gemma_rpd, gemma_tpm, gemini_tpm)
+        frozen = tuple(sorted(
+            (m, l.get("rpm", 0), l.get("rpd", 0), l.get("tpm", 0))
+            for m, l in (model_limits or {}).items()
+        ))
+        key = (gemini_rpm, gemini_rpd, gemma_rpm, gemma_rpd, gemma_tpm, gemini_tpm, frozen)
         instance = cls._shared_instances.get(key)
         if instance is None:
-            instance = cls(*key)
+            instance = cls(
+                gemini_rpm, gemini_rpd, gemma_rpm, gemma_rpd, gemma_tpm, gemini_tpm,
+                dict(model_limits or {}),
+            )
             cls._shared_instances[key] = instance
         return instance
 
@@ -114,8 +140,10 @@ class ModelRateLimiter:
         estimated_tokens — оцінка «промпт + бюджет виводу» ДО запиту. Вона
         тримає місце у TPM-вікні, поки запит у польоті, і замінюється
         фактичним totalTokenCount після відповіді.
+
+        Ліміти беруться per-модельні за наявності, інакше фазові.
         """
-        limits = self._limits.get(phase)
+        limits = self.limits_for(model, phase)
         if not limits:
             return 0
         rpm_limit = int(limits.get("rpm") or 0)
@@ -291,7 +319,7 @@ class ModelRateLimiter:
 
     def get_stats(self, model: str, phase: str, key_ref: str = "") -> dict:
         """Повертає поточну статистику для пари (ключ, модель)."""
-        limits = self._limits.get(phase, {})
+        limits = self.limits_for(model, phase)
         now = time.monotonic()
         window = (key_ref, model)
         rpm = sum(1 for t in self._requests[window] if t > now - 60)

@@ -94,9 +94,10 @@ class DisciplineAssigner:
         cfg = self.settings.discipline_assign
 
         keys = self._collect_keys()
+        self._gemini_models = list(cfg.models)
         self.llm = LLMClient(
             keys=keys,
-            models=[cfg.model],
+            models=self._gemini_models,
             gemma_only=False,
             service="DisciplineAssign",
         )
@@ -150,7 +151,7 @@ class DisciplineAssigner:
             "discipline_assign_worker_started",
             llm_enabled=self.llm.enabled,
             keys=len(self.llm._keys),
-            model=cfg.model,
+            models=self._gemini_models,
         )
 
         while self._running:
@@ -227,7 +228,7 @@ class DisciplineAssigner:
                         log_doc = log.bind(doc_id=doc_id)
 
                         try:
-                            picked, confidence = await self._assign(doc, disciplines_list)
+                            picked, confidence, used_model = await self._assign(doc, disciplines_list)
                         except AllLimitsExhausted:
                             sleep_s = (_tomorrow_midnight_utc() - datetime.now(UTC)).total_seconds()
                             log.critical(
@@ -257,7 +258,7 @@ class DisciplineAssigner:
 
                         try:
                             await self._save_result(
-                                db, doc_id, picked, confidence, code_to_id, cfg.model
+                                db, doc_id, picked, confidence, code_to_id, used_model
                             )
                         except Exception as e:  # noqa: BLE001
                             # Без discipline_checked_at документ наступного
@@ -299,8 +300,8 @@ class DisciplineAssigner:
                     log.warning("discipline_assign_db_close_failed", error=str(e)[:200])
             log.info("discipline_assign_worker_stopped")
 
-    async def _assign(self, doc: dict, disciplines_list: str) -> tuple[list[str], float]:
-        """Викликати LLM та повернути (коди дисциплін, confidence)."""
+    async def _assign(self, doc: dict, disciplines_list: str) -> tuple[list[str], float, str]:
+        """Викликати LLM та повернути (коди дисциплін, confidence, модель)."""
         cfg = self.settings.discipline_assign
         text_sample = (doc.get("text_sample") or "")[: cfg.max_text_chars] or (
             doc.get("title") or ""
@@ -374,7 +375,7 @@ class DisciplineAssigner:
             disciplines=codes,
             confidence=confidence,
         )
-        return codes, confidence
+        return codes, confidence, resp.model
 
     async def _save_result(
         self,

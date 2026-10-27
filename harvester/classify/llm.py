@@ -296,6 +296,10 @@ class LLMClient:
         # з key 0, і перший ключ з'їдав усю TPM-межу, поки решта простоювала
         # (виміряно: 86% відповідей 429 припадали на key_idx 0).
         self._rotate_counter = 0
+        quotas = {
+            name: {"rpm": q.rpm, "rpd": q.rpd, "tpm": q.tpm}
+            for name, q in self.settings.llm.model_quotas.items()
+        }
         self._rate_limiter = ModelRateLimiter.shared(
             gemini_rpm=self.settings.llm.gemini_rpm,
             gemini_rpd=self.settings.llm.gemini_rpd,
@@ -303,6 +307,7 @@ class LLMClient:
             gemma_rpd=self.settings.llm.gemma_rpd,
             gemma_tpm=self.settings.llm.gemma_tpm,
             gemini_tpm=self.settings.llm.gemini_tpm,
+            model_limits=quotas,
         )
 
     @property

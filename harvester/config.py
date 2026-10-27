@@ -157,7 +157,18 @@ class DisciplineAssignConfig(BaseModel):
     batch_size: int = Field(default=20, ge=1, le=100)
     interval_s: int = Field(default=60, ge=5, le=3600)
     recheck_days: int = Field(default=90, ge=1, le=730)
-    model: str = "gemini-3.5-flash-lite"
+    # Моделі фази Gemini для присвоєння дисциплін. Ланцюг іде зверху вниз:
+    # перевірені flash-lite першими (RPD 500/день на ключ), нові моделі
+    # далі (RPD лише 20/день — вони вичерпуються за хвилини і пропускаються).
+    # Увага: "Gemini 3 Flash" в API називається gemini-3-flash-preview.
+    models: list[str] = Field(default=[
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-3.6-flash",
+    ])
     max_disciplines: int = Field(default=3, ge=1, le=10)
     min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     max_text_chars: int = Field(default=15000, ge=1000, le=100000)
@@ -195,6 +206,14 @@ class DatabaseConfig(BaseModel):
     @property
     def remote_configured(self) -> bool:
         return bool(self.host) or bool(self.dsn)
+
+
+class ModelQuota(BaseModel):
+    """Ліміти однієї моделі (RPM / RPD / TPM)."""
+
+    rpm: int = Field(default=15, ge=1)
+    rpd: int = Field(default=500, ge=1)
+    tpm: int = Field(default=250000, ge=1000)
 
 
 class LLMConfig(BaseModel):
@@ -237,6 +256,23 @@ class LLMConfig(BaseModel):
     gemini_tpm: int = Field(
         default=250000, ge=1000, description="Gemini: токенів за хвилину"
     )
+    # Per-модельні ліміти: перекривають фазові (gemini_*/gemma_*) для
+    # зазначених моделей. Ключ — точна назва моделі в API.
+    # Напр. нові flash-моделі мають мізерний RPD (20/день на ключ), тож
+    # без окремого ліміту лімітер дозволяв би 500 запитів і всі зайві
+    # згорали б на справжніх 429 від Google.
+    # Дефолт: RPM 10 / TPM 250K / RPD 20 для нових flash-моделей (заміряно
+    # власником на консолі Google, 27.10.2026). Flash-lite лишаються на
+    # фазових лімітах (15/500/250K).
+    model_quotas: dict[str, ModelQuota] = Field(default_factory=lambda: {
+        name: ModelQuota(rpm=10, rpd=20, tpm=250000)
+        for name in (
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-3.6-flash",
+        )
+    })
     max_text_chars_for_llm: int = Field(default=80000, ge=10000, le=500000)
     max_pages_for_extraction: int = Field(default=100, ge=10, le=1000)
 
