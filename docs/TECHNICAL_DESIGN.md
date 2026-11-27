@@ -7,9 +7,17 @@
 | **Назва проєкту** | Harvester (робоча назва) |
 | **Версія документа** | 1.0 |
 | **Дата** | 2026-08-19 |
-| **Статус** | Затверджено до реалізації |
+| **Статус** | Цільова специфікація; фактичний статус реалізації описано нижче |
 | **Мова документа** | Українська |
 | **Платформа** | Python 3.12+, SQLite 3.45+, Linux (systemd) |
+
+> **Фактичний статус реалізації (2026-09).** У поточному коді повністю інтегровані та
+> запускаються лише discovery-адаптери `ddgs` і `openalex`. Канали Crossref, Unpaywall,
+> Semantic Scholar, arXiv, DOAJ, Internet Archive, CORE, OAI-PMH та site scanner є
+> цільовими компонентами цієї специфікації, але не мають робочого адаптера в репозиторії
+> й тому вимкнені у `config.yaml`. Не вмикати їх лише зміною YAML: перед активацією
+> потрібні реалізація, тести, ліміти та інтеграція у supervisor. PDF у робочих каталогах
+> не зберігаються: вони завантажуються лише тимчасово для верифікації та витягу.
 
 ---
 
@@ -109,7 +117,7 @@
 
 **Поза scope (свідомо не робимо):**
 
-- **Постійне зберігання PDF-файлів.** Файли завантажуються лише для верифікації, хешуються потоково та видаляються. У БД лишаються метадані + URL + SHA-256. (Обґрунтування: диск ~41 ГБ вільно; корпус із сотень тисяч PDF не вміститься; юридично чистіше; суміжний проєкт завантажуватиме файли сам за URL.)
+- **Відсутність постійного зберігання PDF-файлів.** Файли завантажуються лише для верифікації, хешуються потоково та видаляються. У БД лишаються метадані + URL + SHA-256. (Обґрунтування: корпус із сотень тисяч PDF не повинен накопичуватися локально; суміжний проєкт завантажуватиме файли сам за URL.)
 - Обхід платних стін (paywall), sci-hub, піратські бібліотеки (libgen, anna's archive тощо) — **категорично заборонено**.
 - Веб-дашборд (винесено в roadmap v2.0; для MVP достатньо CLI + журналів).
 - OCR сканованих документів без текстового шару (такі документи приймаються, але маркуються `text_layer=false` і класифікуються за метаданими).
@@ -984,6 +992,7 @@ CREATE TABLE tasks (
     max_attempts INTEGER NOT NULL DEFAULT 5,
     run_after    TEXT NOT NULL,
     lease_expires_at TEXT,
+    lease_token  TEXT,                   -- унікальний token власника lease
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
     UNIQUE(type, payload_hash)
@@ -1365,6 +1374,7 @@ real_sources_for_students/
 |---|---|
 | `harvester start [--config PATH]` | Запуск у foreground (для systemd) |
 | `harvester status` | Живий стан: heartbeat, аптайм, worker'и, черга, останні події |
+| `harvester report [--days N] [--json]` | Зведений звіт: стан системи + поденна динаміка verifier (розділ 17) |
 | `harvester stats [--json] [--period 24h\|7d\|30d]` | Зведення: документи за статусами/мовами/темами, канали (yield, помилки), топ-джерела |
 | `harvester export --format csv\|jsonl [--lang uk] [--topic code] [--status verified] [--out FILE]` | Експорт для суміжного проєкту |
 | `harvester sources list\|add URL\|pause ID\|resume ID\|import-seeds` | Керування джерелами |
@@ -1394,7 +1404,7 @@ harvester extract run [OPTIONS]
 --dry-run, -d     Не зберігати результати, лише показати
 --retry-failed    Обробляти тільки документи з попередніми помилками
 --skip-extracted  Пропускати вже оброблені (дефолт: так)
---catalog-dir, -C Шлях до каталогу з resources/ (для використання локальних PDF замість завантаження)
+--catalog-dir, -C Каталог для обмеження списку документів; legacy resources/ читається за наявності
 ```
 
 **Потік виконання:**
@@ -1433,7 +1443,7 @@ CREATE TABLE extractions (
 
 ### 16.2.1. Підготовка каталогу (`harvester curator prepare`)
 
-Підготувати каталог документів для теми: відбір, перевірка доступності, завантаження PDF, запис каталогу.
+Підготувати каталог документів для теми: відбір, тимчасова перевірка доступності PDF, запис каталогу.
 
 ```bash
 harvester curator prepare TOPIC [OPTIONS]
@@ -1455,7 +1465,7 @@ harvester curator prepare "Інформатика" --dry-run
 
 **Результат:** створюється папка `catalogs/catalog_YYYYMMDD_HHMMSS/` з:
 - `catalog_YYYYMMDD_HHMMSS.json` — метаданими каталогу
-- `resources/` — завантаженими PDF-файлами
+- `resources/` — лише legacy-опція для читання вже створених каталогів; нові каталоги PDF не містять
 
 ### 16.2.2. Верифікація каталогу (`harvester curator verify`)
 
@@ -1518,10 +1528,6 @@ python scripts/extract_from_catalog.py catalogs/catalog_076.json --dry-run
 catalogs/
 └── catalog_YYYYMMDD_HHMMSS/
     ├── catalog_YYYYMMDD_HHMMSS.json   # Метадані каталогу
-    └── resources/                      # Завантажені PDF
-        ├── 10678.pdf
-        ├── 15901.pdf
-        └── ...
 ```
 
 Кожен `catalog_YYYYMMDD_HHMMSS.json` містить:
@@ -1549,7 +1555,6 @@ catalogs/
       "has_text_layer": 1,
       "verified_at": "...",
       "first_seen_at": "...",
-      "pdf_path": "resources/47879.pdf",
       "topics": [{"topic_id": 3, "topic_name": "Економіка", "score": 0.83}]
     }
   ]
@@ -1588,6 +1593,7 @@ catalogs/
 - **Логи:** `structlog` → JSON-рядки → stdout → **journald** (systemd); рівні: DEBUG (dev), INFO (prod), WARN, ERROR. Обов'язкові поля: `ts`, `level`, `component`, `event`, `doc_id`/`source_id`/`channel` (де доречно), `duration_ms`, `result_code`. Події рівня WARN+ дублюються в `system_events` (для CLI без доступу до journalctl).
 - **Метрики:** лічильники в пам'яті → погодинний flush у `channel_stats`: по кожному каналу — `requests`, `ok`, `errors`, `items_found`, `items_new`; окремо глобальні: черга за типами/пріоритетами, середня тривалість verify, частка reject за причинами.
 - **Здоров'я:** `harvester status` показує heartbeat-вік; якщо > 2 хв — процес вважається мертвим (для зовнішнього watchdog/моніторингу достатньо `systemctl is-active` + парсинг heartbeat).
+- **Зведена статистика:** `harvester report [--days N] [--json]` — стан системи (документи, мови, класифікації, завдання, канали) та **поденна динаміка verifier**: перевірено / pass / fail / err / LLM-виклики / перший-останній час LLM (UTC), підсумок по `verifier_results` (профіль `strict`) і охоплення verified-документів. Реалізація: `VerifierRepository` (`daily_summary`, `overall_summary`, `coverage`) у `harvester/db/repositories.py`, CLI-команда `report` у `harvester/cli.py`. Денна кількість LLM-викликів ~2000 (4 ключі × `gemini_rpd=500`) є індикатором вичерпання денних лімітів Gemini.
 - **Алертинг v1:** без зовнішніх інтеграцій; ERROR-події видно в `status`/`stats`. (Опційно у конфігурі: виклик довільної shell-команди при фатальних подіях — напр. відправка повідомлення.)
 
 ---
@@ -1905,5 +1911,3 @@ retention:
 ---
 
 *Кінець документа. Версія 1.0 · 2026-08-19. Зміни вносяться через версіонування цього файлу разом із кодом.*
-
-

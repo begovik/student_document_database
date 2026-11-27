@@ -1,6 +1,6 @@
 import asyncio
 import random
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 import structlog
 from ddgs import DDGS
@@ -15,13 +15,79 @@ logger = structlog.get_logger()
 MAX_BACKENDS_PER_QUERY = 3
 
 
+class DDGSSearchError(RuntimeError):
+    """Помилка всіх backend-ів пошуку, яку не можна вважати порожнім результатом."""
+
+
+# Точний текст, який ddgs піднімає, коли ВСІ engine-и відпрацювали без
+# помилки, але нічого не знайшли (ddgs/ddgs.py:223 — `err or "No results
+# found."`). Звіряння за повним рядком, а не за підрядком: інакше реальна
+# помилка engine-а на кшталт "no results attribute" була б прийнята за
+# легітимний порожній результат, і такий збій став би невидимим.
+_NO_RESULTS_MESSAGE = "no results found."
+
+
+def _is_no_results(exc: BaseException) -> bool:
+    """Чи означає виняток ddgs порожній результат, а не збій backend-a.
+
+    Точний збіг, а не підрядок: повідомлення про помилку engine-а може
+    містити слова «no results» у складі іншої фрази, і такий збій не
+    можна вважати нормою.
+    """
+    return str(exc).strip().lower() == _NO_RESULTS_MESSAGE
+
+
+def _text_backends() -> list[str]:
+    """Перелік пошукових backend-ів, які підтримує встановлена ddgs.
+
+    Конфігурація може містити застарілі назви (напр. `bing`), яких ddgs
+    більше не знає. Кожен такий backend марно витрачав один із трьох слотів
+    спроби на запит і плодив WARNING від самої бібліотеки. Список беремо з
+    реєстру ddgs, а не хардкодом: він змінюється між версіями.
+    """
+    try:
+        from ddgs.engines import ENGINES
+
+        return sorted(ENGINES["text"].keys())
+    except Exception:  # noqa: BLE001
+        # Реєстр — внутрішня деталь ddgs. Якщо він зникне, фільтрувати нічого
+        # не можна: краще працювати з конфігурацією як є, ніж мовчки відкинути
+        # всі backend-и й зупинити discovery.
+        logger.warning("ddgs_backends_registry_unavailable")
+        return []
+
+
+def _filter_backends(configured: list[str]) -> list[str]:
+    """Відкинути назви backend-ів, яких немає у встановленій ddgs."""
+    supported = _text_backends()
+    if not supported:
+        return configured
+    valid = [b for b in configured if b in supported]
+    invalid = [b for b in configured if b not in supported]
+    if invalid:
+        logger.warning(
+            "ddgs_unsupported_backends_ignored",
+            ignored=invalid,
+            supported=supported,
+        )
+    if not valid:
+        # Усе налаштоване виявилося недійсним. Підставляти «щось інше» не
+        # можна: це мовчки увімкнуло б backend, якого власник не обирав.
+        # Лишаємо конфігурацію як є — канал голосно повідомить про помилку.
+        logger.error("ddgs_no_supported_backends", configured=configured, supported=supported)
+        return configured
+    return valid
+
+
 class DDGSSearchChannel:
     name = "ddgs"
 
     def __init__(self):
         settings = get_settings()
         self.enabled = settings.channels.ddgs.enabled
-        self.backends = settings.channels.ddgs.backends
+        # Фільтруємо назви, яких немає в ddgs: мертвий backend коштує слот
+        # спроби на КОЖНОМУ запиті (MAX_BACKENDS_PER_QUERY = 3).
+        self.backends = _filter_backends(settings.channels.ddgs.backends)
         self.query_interval = settings.channels.ddgs.query_interval_s
         self._current_backend_idx = 0
 
@@ -43,11 +109,16 @@ class DDGSSearchChannel:
 
         if not query_text:
             logger.warning("ddgs_no_query_text", task=task)
-            return
+            raise ValueError("DDGS search task must contain query_text")
+
+        if not self.backends:
+            raise DDGSSearchError("DDGS не налаштовано жодного backend-а")
 
         results: list[dict] = []
         backends_tried: list[str] = []
         rate_limited = False
+        errors: list[str] = []
+        empty_backends: list[str] = []
 
         for _ in range(min(MAX_BACKENDS_PER_QUERY, len(self.backends))):
             backend = self._get_next_backend()
@@ -59,15 +130,47 @@ class DDGSSearchChannel:
                 if results:
                     break
                 logger.debug("ddgs_empty", query=query_text, backend=backend)
-            except RatelimitException:
+            except RatelimitException as e:
                 rate_limited = True
-                logger.warning("ddgs_ratelimit", query=query_text, backend=backend)
+                errors.append(f"{backend}: rate limit ({e})")
+                logger.warning("ddgs_ratelimit", query=query_text, backend=backend, error=str(e))
                 continue
             except TimeoutException as e:
+                errors.append(f"{backend}: timeout ({e})")
                 logger.warning("ddgs_timeout", query=query_text, backend=backend, error=str(e))
                 continue
             except DDGSException as e:
+                # Бібліотека ddgs піднімає DDGSException("No results found.")
+                # коли ВСІ engine-и відпрацювали без помилки, але нічого не
+                # знайшли. Це-legitимний порожній результат, а не збій
+                # backend-а (див. ddgs/ddgs.py:220-223: `err` порожній →
+                # raise DDGSException("No results found.")).
+                #
+                # Раніше такий випадок рахувався помилкою: запит отримував
+                # 30-хв error-cooldown замість zero_streak-сходинки, а кожна
+                # спроба писала 2 error-події з повним traceback. На пулі
+                # з 4 000 запитів це глушило реальні збої пошуку.
+                if _is_no_results(e):
+                    empty_backends.append(backend)
+                    logger.debug(
+                        "ddgs_backend_no_results", query=query_text, backend=backend
+                    )
+                    continue
+                errors.append(f"{backend}: {e}")
                 logger.warning("ddgs_backend_error", query=query_text, backend=backend, error=str(e))
+                continue
+            except Exception as e:  # noqa: BLE001
+                # Не-DDGSException (напр. зміна бібліотеки, проблема з
+                # DNS/проксі) інакше виривав би з discover() поза обробкою
+                # і виглядав би як збій воркера, а не помилка backend-а.
+                errors.append(f"{backend}: неочікувана помилка {type(e).__name__}: {e}")
+                logger.warning(
+                    "ddgs_backend_unexpected_error",
+                    query=query_text,
+                    backend=backend,
+                    error=str(e)[:200],
+                    error_type=type(e).__name__,
+                )
                 continue
 
         logger.info(
@@ -76,24 +179,56 @@ class DDGSSearchChannel:
             results=len(results),
             backends=backends_tried,
             rate_limited=rate_limited,
+            errors=len(errors),
+            empty_backends=len(empty_backends),
         )
 
-        if rate_limited and not results:
-            await asyncio.sleep(60)
+        # Помилка ставиться лише коли результату немає І був справжній
+        # збій (rate-limit/timeout/помилка engine). Якщо всі backend-и
+        # відпрацювали чисто, але нічого не знайшли — це валідний нульовий
+        # результат: запит отримує zero_streak-сходинку, а не error-cooldown.
+        if not results and (errors or rate_limited):
+            detail = "; ".join(errors) or "усі backend-и rate-limited"
+            raise DDGSSearchError(
+                f"DDGS не отримав результатів для запиту ({'; '.join(backends_tried)}): {detail}"
+            )
+
+        if not results and empty_backends:
+            logger.info(
+                "ddgs_all_backends_empty",
+                query=query_text,
+                backends=empty_backends,
+            )
+
+        yielded = 0
+        dropped_invalid = 0
+        dropped_blocked: dict[str, int] = {}
 
         for result in results:
             href = result.get("href")
             if not href or not validate_url_format(href):
+                # Раніше `continue` без логу: движок пошуку повертає рекламні
+                # та технічні URL, тому незрозуміло було, чому з 30 «результатів»
+                # реєструється 3 документи.
+                dropped_invalid += 1
+                logger.debug(
+                    "ddgs_result_invalid",
+                    query=query_text,
+                    href=str(href)[:150],
+                    reason="empty" if not href else "bad_format",
+                )
                 continue
 
             allowed, reason = await is_url_allowed(href)
             if not allowed:
-                logger.debug("ddgs_url_blocked", url=href, reason=reason)
+                dropped_blocked[reason or "unknown"] = dropped_blocked.get(reason or "unknown", 0) + 1
+                logger.debug("ddgs_url_blocked", url=href[:150], reason=reason, query=query_text)
                 continue
 
             title = result.get("title")
             body = result.get("body")
 
+            yielded += 1
             yield Candidate(
                 url=href,
                 title_hint=title,
@@ -101,6 +236,17 @@ class DDGSSearchChannel:
                 query_text=query_text,
                 ref_url=href,
                 extra={"body": body, "backends": backends_tried},
+            )
+
+        # Підсумок фільтрації: без нього втрата кандидатів невидима.
+        if dropped_invalid or dropped_blocked:
+            logger.info(
+                "ddgs_results_filtered",
+                query=query_text[:100],
+                results=len(results),
+                yielded=yielded,
+                dropped_invalid=dropped_invalid,
+                dropped_blocked=dropped_blocked,
             )
 
     def _search_sync(

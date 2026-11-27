@@ -22,12 +22,40 @@ source .venv/bin/activate
 |---|---|
 | `harvester start [--config PATH]` | Запустити сервіс у безперервному режимі 24/7 (supervisor, workers, discovery) |
 | `harvester status` | Показати поточний стан сервісу (heartbeat, живі воркери, лічильники) |
+| `harvester report [--days 7] [--json]` | Зведений звіт: стан системи + динаміка перевірки джерел (деталі нижче) |
 | `harvester doctor` | Самодіагностика системи (БД, outbox, дзеркало, конфігурація, email) |
 | `harvester stats [--period 24h\|7d\|30d] [--json]` | Статистика по каналах пошуку (запити, успіхи, помилки, нові документи) |
 | `harvester export --output FILE [--format csv\|jsonl] [--lang LANG] [--status STATUS]` | Експорт верифікованих документів з бази даних |
 | `harvester events [--limit N] [--level LEVEL]` | Перегляд системних подій (WARN, ERROR, CRITICAL) |
 | `harvester queries [--top N]` | Аналіз ефективності пошукових запитів та їх yield |
 | `harvester find --topic TOPIC [--limit N] [--lang LANG] [--type TYPE]` | Пошук джерел та літератури в існуючій базі за темою/УДК |
+
+### `harvester report`
+
+Зведений звіт: загальний стан Harvester + підсумок цілодобової перевірки джерел (verifier) + поденна динаміка перевірок за останні N днів.
+
+```bash
+harvester report [OPTIONS]
+```
+
+| Опція | Дефолт | Опис |
+|---|---|---|
+| `--days`, `-d` | `7` | Період поденної динаміки (в днях) |
+| `--json` | `False` | Вивід у форматі JSON (машинночитабельний) |
+
+**Секції текстового виводу:**
+1. **Загальний стан Harvester** — документи за статусами, мови (verified), кількість класифікацій, завдання pending/running, топ каналів.
+2. **Підсумок verifier** — всього перевірок (pass/fail/error), LLM-виклики (pass/fail), охоплення verified-документів у відсотках.
+3. **Перевірка джерел (verifier, N днів)** — по днях: перевірено, pass, fail, err, LLM-виклики, перший/останній час LLM-звернення (UTC).
+
+**JSON-вивід:**
+```bash
+harvester report --json | jq '.verifier.daily'
+harvester report --days 30 --json | jq '.documents_by_status'
+```
+Ключі: `db_mode`, `documents_by_status`, `languages`, `classification_total`, `classification_docs`, `tasks_by_status`, `tasks_by_type`, `channels`, `verifier.total`, `verifier.coverage`, `verifier.daily`.
+
+Джерело даних: `verifier_results` (профіль `strict`) + `documents` + `tasks` + `channel_stats` через `VerifierRepository` `harvester/db/repositories.py`.
 
 ---
 
@@ -48,7 +76,7 @@ source .venv/bin/activate
 
 ## 3. Сервіс кураторства каталогів (`harvester curator`)
 
-Формування та верифікація тематичних каталогів літератури з автозавантаженням PDF.
+Формування та верифікація тематичних каталогів літератури без постійного зберігання PDF.
 
 ### `harvester curator prepare`
 Підготувати каталог документів для заданої теми.
@@ -132,7 +160,7 @@ PGPASSWORD=$PG_PASS psql -h 89.167.68.48 -U harvester -d harvester -c "SELECT ve
 
 ## 6. Витяг літератури та добирання джерел (`harvester bibliography`)
 
-Допоміжний сервіс добирання: сканує всі PDF у каталозі, витягує `ЛІТЕРАТУРА/REFERENCES` (LLM + fallback regex), дедуплікує, фільтрує RU (`is_russian_entry` — `.ru/.su/.рф`, `Москва`/`Издательство`, `ыэъё` без `іїєґ`), шукає кожне посилання в БД (`doi/url/title` `harvester/bibliography/searcher.py:113`) та в інтернеті (`DDGSSearchChannel` `harvester/discovery/ddgs_search.py:18` + `is_url_allowed` `harvester/net/guards.py:99`), завантажує знайдені PDF у `catalog_dir/bibliography_pdfs/` після перевірок (`200 OK`, `>5KB`, `%PDF`, `has_text_layer` `harvester/verify/pdfparse.py:32`, релевантність/інформативність) — документи → і в список, і в БД (`DocumentsRepository.insert_or_ignore` `harvester/db/repositories.py:17`), інтернет-ресурси → лише у список.
+Допоміжний сервіс добирання: читає legacy-PDF з каталогу або тимчасово завантажує PDF за URL, витягує `ЛІТЕРАТУРА/REFERENCES` (LLM + fallback regex), дедуплікує, фільтрує RU, шукає посилання в БД та інтернеті, а після перевірки видаляє тимчасові файли. Документи, що пройшли перевірку, додаються до БД; у JSON зберігаються URL і результати, але не PDF.
 
 ```bash
 harvester bibliography scan CATALOG_DIR [OPTIONS]
@@ -147,7 +175,7 @@ harvester bibliography scan CATALOG_DIR [OPTIONS]
 - `bibliography_YYYYMMDD_HHMMSS.json` — `statistics` (`found_in_database`/`found_online`/`filtered_russian`/`pdfs_downloaded`), `explanation`
 - `bibliography_YYYYMMDD_HHMMSS_literature.txt` — відформатований список
 - `bibliography_YYYYMMDD_HHMMSS_found.json` — знайдені URL
-- `bibliography_pdfs/*.pdf` — верифіковані завантажені PDF
+- PDF-файли не створюються у каталозі; завантаження виконуються лише у системний temp
 
 ```bash
 harvester bibliography scan catalogs/catalog_20260828_135702

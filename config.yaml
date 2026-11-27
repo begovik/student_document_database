@@ -18,13 +18,22 @@ database:
 paths:
   db_path: "data/harvester.db"
   tmp_dir: "data/tmp"
-  backup_dir: "backups"
+  # backup_dir: "backups"
 
 workers:
+  # Збір зупинено: лишаємо тільки класифікацію вже зібраного.
+  # discovery/verify/verifier не запускаються, квота LLM йде класифікаторам.
+  mode: classify_only
   verify: 6
   discovery: 3
-  scanner: 1
+  scanner: 0  # окремого scanner-воркера ще немає
   classify: 1
+  # Класифікатор переведено на Gemini: добова квота спільних ключів
+  # звільнилася разом із зупинкою збору, а відповідь Gemini швидша.
+  classify_model_pool: gemini
+  # Присвоєння дисциплін — по одному LLM-запиту на документ, тому
+  # воркерів потрібно багато, щоб заповнити мінутинне вікно токенів.
+  discipline_assign: 48
 
 http:
   global_concurrency: 32
@@ -44,7 +53,6 @@ channels:
     enabled: true
     backends:
       - duckduckgo
-      - bing
       - brave
       - mojeek
       - startpage
@@ -53,29 +61,37 @@ channels:
     query_interval_s: [3, 10]
   openalex:
     enabled: true
-    rps: 5
+    # Ліміт OpenAlex — 10 запитів/с на акаунт (за mailto). Значення нижче
+    # застосовується ОСОБИСТО до кожного екземпляра каналу, а екземпляр
+    # свій у кожного discovery-воркера: при rps: 5 і 3 воркерах сумарно
+    # виходило 15 зап/с, тобто гарантований 429.
+    # 3 × 3 = 9 зап/с — нижче ліміту навіть за максимального навантаження.
+    rps: 3
+  # Адаптер реалізовано (harvester/discovery/crossref.py).
+  # Ліміт Crossref — 50 зап/с у polite-пулі, без денного бюджету на IP,
+  # на відміну від OpenAlex. 5 консервативно: 3 воркери × 5 = 15 зап/с.
   crossref:
     enabled: true
     rps: 5
   unpaywall:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 1
   semanticscholar:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 1
   arxiv:
-    enabled: true
-    interval_s: 3
+    enabled: false  # адаптер ще не реалізований
+    rps: 0.33
   doaj:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 1
   internet_archive:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 1
   core:
     enabled: false
   oai:
-    enabled: true
+    enabled: false  # OAI-сканер ще не реалізований
     per_host_interval_s: 2
 
 filters:
@@ -104,6 +120,21 @@ reverify:
   interval_days_stable: 90
   broken_retry_days: 3
 
+# Цілодобовий аудитор якості (strict-профіль, окремий воркер).
+#
+# focus_first_seen_after — відсічка для прицільної кампанії. Verifier
+# бере найстаріші недоперевірені документи, тож відсічка зупиняє обробку
+# беклогу. null → нейтральна відсічка 1970-01-01, звичайна поведінка.
+#
+# Було увімкнено 02.10.2026 на час кампанії «договір за участі
+# неповнолітньої особи», вимкнено того ж дня: селектор і так ставить
+# документи без вердикта першими (ORDER BY vr.checked_at IS NULL DESC),
+# тож starvation нові документи не загрожував, а натомість блокував
+# 18 уже зібраних тематичних правових робіт, які чекали повторної
+# перевірки з виправленим вердиктором.
+verifier:
+  focus_first_seen_after: null
+
 scanner:
   max_pages_per_source: 300
   max_depth: 2
@@ -112,8 +143,17 @@ scanner:
 retention:
   fetch_attempts_days: 90
   events_days: 180
-  backups_keep: 14
+  # backups_keep: 14
 
 logging:
   level: INFO
   file: "logs/harvester.log"
+
+# Порядок LLM-моделей. Ланцюг перебирає зверху вниз і бере першу, що
+# відповіла. gemma-4-26b-a4b-it — першою: за вимірами 26.09.2026 її
+# успішність 99.7% проти 74.9% у gemma-4-31b-it (деградація моделі на
+# боці Google). Поміняти місцями — і наступний рестарт підхопить.
+llm:
+  gemma_models:
+    - gemma-4-26b-a4b-it
+    - gemma-4-31b-it

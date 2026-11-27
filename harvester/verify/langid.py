@@ -16,13 +16,34 @@ class LanguageResult:
 
 async def detect_language(text: str) -> LanguageResult:
     if not text or len(text.strip()) < 20:
+        # Мовний фільтр не відпрацював, але документ НЕ відсікається як
+        # російський — тобто «unknown» тут означає неперевірений документ,
+        # а не «мова не визначена і все добре». Раніше це було повністю
+        # мовчки, тому збій визначення мов не можна було помітити.
+        logger.debug("language_detection_insufficient_text", chars=len(text or ""))
         return LanguageResult("unknown", 0.0, "insufficient_text")
 
     try:
         result = await asyncio.to_thread(_detect_language_sync, text)
+        if result.method in ("unknown", "error") or result.confidence < 0.5:
+            # Низька впевненість = фільтр не дає підстави відсікати;
+            # фіксуємо явно, бо інакше такі документи проходять невидимо.
+            logger.debug(
+                "language_detection_uncertain",
+                language=result.language,
+                confidence=result.confidence,
+                method=result.method,
+            )
         return result
     except Exception as e:
-        logger.error("language_detection_error", error=str(e))
+        # Тут критично: помилка визначення мови означає, що документ не
+        # перевірений на російську мову і пройде далі.
+        logger.error(
+            "language_detection_error",
+            error=str(e),
+            error_type=type(e).__name__,
+            impact="фільтр RU/СРСР не відпрацював, документ не відсіяно",
+        )
         return LanguageResult("unknown", 0.0, "error")
 
 
@@ -57,9 +78,7 @@ def _detect_language_sync(text: str) -> LanguageResult:
             lang_code = detected.iso_code_639_1.name.lower()
             confidence = 0.8
 
-            if lang_code == "uk":
-                confidence = 0.85
-            elif lang_code == "ru":
+            if lang_code == "uk" or lang_code == "ru":
                 confidence = 0.85
 
             return LanguageResult(lang_code, confidence, "lingua")
@@ -77,9 +96,7 @@ def _detect_language_sync(text: str) -> LanguageResult:
             lang_code = detected.split("-")[0].lower()
             confidence = 0.7
 
-            if lang_code == "uk":
-                confidence = 0.75
-            elif lang_code == "ru":
+            if lang_code == "uk" or lang_code == "ru":
                 confidence = 0.75
 
             return LanguageResult(lang_code, confidence, "langdetect")

@@ -123,6 +123,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_attempts INTEGER NOT NULL DEFAULT 5,
     run_after    TEXT NOT NULL,
     lease_expires_at TEXT,
+    lease_token  TEXT,
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
     UNIQUE(type, payload_hash)
@@ -141,8 +142,10 @@ CREATE TABLE IF NOT EXISTS search_queries (
     results_yield INTEGER NOT NULL DEFAULT 0,
     last_run_at   TEXT,
     cooldown_until TEXT,
+    priority      INTEGER NOT NULL DEFAULT 10,
     UNIQUE(text, engine, region)
 );
+CREATE INDEX IF NOT EXISTS idx_search_queries_priority ON search_queries(priority DESC, last_run_at);
 
 CREATE TABLE IF NOT EXISTS topics (
     id            SERIAL PRIMARY KEY,
@@ -222,3 +225,8 @@ CREATE INDEX IF NOT EXISTS idx_verifier_document ON verifier_results(document_id
 CREATE INDEX IF NOT EXISTS idx_verifier_status ON verifier_results(status);
 CREATE INDEX IF NOT EXISTS idx_verifier_next_check ON verifier_results(next_check_at) WHERE status='pass';
 CREATE INDEX IF NOT EXISTS idx_documents_verifier ON documents(verifier_checked_at) WHERE status='verified';
+
+-- 006: єдина таксономія дисциплін + цілодобовий присвоювач
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS discipline_checked_at TEXT;
+ALTER TABLE topics ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'topic';
+CREATE INDEX IF NOT EXISTS idx_documents_discipline ON documents(discipline_checked_at) WHERE status='verified';

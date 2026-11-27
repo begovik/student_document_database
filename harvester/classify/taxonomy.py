@@ -112,8 +112,16 @@ async def seed_topics(db: Database) -> int:
     return inserted
 
 
-async def load_topics(db: Database) -> list[dict]:
-    rows = await db.fetchall("SELECT * FROM topics")
+async def load_topics(db: Database, kind: str | None = "topic") -> list[dict]:
+    """Широкі теми (kind='topic') — для класифікатора/верифікатора.
+
+    Дисципліни (kind='discipline') не входять, щоб не роздувати LLM-списки.
+    Передайте kind=None щоб отримати всі рядки.
+    """
+    if kind:
+        rows = await db.fetchall("SELECT * FROM topics WHERE kind = ?", (kind,))
+    else:
+        rows = await db.fetchall("SELECT * FROM topics")
     topics = []
     for row in rows:
         d = dict(row)
@@ -122,3 +130,29 @@ async def load_topics(db: Database) -> list[dict]:
         d["keywords_en"] = json.loads(d["keywords_en"] or "[]")
         topics.append(d)
     return topics
+
+
+async def load_disciplines(db: Database) -> list[dict]:
+    """Усі topic-рядки, що відповідають дисциплінам каталогу.
+
+    Включає:
+    - нові рядки з kind='discipline' (коди dis_*);
+    - широкі теми, покриті дисциплінами (збіг назви або аліас каталогу) —
+      щоб присвоювання дисциплін використовувало вже наявні topic ids.
+    """
+    from harvester.discovery.querygen import DISCIPLINE_TOPIC_ALIASES, parse_discipline_catalog
+
+    catalog_names = {name.lower() for _, name in parse_discipline_catalog()}
+    aliased_topics = {name.lower() for name in DISCIPLINE_TOPIC_ALIASES}
+
+    rows = await db.fetchall("SELECT * FROM topics")
+    out: list[dict] = []
+    for row in rows:
+        d = dict(row)
+        name_low = (d.get("name_uk") or "").lower()
+        if d.get("kind") == "discipline" or name_low in catalog_names or name_low in aliased_topics:
+            d["udc_prefixes"] = json.loads(d["udc_prefixes"] or "[]")
+            d["keywords_uk"] = json.loads(d["keywords_uk"] or "[]")
+            d["keywords_en"] = json.loads(d["keywords_en"] or "[]")
+            out.append(d)
+    return out

@@ -9,7 +9,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+
+import structlog
+
+logger = structlog.get_logger()
 
 
 @dataclass
@@ -65,12 +68,12 @@ def _parse_pdf(pdf_path: Path) -> dict:
         for page in doc:
             total_text += page.get_text()
             img_count += len(page.get_images())
-        
+
+        meta = doc.metadata or {}
         doc.close()
         
         has_text_layer = len(total_text.strip()) > 100
-        
-        meta = doc.metadata or {}
+
         producer = meta.get("producer", "")
         title = meta.get("title", "")
         author = meta.get("author", "")
@@ -89,6 +92,13 @@ def _parse_pdf(pdf_path: Path) -> dict:
             "subject_from_meta": subject or "",
         }
     except Exception as e:
+        # Аналіз не виконано, але повертається dict, який виглядає як
+        # результат. Без логу не видно, скільки PDF не проаналізовано.
+        logger.warning(
+            "pdf_quality_analysis_failed",
+            error=str(e)[:200],
+            error_type=type(e).__name__,
+        )
         return {"error": str(e)}
 
 
@@ -577,8 +587,7 @@ def get_document_priority(quality: PDFQualityResult) -> tuple[int, str]:
     )
     if is_relevant:
         base += 30
-        if base > 1000:
-            base = 1000
+        base = min(base, 1000)
     
     # Визначення причини
     if base >= 700:
@@ -646,6 +655,12 @@ def analyze_catalog(catalog_dir: Path) -> list[dict]:
             report = analyze_and_report(pdf_file)
             results.append(report)
         except Exception as e:
+            logger.warning(
+                "pdf_quality_catalog_item_failed",
+                file=pdf_file.name,
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+            )
             results.append({
                 "file": pdf_file.name,
                 "decision": "ERROR",
@@ -656,13 +671,14 @@ def analyze_catalog(catalog_dir: Path) -> list[dict]:
 
 
 def main():
-    import sys
     import json
+    import sys
     
     if len(sys.argv) > 1:
         pdf_dir = Path(sys.argv[1])
     else:
-        pdf_dir = Path("/opt/harvester/catalogs/catalog_20260827_142217/resources")
+        print("Вкажіть шлях до каталогу з legacy-PDF: python -m harvester.extract.pdf_quality PATH")
+        return
     
     print(f"\n{'='*80}")
     print(f"📊 АНАЛІЗ PDF ЯКОСТІ — Каталог: {pdf_dir}")
@@ -683,7 +699,7 @@ def main():
     reject = sum(1 for r in results if r.get("decision") == "REJECT")
     error = sum(1 for r in results if r.get("decision") == "ERROR")
     
-    print(f"\n📋 ПІДСУМОК")
+    print("\n📋 ПІДСУМОК")
     print(f"{'='*40}")
     print(f"Всього документів: {len(results)}")
     print(f"  ✅ Прийняти (ACCEPT): {accept}")
@@ -710,10 +726,10 @@ def main():
         decision_display = {"ACCEPT": "✅✅", "REVIEW": "⚠️⚡", "REJECT": "❌❌", "ERROR": "💥💥"}.get(decision, "?")
         ql_display = {"excellent": "ВИСОКА", "good": "ДОБРА", "acceptable": "НОРМ", "poor": "ПОГАНА", "reject": "ВІДК", "error": "ПОМИЛКА"}.get(ql, "❓")
         
-        print(f"{priority:>5} {decision_display:^12} {str(pages):>5} {str(cps):>10} {ql_display:^10} {str(dt):^20} {title}")
+        print(f"{priority:>5} {decision_display:^12} {pages!s:>5} {cps!s:>10} {ql_display:^10} {dt!s:^20} {title}")
     
     print(f"\n{'='*80}")
-    print(f"📋 ПІДРОЗУМОКИ")
+    print("📋 ПІДРОЗУМОКИ")
     print(f"{'='*80}")
     
     # Відкинуті

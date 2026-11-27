@@ -1,6 +1,5 @@
 import asyncio
 import time
-from collections import defaultdict
 
 import structlog
 
@@ -16,18 +15,18 @@ class TokenBucket:
         self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            elapsed = now - self.last_refill
-            self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
-            self.last_refill = now
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = now - self.last_refill
+                self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+                self.last_refill = now
 
-            if self.tokens < 1:
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
                 wait_time = (1 - self.tokens) / self.rate
-                await asyncio.sleep(wait_time)
-                self.tokens = 0
-            else:
-                self.tokens -= 1
+            await asyncio.sleep(wait_time)
 
 
 class HostRateLimiter:
@@ -70,15 +69,27 @@ class BandwidthLimiter:
         self._lock = asyncio.Lock()
 
     async def wait_for_bytes(self, byte_count: int) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            elapsed = now - self._last_refill
-            self._tokens = min(self.max_bps, self._tokens + elapsed * self.max_bps)
-            self._last_refill = now
+        if byte_count <= 0:
+            return
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                self._tokens = min(self.max_bps, self._tokens + elapsed * self.max_bps)
+                self._last_refill = now
 
-            if self._tokens < byte_count:
-                wait_time = (byte_count - self._tokens) / self.max_bps
-                await asyncio.sleep(wait_time)
-                self._tokens = 0
-            else:
-                self._tokens -= byte_count
+                if self._tokens >= byte_count:
+                    self._tokens -= byte_count
+                    return
+                # Один HTTP chunk може бути більшим за bucket capacity.
+                if byte_count > self.max_bps:
+                    wait_time = max(0.0, (byte_count - self._tokens) / self.max_bps)
+                    self._tokens = 0
+                    self._last_refill = now + wait_time
+                    consume_entire_chunk = True
+                else:
+                    wait_time = (byte_count - self._tokens) / self.max_bps
+                    consume_entire_chunk = False
+            await asyncio.sleep(wait_time)
+            if consume_entire_chunk:
+                return

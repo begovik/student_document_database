@@ -8,9 +8,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import structlog
 
@@ -36,11 +39,14 @@ logger = structlog.get_logger()
 PG_SCHEMA_PATH = Path(__file__).parent / "pg_schema.sql"
 PG_MIGRATIONS_DIR = Path(__file__).parent / "pg_migrations"
 
+# Поріг, з якого запит вважається повільним і потребує уваги (мс).
+SLOW_QUERY_MS = 2000
+
 
 class PGResult:
     """Адаптер результату execute для сумісності з sqlite3.Cursor."""
 
-    __slots__ = ("rows", "rowcount", "lastrowid")
+    __slots__ = ("lastrowid", "rowcount", "rows")
 
     def __init__(self, rows: list | None = None, rowcount: int = 0):
         self.rows = rows if rows is not None else []
@@ -56,7 +62,9 @@ class PostgresDatabase(Database):
         self.cfg = cfg
         self._password = password if password is not None else get_settings().pg_password
         self._pool: Pool | None = None
-        self._tx_conn: Any | None = None
+        self._tx_conn_var: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+            "postgres_transaction_connection", default=None
+        )
         self._is_initialized = False
         self.db_path = f"postgresql://{self.cfg.user}@{self.cfg.host}:{self.cfg.port}/{self.cfg.name}"
 
@@ -83,24 +91,30 @@ class PostgresDatabase(Database):
     def _dsn(self) -> str:
         if self.cfg.dsn:
             return self.cfg.dsn
-        user = self.cfg.user or get_settings().pg_user or "postgres"
+        # `DatabaseConfig.user` має історичний default, тому спочатку беремо
+        # явне значення з env (`PG_USER`), інакше env ніколи не застосовується.
+        user = get_settings().pg_user or self.cfg.user or "postgres"
         host = self.cfg.host
         port = self.cfg.port
         name = self.cfg.name
+        user_q = quote(user, safe="")
+        name_q = quote(name, safe="")
         if self._password:
-            return f"postgresql://{user}:{self._password}@{host}:{port}/{name}"
-        return f"postgresql://{user}@{host}:{port}/{name}"
+            password_q = quote(self._password, safe="")
+            return f"postgresql://{user_q}:{password_q}@{host}:{port}/{name_q}"
+        return f"postgresql://{user_q}@{host}:{port}/{name_q}"
 
     async def try_connect(self, timeout_s: float | None = None) -> bool:
         """Швидкий перевірковий `SELECT 1` одним з'єднанням."""
         self._check_asyncpg()
         if not self.cfg.remote_configured:
             return False
+        timeout = timeout_s if timeout_s is not None else self.cfg.connect_timeout_s
         conn = None
         try:
             conn = await asyncio.wait_for(
-                asyncpg.connect(self._dsn(), timeout=self.cfg.connect_timeout_s),
-                timeout=timeout_s or self.cfg.connect_timeout_s + 1,
+                asyncpg.connect(self._dsn(), timeout=timeout),
+                timeout=timeout + 1,
             )
             await asyncio.wait_for(conn.fetchval("SELECT 1"), timeout=5)
             return True
@@ -111,8 +125,14 @@ class PostgresDatabase(Database):
             if conn is not None:
                 try:
                     await conn.close()
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # Проба не вдалася — закриття теж. Витік з'єднання
+                    # накопичується при кожній невдалій пробі restore-циклу.
+                    logger.warning(
+                        "pg_probe_close_failed",
+                        error=str(e)[:150],
+                        error_type=type(e).__name__,
+                    )
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -151,6 +171,16 @@ class PostgresDatabase(Database):
                 try:
                     version = int(mf.stem.split("_")[0])
                 except (ValueError, IndexError):
+                    # Міграція з некоректною назвою буде пропущена
+                    # НАЗАВЖДИ, без зміни схеми й без помилки. Найнебезпечніша
+                    # мовчазна втрата: схема й код розходять, симптом —
+                    # незрозумілі помилки колонок у роботі.
+                    logger.error(
+                        "pg_migration_bad_filename",
+                        file=mf.name,
+                        expected="<version>_<name>.sql",
+                        impact="міграція буде пропущена",
+                    )
                     continue
                 if version > current:
                     sql = mf.read_text(encoding="utf-8")
@@ -163,17 +193,54 @@ class PostgresDatabase(Database):
                     logger.info("pg_migration_applied", file=mf.name, version=version)
 
     async def probe(self, timeout_s: float | None = None) -> bool:
+        """Перевірити живість пулу. Помилка НЕ мовчить: health-check, який
+        повертає False без причини, не відрізняє недоступність БД від
+        таймауту пулу."""
         if self._pool is None:
+            logger.warning("pg_probe_no_pool")
             return False
+        started = time.monotonic()
         try:
             async with self._pool.acquire() as conn:
                 await asyncio.wait_for(conn.fetchval("SELECT 1"), timeout=timeout_s or 5)
             return True
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "pg_probe_failed",
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+                timeout_s=timeout_s or 5,
+            )
             return False
+        finally:
+            waited = round((time.monotonic() - started) * 1000)
+            if waited > 1000:
+                # Повільний пул означає, що зʼєднання вичерпуються або
+                # запити конкурують за них — це видно лише за часом.
+                logger.warning("pg_probe_slow", duration_ms=waited)
 
     def _conn_or_pool(self):
-        return self._tx_conn if self._tx_conn is not None else self._pool
+        return self._tx_conn_var.get() or self._pool
+
+    async def _timed(self, sql: str, op_name: str, coro):
+        """Виконати запит із фіксацією повільних викликів.
+
+        `command_timeout=60` обриває запит, але без логування не видно,
+        *які* саме запити регулярно впираються в час — зазвичай це
+        неіндексовані вибірки селектора verifier-а чи дзеркала.
+        """
+        started = time.monotonic()
+        try:
+            return await coro
+        finally:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            if duration_ms >= SLOW_QUERY_MS:
+                logger.warning(
+                    "pg_slow_query",
+                    op=op_name,
+                    duration_ms=duration_ms,
+                    sql=sql[:200].replace("\n", " "),
+                )
 
     async def execute(self, sql: str, params: tuple | None = None) -> PGResult:
         if self._pool is None:
@@ -183,23 +250,25 @@ class PostgresDatabase(Database):
         target = self._conn_or_pool()
 
         if mode == "rows":
-            rows = await target.fetch(pg_sql, *params)
+            rows = await self._timed(pg_sql, "fetch", target.fetch(pg_sql, *params))
             return PGResult(rows=rows)
-        status = await target.execute(pg_sql, *params)
+        status = await self._timed(pg_sql, "execute", target.execute(pg_sql, *params))
         return PGResult(rowcount=crowcount_from_status(status))
 
     async def executemany(self, sql: str, params: list[tuple]) -> None:
         if self._pool is None:
             raise RuntimeError("PostgresDatabase не ініціалізовано")
         pg_sql = prepare_many(sql)
-        await self._pool.executemany(pg_sql, [self._sanitize_params(p) for p in params])
+        target = self._conn_or_pool()
+        await target.executemany(pg_sql, [self._sanitize_params(p) for p in params])
 
     async def executescript(self, sql: str) -> None:
         if self._pool is None:
             raise RuntimeError("PostgresDatabase не ініціалізовано")
         self._check_asyncpg()
+        target = self._conn_or_pool()
         for stmt in split_statements(sql):
-            await self._pool.execute(translate_sql(stmt))
+            await target.execute(translate_sql(stmt))
 
     async def fetchone(self, sql: str, params: tuple | None = None):
         if self._pool is None:
@@ -207,7 +276,7 @@ class PostgresDatabase(Database):
         pg_sql, _ = prepare(sql)
         params = self._sanitize_params(params) or []
         target = self._conn_or_pool()
-        return await target.fetchrow(pg_sql, *params)
+        return await self._timed(pg_sql, "fetchone", target.fetchrow(pg_sql, *params))
 
     async def fetchall(self, sql: str, params: tuple | None = None) -> list[Any]:
         if self._pool is None:
@@ -215,7 +284,7 @@ class PostgresDatabase(Database):
         pg_sql, _ = prepare(sql)
         params = self._sanitize_params(params) or []
         target = self._conn_or_pool()
-        return await target.fetch(pg_sql, *params)
+        return await self._timed(pg_sql, "fetchall", target.fetch(pg_sql, *params))
 
     async def insert(self, sql: str, params: tuple | None = None) -> int | None:
         result = await self.execute(sql, params)
@@ -233,9 +302,12 @@ class PostgresDatabase(Database):
     async def transaction(self):
         if self._pool is None:
             raise RuntimeError("PostgresDatabase не ініціалізовано")
+        existing = self._tx_conn_var.get()
+        if existing is not None:
+            yield existing
+            return
         conn = await self._pool.acquire()
-        prev = self._tx_conn
-        self._tx_conn = conn
+        token = self._tx_conn_var.set(conn)
         try:
             tr = conn.transaction()
             await tr.start()
@@ -246,7 +318,7 @@ class PostgresDatabase(Database):
                 raise
             await tr.commit()
         finally:
-            self._tx_conn = prev
+            self._tx_conn_var.reset(token)
             await self._pool.release(conn)
 
     async def _version(self) -> int:
@@ -257,7 +329,14 @@ class PostgresDatabase(Database):
                 "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
             )
             return int(v) if v is not None else 0
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            # Помилка тут нешкідлива для запису, але критична для міграцій:
+            # version=0 змусить apply_schema накласти початкову схему ще раз.
+            logger.error(
+                "pg_version_read_failed",
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+            )
             return 0
 
     async def close(self) -> None:

@@ -24,6 +24,7 @@ class PDFParseResult:
     metadata: PDFMetadata
     text: str
     has_text_layer: bool
+    text_sample: str = ""
     is_encrypted: bool = False
     is_corrupt: bool = False
     error: str | None = None
@@ -85,13 +86,16 @@ def _parse_pdf_sync(file_path: Path, max_pages: int) -> PDFParseResult:
             modification_date=metadata_dict.get("modDate"),
         )
 
-        text_parts = []
+        text_parts: list[str] = []
+        sample_parts: list[str] = []
         pages_to_read = min(page_count, max_pages)
         for page_num in range(pages_to_read):
             page = doc[page_num]
             text = page.get_text()
             if text:
                 text_parts.append(text)
+                if page_num < 3:
+                    sample_parts.append(text)
 
         doc.close()
 
@@ -102,6 +106,7 @@ def _parse_pdf_sync(file_path: Path, max_pages: int) -> PDFParseResult:
             page_count=page_count,
             metadata=metadata,
             text=full_text,
+            text_sample="\n".join(sample_parts),
             has_text_layer=has_text_layer,
         )
 
@@ -325,10 +330,7 @@ def extract_title_from_text(text: str) -> str | None:
                 break
             continue
 
-        if is_mostly_upper:
-            found_start = True
-            title_lines.append(stripped)
-        elif is_title_case and not found_start:
+        if is_mostly_upper or is_title_case and not found_start:
             found_start = True
             title_lines.append(stripped)
         elif found_start:
@@ -365,4 +367,15 @@ def extract_udc_from_text(text: str) -> str | None:
     if match:
         return match.group(1).strip()
 
+    return None
+
+
+def extract_year_from_text(text: str) -> int | None:
+    """Витягнути перший правдоподібний рік видання з тексту PDF."""
+    import re
+
+    for match in re.finditer(r"(?<!\d)(1[5-9]\d{2}|20\d{2}|21\d{2})(?!\d)", text or ""):
+        year = int(match.group(1))
+        if 1500 <= year <= 2100:
+            return year
     return None

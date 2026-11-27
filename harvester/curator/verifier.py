@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 import json
-import asyncio
 import os
 import tempfile
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import structlog
 
-from harvester.config import get_settings, get_filter_rules, FilterRules
-from harvester.db.failover import build_database
+from harvester.config import FilterRules, get_filter_rules, get_settings
+from harvester.classify.llm import log_raw_response
 from harvester.curator.availability import check_availability
+from harvester.db.failover import build_database
 
 logger = structlog.get_logger()
+
+CATALOG_FILE_MODE = 0o644
 
 
 async def find_replacement_candidates(
@@ -31,17 +33,21 @@ async def find_replacement_candidates(
         rules = get_filter_rules()
     
     min_page_count = rules.min_page_count
-    from harvester.db.repositories import DocumentsRepository
-
     topic_ids = []
     for t in original_doc.get("topics", []):
-        topic_ids.append(t.get("topic_id"))
+        topic_id = t.get("topic_id")
+        if topic_id is not None:
+            topic_ids.append(topic_id)
 
     # Створити умову NOT IN з плейсхолдерами
     not_in_placeholders = ",".join("?" * len(selected_ids))
-    not_in_condition = f"d.id NOT IN ({not_in_placeholders})"
+    not_in_condition = (
+        f"d.id NOT IN ({not_in_placeholders})" if selected_ids else "1=1"
+    )
 
-    topic_in_condition = "1=0"
+    # Якщо документ не має topic-зв'язків, заміни все одно можна шукати
+    # серед усіх якісних verified-документів.
+    topic_in_condition = "1=1"
     if topic_ids:
         topic_in_placeholders = ",".join("?" * len(topic_ids))
         topic_in_condition = f"dt.topic_id IN ({topic_in_placeholders})"
@@ -55,19 +61,27 @@ async def find_replacement_candidates(
         f"""
         SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
                d.canonical_url, d.language, d.udc, d.page_count,
-               d.has_text_layer, d.size_bytes, d.sha256, d.status,
+               d.has_text_layer, d.size_bytes, d.sha256, d.status, d.extra,
+               d.text_sample, d.verifier_status, d.verifier_checked_at,
+               vr.status AS verifier_result_status,
+               vr.llm_status AS llm_status,
                dt.score as topic_score,
                t.id as topic_id, t.name_uk as topic_name
         FROM documents d
         LEFT JOIN document_topics dt ON dt.document_id = d.id
         LEFT JOIN topics t ON t.id = dt.topic_id
+        LEFT JOIN verifier_results vr ON vr.document_id = d.id AND vr.profile = 'strict'
         WHERE d.status = 'verified'
+          AND d.verifier_status = 'pass'
+          AND vr.status = 'pass'
+          AND vr.llm_status = 'pass'
           AND d.title IS NOT NULL AND d.title != ''
           AND d.authors IS NOT NULL
           AND d.language IS NOT NULL
+          AND LOWER(d.language) NOT IN ('', 'unknown', 'und')
           AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
           AND d.page_count >= {min_page_count}
-          AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
+          AND d.has_text_layer = 1
           AND ({not_in_condition})
           AND ({topic_in_condition})
           AND (d.extra IS NULL OR d.extra NOT LIKE '%"curator"%')
@@ -82,7 +96,7 @@ async def find_replacement_candidates(
         candidates.append({
             "id": row["id"],
             "title": row["title"],
-            "authors": json.loads(row["authors"]) if row["authors"] else [],
+            "authors": _parse_authors(row["authors"]),
             "year": row["year"],
             "publisher": row["publisher"],
             "doc_type": row["doc_type"],
@@ -96,9 +110,33 @@ async def find_replacement_candidates(
             "has_text_layer": row["has_text_layer"],
             "size_bytes": row["size_bytes"],
             "sha256": row["sha256"],
+            "status": row["status"],
+            "extra": row["extra"],
+            "text_sample": row["text_sample"],
+            "verifier_status": row["verifier_status"],
+            "verifier_checked_at": row["verifier_checked_at"],
+            "verifier_result_status": row["verifier_result_status"],
+            "llm_status": row["llm_status"],
         })
 
     return candidates
+
+
+def _parse_authors(value: Any) -> list[str]:
+    """Безпечно нормалізувати authors із JSON та старих рядкових записів."""
+    if isinstance(value, list):
+        return [str(author).strip() for author in value if str(author).strip()]
+    if not value:
+        return []
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return [value.strip()] if value.strip() else []
+        if isinstance(parsed, list):
+            return [str(author).strip() for author in parsed if str(author).strip()]
+        return [value.strip()] if value.strip() else []
+    return [str(value).strip()]
 
 
 async def call_llm_for_fix(
@@ -110,13 +148,6 @@ async def call_llm_for_fix(
     settings = get_settings()
     if not settings.llm.enabled:
         return None
-
-    import aiohttp
-    import re
-
-    config = settings.llm
-    gemini_keys = [k for k in [settings.gemini_api_key, settings.gemini_api_key_2, settings.gemini_api_key_3] if k]
-    models = config.gemini_models or ["gemini-3.1-flash-lite"]
 
     prompt = f"""Ти — куратор наукової бібліотеки. Документ у каталозі має помилку — виріши, що робити.
 
@@ -142,73 +173,60 @@ async def call_llm_for_fix(
 {"action": "replace|retry|skip", "replacement_id": null, "reasoning": "коротка причина"}
 """
 
-    last_error = None
-    # Фаза 1: Gemini
-    for model in models:
-        for gemini_key in gemini_keys:
+    try:
+        from harvester.classify.llm import LLMClient, LLMUnavailable
+
+        client = LLMClient(keys=settings.gemini_keys, service="CuratorVerify")
+        response = await client.complete(prompt)
+        text = response.text.strip()
+        decoder = json.JSONDecoder()
+        result = None
+        for index, char in enumerate(text):
+            if char != "{":
+                continue
             try:
-                async with aiohttp.ClientSession() as client:
-                    url = f"{config.gemini_base_url}/models/{model}:generateContent?key={gemini_key}"
-                    payload = {
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {
-                            "temperature": config.temperature,
-                            "maxOutputTokens": config.max_tokens,
-                        },
-                    }
-                    resp = await client.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=config.timeout_s))
-                    if resp.status != 200:
-                        raise RuntimeError(f"Gemini error {resp.status}")
+                candidate, _ = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict) and "action" in candidate:
+                result = candidate
+                break
+        if not isinstance(result, dict):
+            # Без сирої відповіді не видно, чи модель повернула текст замість
+            # JSON, чи вивід обрізало, чи це was thinking-бюджет.
+            log_raw_response(logger, "llm_fix_no_action_json", response)
+            return None
 
-                    data = await resp.json()
-                    text = ""
-                    for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-                        text += part.get("text", "")
-
-                    match = re.search(r'\{[^}]*"action"[^}]*\}', text)
-                    if match:
-                        return json.loads(match.group())
-                    break
-            except Exception as e:
-                last_error = e
-                await asyncio.sleep(config.min_interval_s)
-
-    # Фаза 2: Gemma (ті самі ключі, gemma_models + стиснення)
-    from harvester.classify.llm import rephrase_for_gemma
-
-    gemma_models = config.gemma_models or ["gemma-4-31b-it", "gemma-4-26b-it"]
-    truncated_prompt = rephrase_for_gemma(prompt, config.gemma_max_chars)
-
-    for model in gemma_models:
-        for gemini_key in gemini_keys:
+        action = str(result.get("action") or "skip").strip().lower()
+        if action not in {"replace", "retry", "skip"}:
+            logger.info("llm_fix_unknown_action", raw_action=action[:60], response=response.model)
+            action = "skip"
+        replacement_id = result.get("replacement_id")
+        if isinstance(replacement_id, bool):
+            replacement_id = None
+        else:
             try:
-                async with aiohttp.ClientSession() as client:
-                    url = f"{config.gemini_base_url}/models/{model}:generateContent?key={gemini_key}"
-                    payload = {
-                        "contents": [{"parts": [{"text": truncated_prompt}]}],
-                        "generationConfig": {
-                            "temperature": config.temperature,
-                            "maxOutputTokens": config.max_tokens,
-                        },
-                    }
-                    resp = await client.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=config.timeout_s))
-                    if resp.status != 200:
-                        raise RuntimeError(f"Gemma error {resp.status}")
-
-                    data = await resp.json()
-                    text = ""
-                    for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-                        text += part.get("text", "")
-
-                    match = re.search(r'\{[^}]*"action"[^}]*\}', text)
-                    if match:
-                        return json.loads(match.group())
-                    break
-            except Exception as e:
-                last_error = e
-                await asyncio.sleep(config.min_interval_s)
-
-    logger.warning("llm_fix_failed", error=str(last_error)[:100] if last_error else "unknown")
+                replacement_id = int(replacement_id) if replacement_id is not None else None
+            except (TypeError, ValueError):
+                # Модель повернула не число: раніше це тихо перетворювалося
+                # на None і документ просто лишався без заміни.
+                logger.info(
+                    "llm_fix_invalid_replacement_id",
+                    value=repr(replacement_id)[:60],
+                    response=response.model,
+                )
+                replacement_id = None
+        return {
+            "action": action,
+            "replacement_id": replacement_id,
+            "reasoning": str(result.get("reasoning") or "").strip(),
+        }
+    except LLMUnavailable as e:
+        logger.warning("llm_fix_unavailable", error=str(e)[:200])
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning("llm_fix_invalid_json", error=str(e)[:200], error_type=type(e).__name__)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("llm_fix_failed", error=str(e)[:200], error_type=type(e).__name__)
     return None
 
 
@@ -221,10 +239,83 @@ async def save_catalog_atomically(path: str, data: dict[str, Any]) -> None:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
         os.replace(tmp_path, path)
+        os.chmod(path, CATALOG_FILE_MODE)
     except BaseException:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
+
+
+def _has_catalog_extraction_data(doc: dict[str, Any]) -> bool:
+    quotations = doc.get("quotations")
+    if isinstance(quotations, list):
+        has_quotes = any(
+            isinstance(quotation, dict) and str(quotation.get("text", "")).strip()
+            for quotation in quotations
+        )
+    else:
+        has_quotes = False
+
+    summary = doc.get("summary")
+    has_summary = False
+    if isinstance(summary, dict):
+        sections = summary.get("sections")
+        if isinstance(sections, list):
+            for section in sections:
+                if not isinstance(section, dict):
+                    continue
+                title = str(section.get("title", "")).strip()
+                overview = str(section.get("overview", "")).strip()
+                methodology = str(section.get("methodology", "")).strip()
+                findings = str(section.get("findings", "")).strip()
+                conclusions = str(section.get("conclusions", "")).strip()
+                key_ideas = section.get("key_ideas", [])
+                has_ideas = isinstance(key_ideas, list) and any(str(idea).strip() for idea in key_ideas)
+                if any(
+                    value and value not in {"н/зв", "Розділ", "Загальна сумаризація"}
+                    for value in (title, overview, methodology, findings, conclusions)
+                ) or has_ideas:
+                    has_summary = True
+                    break
+
+    return has_quotes or has_summary
+
+
+def _catalog_validation_error(doc: dict[str, Any]) -> str | None:
+    error = doc.get("error")
+    if error:
+        return str(error)
+    if not _has_catalog_extraction_data(doc):
+        return "відсутні quotations і summary"
+    return None
+
+
+async def _load_extraction_fields(db, document_id: int) -> dict[str, Any]:
+    """Прочитати збережену extraction (quotes/summary) документа з БД."""
+    row = await db.fetchone(
+        "SELECT quotations, summary FROM extractions WHERE document_id = ?",
+        (document_id,),
+    )
+    if not row:
+        return {}
+    fields: dict[str, Any] = {}
+    quotations = row["quotations"]
+    if quotations:
+        try:
+            parsed = json.loads(quotations)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, list):
+            fields["quotations"] = parsed
+    summary = row["summary"]
+    if summary:
+        try:
+            parsed_summary = json.loads(summary)
+        except (json.JSONDecodeError, TypeError):
+            parsed_summary = None
+        if isinstance(parsed_summary, dict):
+            fields["summary"] = parsed_summary
+    return fields
 
 
 async def mark_unavailable_in_db(db, doc_id: int, reason: str, replacement_id: int | None = None, catalog_name: str | None = None):
@@ -319,7 +410,14 @@ async def verify_catalog(
 
     settings = get_settings()
     db = build_database(settings)
-    await db.initialize(sync_mirror=False)
+    try:
+        await db.initialize(sync_mirror=False)
+    except Exception as e:  # noqa: BLE001
+        # Раніше падіння ініціалізації БД проходило як трасировка у
+        # stderr без повідомлення в журналі подій — не було видно, чи
+        # вдалося відкрити каталог узагалі.
+        logger.exception("curator_verify_db_init_failed", error=str(e)[:200])
+        return None
 
     try:
         documents = catalog.get("documents", [])
@@ -327,8 +425,17 @@ async def verify_catalog(
             logger.info("catalog_empty", path=catalog_path)
             return None
 
-        # Знайти документи з помилками
-        error_docs = [(i, d) for i, d in enumerate(documents) if d.get("error")]
+        # Знайти документи з помилками або порожнім витягом
+        changed = False
+        error_docs = []
+        for i, d in enumerate(documents):
+            original_error = d.get("error")
+            validation_error = _catalog_validation_error(d)
+            if validation_error:
+                if not original_error:
+                    d["error"] = validation_error
+                    changed = True
+                error_docs.append((i, d, validation_error, not original_error))
 
         if not error_docs:
             logger.info("catalog_no_errors", path=catalog_path, total=len(documents))
@@ -343,10 +450,15 @@ async def verify_catalog(
         retried = 0
         errors = 0
 
-        for idx, (orig_idx, doc) in enumerate(error_docs):
+        for idx, (orig_idx, doc, error, validation_only) in enumerate(error_docs):
             doc_id = doc.get("id")
-            error = doc.get("error", "")
             logger.info("processing_error", index=idx + 1, total=len(error_docs), doc_id=doc_id, error=error[:100])
+
+            if validation_only:
+                skipped += 1
+                errors += 1
+                logger.warning("catalog_validation_error", doc_id=doc_id, error=error)
+                continue
 
             doc_for_lookup = {
                 "id": doc_id,
@@ -375,8 +487,30 @@ async def verify_catalog(
                 replacement = next((c for c in candidates if c["id"] == replacement_id), None)
                 if replacement:
                     # Перевірити доступність заміни
-                    avail, _ = await check_availability(replacement["canonical_url"])
+                    avail, avail_reason = await check_availability(
+                        replacement["canonical_url"]
+                    )
+                    if not avail:
+                        # Причину відкидання заміни раніше викидали (`_`),
+                        # тому в журналі лишалося лише «replacement_unavailable».
+                        logger.info(
+                            "replacement_not_available",
+                            doc_id=doc_id,
+                            replacement_id=replacement_id,
+                            reason=avail_reason,
+                        )
                     if avail:
+                        # Заміна без extraction-даних не є якісним джерелом:
+                        # вона одразу провалить catalog validation.
+                        extraction = await _load_extraction_fields(db, replacement["id"])
+                        if not _has_catalog_extraction_data(extraction):
+                            logger.warning(
+                                "replacement_without_extraction",
+                                doc_id=replacement_id,
+                            )
+                            skipped += 1
+                            errors += 1
+                            continue
                         # Замінити в каталозі
                         new_doc = {
                             "id": replacement["id"],
@@ -392,10 +526,14 @@ async def verify_catalog(
                             "size_bytes": replacement["size_bytes"],
                             "sha256": replacement["sha256"],
                             "has_text_layer": replacement["has_text_layer"],
+                            "verifier_status": replacement.get("verifier_status"),
+                            "verifier_checked_at": replacement.get("verifier_checked_at"),
                             "topics": [{"topic_id": replacement["topic_id"], "topic_name": replacement["topic_name"], "score": replacement["topic_score"]}] if replacement.get("topic_id") else doc.get("topics", []),
+                            **extraction,
                         }
 
                         documents[orig_idx] = new_doc
+                        changed = True
                         global_selected_ids.add(replacement["id"])
                         global_selected_ids.discard(doc_id)
 
@@ -444,7 +582,10 @@ async def verify_catalog(
         else:
             # Файловий формат: catalog.json -> catalog_fixed.json
             new_path = catalog_path.replace(".json", "_fixed.json")
-        await save_catalog_atomically(new_path, catalog)
+        if changed or fixed or replaced or skipped or retried or errors:
+            await save_catalog_atomically(new_path, catalog)
+        else:
+            new_path = catalog_json_path
 
         logger.info("curator_verify_complete", path=new_path, fixed=fixed, replaced=replaced, skipped=skipped, errors=errors)
         return VerifyResult(

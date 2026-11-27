@@ -5,25 +5,49 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
+import re
 import tempfile
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-import httpx
 import structlog
 
-from harvester.config import get_settings, get_filter_rules, FilterRules
-from harvester.db.failover import build_database
-from harvester.db.repositories import DocumentsRepository, TopicsRepository
+from harvester.config import FilterRules, get_filter_rules, get_settings
 from harvester.curator.availability import check_availability
 from harvester.curator.selector import SelectionResult, call_llm_for_selection
+from harvester.db.failover import build_database
+from harvester.db.repositories import DocumentsRepository, TopicsRepository
 
 logger = structlog.get_logger()
 
+CATALOG_DIR_MODE = 0o755
+CATALOG_FILE_MODE = 0o644
+
+
+def _parse_authors(value: Any) -> list[str]:
+    """Нормалізувати JSON/рядкове поле authors без падіння на старих записах."""
+    if isinstance(value, list):
+        return [str(author).strip() for author in value if str(author).strip()]
+    if not value:
+        return []
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return [value.strip()] if value.strip() else []
+        if isinstance(parsed, list):
+            return [str(author).strip() for author in parsed if str(author).strip()]
+        return [value.strip()] if value.strip() else []
+    return [str(value).strip()]
+
 # Мінімальні вимоги до документа для відбору
 REQUIRED_STATUS = "verified"
+REQUIRED_VERIFIER_STATUS = "pass"
+# Strict-pass має підтверджений LLM-вердикт. Запис, де llm_status='error',
+# не є доказом якості: до 2026-09-25 fail-open логіка записувала такі
+# документи як pass (135 658 з 137 252 у production). Curator не має
+# випускати їх у каталог.
+REQUIRED_LLM_STATUS = "pass"
 REQUIRED_FIELDS = {
     "title": "Назва має бути непорожньою",
     "authors": "Автори мають бути задані",
@@ -34,17 +58,25 @@ REQUIRED_FIELDS = {
 }
 
 
-def is_document_complete(doc: dict[str, Any], rules: FilterRules | None = None) -> tuple[bool, str | None]:
-    """Перевірити, чи документ має повний набір даних і є повноцінним цілісним джерелом."""
+def is_document_complete(
+    doc: dict[str, Any],
+    rules: FilterRules | None = None,
+    require_strict_pass: bool = False,
+) -> tuple[bool, str | None]:
+    """Перевірити повноту документа та, за потреби, strict-верифікацію.
+
+    ``require_strict_pass`` використовується curator-ом. Звичайний verifier
+    викликає цю функцію до LLM, тому сам verifier-status тут не потрібен.
+    """
     import re
-    
+
     if rules is None:
         rules = get_filter_rules()
-    
+
     min_page_count = rules.min_page_count
     min_chars_per_page = rules.min_chars_per_page
-    
-    REQUIRED_FIELDS = {
+
+    required_fields = {
         "title": "Назва має бути непорожньою",
         "authors": "Автори мають бути задані",
         "language": "Мова має бути визначена",
@@ -55,21 +87,49 @@ def is_document_complete(doc: dict[str, Any], rules: FilterRules | None = None) 
     if doc.get("status") != REQUIRED_STATUS:
         return False, f"status={doc.get('status')} (потрібно {REQUIRED_STATUS})"
 
-    for field, reason in REQUIRED_FIELDS.items():
+    if require_strict_pass:
+        if doc.get("verifier_status") != REQUIRED_VERIFIER_STATUS:
+            return False, (
+                f"strict verifier_status={doc.get('verifier_status')} "
+                f"(потрібно {REQUIRED_VERIFIER_STATUS})"
+            )
+        if doc.get("verifier_result_status") != REQUIRED_VERIFIER_STATUS:
+            return False, (
+                f"strict verifier_results.status={doc.get('verifier_result_status')} "
+                f"(потрібно {REQUIRED_VERIFIER_STATUS})"
+            )
+        if doc.get("llm_status") != REQUIRED_LLM_STATUS:
+            return False, (
+                f"strict LLM-вердикт={doc.get('llm_status')} "
+                f"(потрібно {REQUIRED_LLM_STATUS})"
+            )
+
+    for field, reason in required_fields.items():
         value = doc.get(field)
         if field == "has_text_layer":
-            if value is None or int(value) != 1:
+            try:
+                has_text_layer = int(value)
+            except (TypeError, ValueError):
+                has_text_layer = 0
+            if has_text_layer != 1:
                 return False, f"{field}={value}"
         elif field == "page_count":
-            if not value or int(value) < min_page_count:
+            try:
+                page_count_value = int(value)
+            except (TypeError, ValueError):
+                page_count_value = 0
+            if page_count_value < min_page_count:
                 return False, f"page_count={value} (мінімум {min_page_count} сторінки для цілісного джерела)"
         elif value is None or value == "" or value == "None":
             return False, reason
 
+    if str(doc.get("language") or "").strip().lower() in {"unknown", "und", "none"}:
+        return False, "мова не визначена"
+
     # Додаткові перевірки якості
-    title = doc.get("title", "")
+    title = str(doc.get("title") or "")
     if not title or len(title.strip()) < 10:
-        return False, f"title слишком короткий ({len(title)} символів)"
+        return False, f"title занадто короткий ({len(title)} символів)"
     title_lower = title.lower()
     if ".docx" in title_lower or ".doc" in title_lower:
         return False, "title містить розширення файлу"
@@ -81,17 +141,25 @@ def is_document_complete(doc: dict[str, Any], rules: FilterRules | None = None) 
         return False, f"title не містить слів (знайдено {len(words)})"
     # Відкидати якщо title містить ".mdi", "c--", "c-document" (windows garbage)
     if ".mdi" in title_lower or "c--documents" in title_lower:
-        return False, f"title містить garbage-патерн"
+        return False, "title містить garbage-патерн"
 
     # Перевірка авторів
     authors = doc.get("authors", [])
+    if isinstance(authors, str):
+        try:
+            parsed_authors = json.loads(authors)
+            authors = parsed_authors if isinstance(parsed_authors, list) else [authors]
+        except (json.JSONDecodeError, TypeError):
+            authors = [authors]
+    if isinstance(authors, list):
+        authors = [str(author).strip() for author in authors if str(author).strip()]
     if not authors:
         return False, "автори відсутні"
     if isinstance(authors, list):
         # Відкидати списки з одного елементом якщо це ініціали (типу "Г.А.") 
         # або загальновідомі garbage-значення
         if len(authors) == 1:
-            a = authors[0]
+            a = str(authors[0])
             if re.match(r'^[А-ЩЬьюЯ]{1,3}\.[А-ЩЬьюЯ]{1,3}\.*$', a):
                 return False, f"автор '{a}' виглядає як ініціали (бракує прізвища)"
             if a in ("USER", "1", "Unknown", "service", "", "Admin", "Lena"):
@@ -102,60 +170,97 @@ def is_document_complete(doc: dict[str, Any], rules: FilterRules | None = None) 
         # Відкидати якщо всі автори некоректні
         bad_authors = []
         for a in authors:
-            if a in ("USER", "1", "Unknown", "service", "", "Admin"):
-                bad_authors.append(a)
-            elif re.match(r'^[А-ЩЬьюЯ]{1,3}\.[А-ЩЬьюЯ]{1,3}\.*$', a):
-                bad_authors.append(a)
-            elif len(a.strip()) < 2:
+            if a in ("USER", "1", "Unknown", "service", "", "Admin") or re.match(r'^[А-ЩЬьюЯ]{1,3}\.[А-ЩЬьюЯ]{1,3}\.*$', a) or len(a.strip()) < 2:
                 bad_authors.append(a)
         if len(bad_authors) == len(authors):
             return False, f"всі автори некоректні: {bad_authors[:2]}"
-        if len(bad_authors) > 0:
-            # Якщо більшість авторів некоректні - відкидати
-            if len(bad_authors) >= len(authors) * 0.5:
-                return False, f"більшість авторів некоректні: {bad_authors[:2]}"
+        # Якщо більшість авторів некоректні — відкидати.
+        if bad_authors and len(bad_authors) >= len(authors) * 0.5:
+            return False, f"більшість авторів некоректні: {bad_authors[:2]}"
     else:
-        # Якщо автори не список - намагаємось розібрати
-        try:
-            parsed = json.loads(authors)
-            if isinstance(parsed, list):
-                authors = parsed
-            else:
-                return False, "автори не є списком"
-        except (json.JSONDecodeError, TypeError):
-            return False, "автори некоректний формат"
+        return False, "автори некоректний формат"
 
-    if doc.get("extra") and isinstance(doc.get("extra"), str):
+    extra = doc.get("extra")
+    if isinstance(extra, str):
         try:
-            extra = json.loads(doc["extra"])
-            if extra.get("curator", {}).get("unavailable_since"):
-                return False, "позначений як недоступний"
+            extra = json.loads(extra)
         except (json.JSONDecodeError, TypeError):
-            pass
+            extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    curator_extra = extra.get("curator")
+    if isinstance(curator_extra, dict) and curator_extra.get("unavailable_since"):
+        return False, "позначений як недоступний"
 
     # === НОВІ ПЕРЕВІРКИ ЗА ПРАВИЛАМИ ===
     
-    # Перевірка щільності тексту (мінімум 1500 знаків на сторінку)
-    text_length = doc.get("text_length", 0) or 0
+    # Довжина повного тексту (text_length) зберігається лише у документів,
+    # верифікованих новим пайплайном (verify/pipeline.py). Старі verified-документи
+    # поле не мають — для них оцінюємо наявність тексту за text_sample, а щільність
+    # на сторінку не перевіряємо (нема повної довжини тексту).
+    text_length = doc.get("text_length") or extra.get("text_length")
+    try:
+        text_length_value = int(text_length) if text_length not in (None, "") else 0
+    except (TypeError, ValueError):
+        text_length_value = 0
+    has_full_text_length = text_length_value > 0
     page_count = doc.get("page_count", 1) or 1
-    if text_length > 0 and page_count > 0:
-        chars_per_page = text_length / page_count
-        if chars_per_page < min_chars_per_page:
-            return False, f"низька щільність тексту ({chars_per_page:.0f} знаків/стор, мінімум {min_chars_per_page})"
+
+    if has_full_text_length:
+        # Перевірка щільності тексту (мінімум min_chars_per_page знаків на сторінку)
+        if text_length_value < max(min_chars_per_page, 500):
+            return False, f"недостатньо повного тексту ({text_length_value} знаків)"
+        if page_count > 0:
+            chars_per_page = text_length_value / page_count
+            if chars_per_page < min_chars_per_page:
+                return False, f"низька щільність тексту ({chars_per_page:.0f} знаків/стор, мінімум {min_chars_per_page})"
+    else:
+        # Старі verified-документи без text_length: вимагаємо наявність тексту.
+        text_sample = doc.get("text_sample") or ""
+        sample_len = len(str(text_sample))
+        if sample_len < 500:
+            return False, f"недостатньо повного тексту ({sample_len} знаків)"
+
+    structure = extra.get("structure") if isinstance(extra.get("structure"), dict) else {}
+    # Структурний аналіз (references/introduction/conclusion) доступний лише для
+    # документів, верифікованих новим пайплайном. Для старих записів перевірку
+    # пропускаємо — цілісність оцінює LLM-верифікатор.
+    has_structure_analysis = bool(structure)
+    if has_structure_analysis:
+        if rules.require_references and not structure.get("has_references"):
+            return False, "відсутній розділ літератури/references"
+        if rules.require_introduction and not structure.get("has_introduction"):
+            return False, "відсутній вступ/introduction"
+        if rules.require_conclusion and not structure.get("has_conclusion"):
+            return False, "відсутні висновки/conclusion"
+        if rules.require_structured_sections and not structure.get("structured_sections"):
+            return False, "відсутня структурована нумерація розділів"
+        if rules.require_title_page and not structure.get("has_title_page"):
+            return False, "відсутня титульна сторінка"
+        try:
+            toc_ratio = float(structure.get("toc_ratio") or 0.0)
+        except (TypeError, ValueError):
+            toc_ratio = 1.0
+        if toc_ratio > rules.max_toc_ratio:
+            return False, f"зміст займає {toc_ratio:.1%} тексту (ліміт {rules.max_toc_ratio:.1%})"
+        if rules.reject_annotations and structure.get("only_abstract"):
+            return False, "документ є лише анотацією/рефератом"
+    if rules.reject_theses_fragments and str(doc.get("doc_type") or "").lower() in {
+        "thesis",
+        "dissertation",
+    }:
+        return False, "дисертації/кваліфікаційні роботи не належать до цільових джерел"
     
     # Відкидання презентацій PowerPoint
     if rules.reject_ppt:
-        extra_data = doc.get("extra")
-        if extra_data and isinstance(extra_data, str):
-            try:
-                extra = json.loads(extra_data)
-                producer = extra.get("producer", "")
-                if "powerpoint" in producer.lower() or "ppt" in producer.lower():
-                    return False, "презентація PowerPoint"
-            except (json.JSONDecodeError, TypeError):
-                pass
+        pdf_metadata = extra.get("pdf_metadata")
+        if not isinstance(pdf_metadata, dict):
+            pdf_metadata = {}
+        producer = str(extra.get("producer") or pdf_metadata.get("producer") or "")
+        if "powerpoint" in producer.lower() or "ppt" in producer.lower():
+            return False, "презентація PowerPoint"
         # Додаткова перевірка за назвою
-        title_lower = doc.get("title", "").lower()
+        title_lower = title.lower()
         if "презентація" in title_lower or "presentation" in title_lower:
             return False, "презентація за назвою"
     
@@ -192,20 +297,27 @@ async def get_candidates_for_topic(
             f"""
             SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
                    d.canonical_url, d.language, d.udc, d.page_count, d.has_text_layer,
-                   d.size_bytes, d.sha256, d.status, d.extra,
+                   d.size_bytes, d.sha256, d.status, d.extra, d.text_sample,
+                   d.verifier_status, d.verifier_checked_at,
+                   vr.status AS verifier_result_status,
+                   vr.llm_status AS llm_status,
                    d.verified_at, d.first_seen_at,
                    dt.score as topic_score,
                    t.id as topic_id, t.name_uk as topic_name
             FROM documents d
             LEFT JOIN document_topics dt ON dt.document_id = d.id
             LEFT JOIN topics t ON t.id = dt.topic_id
+            LEFT JOIN verifier_results vr ON vr.document_id = d.id AND vr.profile = 'strict'
             WHERE d.status = 'verified'
+              AND d.verifier_status = 'pass'
+              AND vr.status = 'pass'
+              AND vr.llm_status = 'pass'
               AND d.title IS NOT NULL AND d.title != ''
               AND d.authors IS NOT NULL
               AND d.language IS NOT NULL
               AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
               AND d.page_count >= {min_page_count}
-              AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
+              AND d.has_text_layer = 1
               AND d.id IN (
                   SELECT dt2.document_id
                   FROM document_topics dt2
@@ -219,25 +331,32 @@ async def get_candidates_for_topic(
             (topic_id, limit),
         )
     elif udc_prefixes:
-        udc_conditions = " OR ".join(f"d.udc LIKE '{p}%'" for p in udc_prefixes)
+        udc_conditions = " OR ".join("d.udc LIKE ?" for _ in udc_prefixes)
         rows = await repo.db.fetchall(
             f"""
             SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
                    d.canonical_url, d.language, d.udc, d.page_count, d.has_text_layer,
-                   d.size_bytes, d.sha256, d.status, d.extra,
+                   d.size_bytes, d.sha256, d.status, d.extra, d.text_sample,
+                   d.verifier_status, d.verifier_checked_at,
+                   vr.status AS verifier_result_status,
+                   vr.llm_status AS llm_status,
                    d.verified_at, d.first_seen_at,
                    COALESCE(dt.score, 0) as topic_score,
                    t.id as topic_id, t.name_uk as topic_name
             FROM documents d
             LEFT JOIN document_topics dt ON dt.document_id = d.id
             LEFT JOIN topics t ON t.id = dt.topic_id
+            LEFT JOIN verifier_results vr ON vr.document_id = d.id AND vr.profile = 'strict'
             WHERE d.status = 'verified'
+              AND d.verifier_status = 'pass'
+              AND vr.status = 'pass'
+              AND vr.llm_status = 'pass'
               AND d.title IS NOT NULL AND d.title != ''
               AND d.authors IS NOT NULL
               AND d.language IS NOT NULL
               AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
               AND d.page_count >= {min_page_count}
-              AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
+              AND d.has_text_layer = 1
               AND (
                   {udc_conditions}
               )
@@ -245,27 +364,34 @@ async def get_candidates_for_topic(
             ORDER BY dt.score DESC NULLS LAST, d.year DESC NULLS LAST
             LIMIT ?
             """,
-            (limit,),
+            tuple([f"{prefix}%" for prefix in udc_prefixes] + [limit]),
         )
     else:
         rows = await repo.db.fetchall(
             f"""
             SELECT d.id, d.title, d.authors, d.year, d.publisher, d.doc_type,
                    d.canonical_url, d.language, d.udc, d.page_count, d.has_text_layer,
-                   d.size_bytes, d.sha256, d.status, d.extra,
+                   d.size_bytes, d.sha256, d.status, d.extra, d.text_sample,
+                   d.verifier_status, d.verifier_checked_at,
+                   vr.status AS verifier_result_status,
+                   vr.llm_status AS llm_status,
                    d.verified_at, d.first_seen_at,
                    COALESCE(dt.score, 0) as topic_score,
                    t.id as topic_id, t.name_uk as topic_name
             FROM documents d
             LEFT JOIN document_topics dt ON dt.document_id = d.id
             LEFT JOIN topics t ON t.id = dt.topic_id
+            LEFT JOIN verifier_results vr ON vr.document_id = d.id AND vr.profile = 'strict'
             WHERE d.status = 'verified'
+              AND d.verifier_status = 'pass'
+              AND vr.status = 'pass'
+              AND vr.llm_status = 'pass'
               AND d.title IS NOT NULL AND d.title != ''
               AND d.authors IS NOT NULL
               AND d.language IS NOT NULL
               AND d.canonical_url IS NOT NULL AND d.canonical_url != ''
               AND d.page_count >= {min_page_count}
-              AND (d.has_text_layer = 1 OR d.has_text_layer IS NULL)
+              AND d.has_text_layer = 1
               AND (d.extra IS NULL OR d.extra NOT LIKE '%"curator"%')
             ORDER BY dt.score DESC NULLS LAST, d.year DESC NULLS LAST
             LIMIT ?
@@ -282,7 +408,7 @@ async def get_candidates_for_topic(
         candidates.append({
             "id": row["id"],
             "title": row["title"],
-            "authors": json.loads(row["authors"]) if row["authors"] else [],
+            "authors": _parse_authors(row["authors"]),
             "year": row["year"],
             "publisher": row["publisher"],
             "doc_type": row["doc_type"],
@@ -300,6 +426,11 @@ async def get_candidates_for_topic(
             "verified_at": row["verified_at"],
             "first_seen_at": row["first_seen_at"],
             "extra": row["extra"],
+            "text_sample": row["text_sample"],
+            "verifier_status": row["verifier_status"],
+            "verifier_checked_at": row["verifier_checked_at"],
+            "verifier_result_status": row["verifier_result_status"],
+            "llm_status": row["llm_status"],
         })
 
     return candidates
@@ -326,7 +457,7 @@ async def find_replacement(
     available = [
         c for c in candidates
         if c["id"] not in selected_ids
-        and is_document_complete(c)[0]
+        and is_document_complete(c, rules, require_strict_pass=True)[0]
         and (await check_availability(c["canonical_url"]))[0]
     ]
 
@@ -336,61 +467,18 @@ async def find_replacement(
     return available[0]  # Найкращий за score/рік
 
 
-async def download_pdf_to_resources(
+async def verify_pdf_download(
     url: str,
-    resources_dir: Path,
-    document_id: int,
     timeout_s: float = 60.0,
-) -> tuple[Path | None, str | None]:
-    """Завантажити PDF з URL у папку resources каталогу.
+) -> tuple[bool, str | None]:
+    """Перевірити фактичне завантаження PDF без збереження у каталозі."""
+    from harvester.extract.engine import download_pdf
 
-    Returns (path_to_pdf, None) if successful, or (None, error_description) if failed.
-    PDF saved as: resources_dir / f"{document_id}.pdf"
-    """
-    settings = get_settings()
-    timeout = httpx.Timeout(timeout_s, connect=10.0, read=30.0, pool=None)
-    headers = {
-        "User-Agent": settings.http.user_agent,
-        "Accept": "application/pdf,*/*",
-    }
-
-    pdf_path = resources_dir / f"{document_id}.pdf"
-
-    try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code != 200:
-                reason = f"HTTP {resp.status_code}"
-                logger.warning("pdf_download_failed_to_resources", url=url, document_id=document_id, status=resp.status_code)
-                return None, reason
-
-            content_type = resp.headers.get("content-type", "")
-            if "pdf" not in content_type.lower() and "octet-stream" not in content_type.lower():
-                if "html" in content_type.lower():
-                    reason = f"не PDF (content-type={content_type})"
-                    logger.warning("pdf_download_not_pdf_to_resources", url=url, document_id=document_id)
-                    return None, reason
-
-            data = resp.content
-            if len(data) < 1024:
-                reason = f"файл занадто малий ({len(data)} байт)"
-                logger.warning("pdf_download_too_small_to_resources", url=url, document_id=document_id, size=len(data))
-                return None, reason
-
-            if data[:4] != b"%PDF":
-                reason = "відсутні %PDF magic bytes"
-                logger.warning("pdf_download_not_pdf_magic_to_resources", url=url, document_id=document_id)
-                return None, reason
-
-            pdf_path.write_bytes(data)
-            logger.info("pdf_downloaded_to_resources", url=url, document_id=document_id, path=str(pdf_path))
-            return pdf_path, None
-
-    except Exception as e:
-        detail = str(e).strip() or type(e).__name__
-        reason = f"{type(e).__name__}: {detail}" if str(e).strip() else type(e).__name__
-        logger.error("pdf_download_error_to_resources", url=url, document_id=document_id, error=reason)
-        return None, reason
+    pdf_path, error = await download_pdf(url, timeout_s=timeout_s)
+    if pdf_path is None:
+        return False, error
+    await asyncio.to_thread(pdf_path.unlink, missing_ok=True)
+    return True, None
 
 
 async def save_catalog_atomically(path: str, data: dict[str, Any]) -> None:
@@ -402,6 +490,7 @@ async def save_catalog_atomically(path: str, data: dict[str, Any]) -> None:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
         os.replace(tmp_path, path)
+        os.chmod(path, CATALOG_FILE_MODE)
     except BaseException:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -496,7 +585,6 @@ async def prepare_catalog(
     await db.initialize(sync_mirror=False)
 
     try:
-        tags = log_tags = {}
         logger.info("curator_prepare_start", topic=topic_name)
 
         # 1. Знайти тему в БД або визначити UDC
@@ -510,8 +598,17 @@ async def prepare_catalog(
         if topic_info and topic_info.get("udc_prefixes"):
             try:
                 udc_prefixes = json.loads(topic_info["udc_prefixes"])
-            except (TypeError, json.JSONDecodeError):
-                pass
+            except (TypeError, json.JSONDecodeError) as e:
+                # UDC-фільтр мовчки вимикається для теми → кандидати
+                # відбираються без урахування індексу. Це змінює склад
+                # каталогу, тож має бути видимим.
+                logger.warning(
+                    "curator_udc_prefixes_parse_failed",
+                    topic=topic_name_uk,
+                    raw=str(topic_info["udc_prefixes"])[:80],
+                    error=str(e)[:120],
+                    impact="UDC-фільтр вимкнено для теми",
+                )
 
         if not topic_id and not udc_prefixes:
             logger.warning("topic_not_found_in_db", topic=topic_name)
@@ -547,25 +644,44 @@ async def prepare_catalog(
 
         complete_candidates = []
         incomplete_count = 0
+        # Розподіл причин відхилення: без нього «0 кандидатів» не дає
+        # зрозуміти, чи бракує LLM-вердиктів (llm_status), чи полів
+        # (автори/мова), чи сторінок. Це основне питання якості пулу.
+        reject_reasons: dict[str, int] = {}
         for c in candidates:
-            ok, reason = is_document_complete(c, rules)
+            ok, reason = is_document_complete(c, rules, require_strict_pass=True)
             if ok:
                 complete_candidates.append(c)
             else:
                 incomplete_count += 1
+                # Групуємо схожі причини, щоб лічильник був читабельним.
+                key = re.sub(r"[=:].*$", "", (reason or "unknown"))[:60]
+                reject_reasons[key] = reject_reasons.get(key, 0) + 1
 
-        logger.info("candidates_found", total=len(candidates), complete=len(complete_candidates), incomplete=incomplete_count)
+        logger.info(
+            "candidates_found",
+            total=len(candidates),
+            complete=len(complete_candidates),
+            incomplete=incomplete_count,
+            reject_reasons=reject_reasons,
+        )
 
         if not complete_candidates:
-            logger.warning("no_complete_candidates", topic=topic_name_uk)
+            logger.warning(
+                "no_complete_candidates",
+                topic=topic_name_uk,
+                total=len(candidates),
+                reject_reasons=reject_reasons,
+            )
             return None
 
         # 3. LLM-відбір
-        selection = await call_llm_for_selection(topic_name_uk, complete_candidates, rules=rules)
+        min_count = limit or 30
+        selection = await call_llm_for_selection(topic_name_uk, complete_candidates, rules=rules, min_count=min_count)
         if selection is None:
             # Якщо LLM недоступний — обираємо перші complete_candidates
             logger.warning("llm_selection_failed_fallback_to_first", count=len(complete_candidates))
-            suggested_count = min(30, len(complete_candidates))
+            suggested_count = min(min_count, len(complete_candidates))
             selection = SelectionResult(
                 topic=topic_name_uk,
                 candidates_count=len(complete_candidates),
@@ -574,7 +690,11 @@ async def prepare_catalog(
                 reasoning="LLM недоступний, обрано перші N документів",
             )
 
-        selected_ids = set(selection.selected_ids)
+        # LLM може запропонувати більше документів, ніж потрібно для каталогу.
+        # Обмежуємо кількість, зберігаючи порядок відбору LLM.
+        candidate_ids = {c["id"] for c in complete_candidates}
+        ordered_ids = [i for i in selection.selected_ids if i in candidate_ids]
+        selected_ids = set(ordered_ids[:min_count])
         selected_docs = [c for c in complete_candidates if c["id"] in selected_ids]
 
         logger.info("selection_done", suggested=selection.suggested_count, actual=len(selected_docs))
@@ -607,6 +727,8 @@ async def prepare_catalog(
             if replacement:
                 available.append(replacement)
                 replaced.append((doc["id"], replacement["id"]))
+                selected_ids.add(replacement["id"])
+                selected_ids.discard(doc["id"])
                 logger.info("replacement_found", original=doc["id"], replacement=replacement["id"])
             else:
                 still_unavailable.append((doc["id"], reason))
@@ -623,84 +745,56 @@ async def prepare_catalog(
                 success_count=len(available),
             )
 
-        # 6. Створити структуру каталогу та завантажити PDF
+        # 6. Створити структуру каталогу. PDF перевіряємо тимчасово, але
+        # каталог містить лише метадані, URL та хеш документа.
         now = datetime.now()
         now_str = now.strftime('%Y%m%d_%H%M%S')
         catalog_folder = f"catalog_{now_str}"
         catalog_path = os.path.join(output_dir, catalog_folder)
-        resources_dir = os.path.join(catalog_path, "resources")
         catalog_json_path = os.path.join(catalog_path, f"{catalog_folder}.json")
-        
-        os.makedirs(resources_dir, exist_ok=True)
-        logger.info("catalog_structure_created", catalog_path=catalog_path, resources_dir=resources_dir)
 
-        # Завантажити PDF для обраних документів
+        os.makedirs(catalog_path, exist_ok=True)
+        os.chmod(catalog_path, CATALOG_DIR_MODE)
+        logger.info("catalog_structure_created", catalog_path=catalog_path)
+
         documents_data = []
         downloaded = []
         download_failed = []
-        
+
         for doc in available:
-            pdf_path, error = await download_pdf_to_resources(
-                doc["canonical_url"],
-                Path(resources_dir),
-                doc["id"],
-            )
-            if pdf_path:
-                downloaded.append((doc["id"], str(pdf_path)))
-                doc_data = {
-                    "id": doc["id"],
-                    "title": doc["title"],
-                    "authors": doc["authors"],
-                    "year": doc["year"],
-                    "publisher": doc["publisher"],
-                    "doc_type": doc["doc_type"],
-                    "canonical_url": doc["canonical_url"],
-                    "language": doc["language"],
-                    "udc": doc["udc"],
-                    "page_count": doc["page_count"],
-                    "size_bytes": doc["size_bytes"],
-                    "sha256": doc["sha256"],
-                    "has_text_layer": doc["has_text_layer"],
-                    "verified_at": doc["verified_at"],
-                    "first_seen_at": doc["first_seen_at"],
-                    "pdf_path": f"resources/{doc['id']}.pdf",  # Відносний шлях до PDF
-                }
-                if doc.get("topic_id") and doc.get("topic_name"):
-                    doc_data["topics"] = [{
-                        "topic_id": doc["topic_id"],
-                        "topic_name": doc["topic_name"],
-                        "score": doc["topic_score"],
-                    }]
-                documents_data.append(doc_data)
-            else:
+            success, error = await verify_pdf_download(doc["canonical_url"])
+            if not success:
                 download_failed.append((doc["id"], error or "Невідомо"))
                 logger.warning("pdf_download_failed", document_id=doc["id"], error=error or "Невідомо")
-                # Все одно додамо документ до каталогу, але без PDF
-                doc_data = {
-                    "id": doc["id"],
-                    "title": doc["title"],
-                    "authors": doc["authors"],
-                    "year": doc["year"],
-                    "publisher": doc["publisher"],
-                    "doc_type": doc["doc_type"],
-                    "canonical_url": doc["canonical_url"],
-                    "language": doc["language"],
-                    "udc": doc["udc"],
-                    "page_count": doc["page_count"],
-                    "size_bytes": doc["size_bytes"],
-                    "sha256": doc["sha256"],
-                    "has_text_layer": doc["has_text_layer"],
-                    "verified_at": doc["verified_at"],
-                    "first_seen_at": doc["first_seen_at"],
-                    "pdf_path": None,  # PDF не завантажено
-                }
-                if doc.get("topic_id") and doc.get("topic_name"):
-                    doc_data["topics"] = [{
-                        "topic_id": doc["topic_id"],
-                        "topic_name": doc["topic_name"],
-                        "score": doc["topic_score"],
-                    }]
-                documents_data.append(doc_data)
+                continue
+
+            downloaded.append(doc["id"])
+            doc_data = {
+                "id": doc["id"],
+                "title": doc["title"],
+                "authors": doc["authors"],
+                "year": doc["year"],
+                "publisher": doc["publisher"],
+                "doc_type": doc["doc_type"],
+                "canonical_url": doc["canonical_url"],
+                "language": doc["language"],
+                "udc": doc["udc"],
+                "page_count": doc["page_count"],
+                "size_bytes": doc["size_bytes"],
+                "sha256": doc["sha256"],
+                "has_text_layer": doc["has_text_layer"],
+                "verified_at": doc["verified_at"],
+                "first_seen_at": doc["first_seen_at"],
+                "verifier_status": doc.get("verifier_status"),
+                "verifier_checked_at": doc.get("verifier_checked_at"),
+            }
+            if doc.get("topic_id") and doc.get("topic_name"):
+                doc_data["topics"] = [{
+                    "topic_id": doc["topic_id"],
+                    "topic_name": doc["topic_name"],
+                    "score": doc["topic_score"],
+                }]
+            documents_data.append(doc_data)
 
         logger.info("pdf_download_results", total=len(available), downloaded=len(downloaded), failed=len(download_failed))
 
@@ -710,7 +804,6 @@ async def prepare_catalog(
             "total_documents": len(documents_data),
             "replaced_count": len(replaced),
             "documents": documents_data,
-            "resources_dir": "resources",
         }
 
         # Атомарно записати JSON каталогу
@@ -720,6 +813,7 @@ async def prepare_catalog(
                 json.dump(catalog_data, f, ensure_ascii=False, indent=2)
                 f.write("\n")
             os.replace(tmp_json, catalog_json_path)
+            os.chmod(catalog_json_path, CATALOG_FILE_MODE)
             logger.info("catalog_written", path=catalog_json_path)
         except BaseException:
             if os.path.exists(tmp_json):

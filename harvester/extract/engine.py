@@ -10,12 +10,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import httpx
 import structlog
 
+from harvester.classify.llm import log_raw_response
 from harvester.config import get_settings
-from harvester.db.failover import build_database
-from harvester.verify.pdfparse import PDFParseResult, parse_pdf
+from harvester.net.client import get_http_client
+from harvester.verify.pdfparse import parse_pdf
 
 logger = structlog.get_logger()
 
@@ -102,6 +102,39 @@ LLM_SYSTEM_PROMPT = """Ти — дослідник, який аналізує н
 MAX_TEXT_CHARS_FOR_LLM = 80000  # Deprecated: use settings.llm.max_text_chars_for_llm
 
 
+def _has_meaningful_quotations(quotations: Any) -> bool:
+    if not isinstance(quotations, list):
+        return False
+    for quotation in quotations:
+        if isinstance(quotation, dict) and str(quotation.get("text", "")).strip():
+            return True
+    return False
+
+
+def _has_meaningful_summary(summary: Any) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    sections = summary.get("sections")
+    if not isinstance(sections, list) or not sections:
+        return False
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        title = str(section.get("title", "")).strip()
+        overview = str(section.get("overview", "")).strip()
+        methodology = str(section.get("methodology", "")).strip()
+        findings = str(section.get("findings", "")).strip()
+        conclusions = str(section.get("conclusions", "")).strip()
+        key_ideas = section.get("key_ideas", [])
+        has_ideas = isinstance(key_ideas, list) and any(str(idea).strip() for idea in key_ideas)
+        if any(
+            value and value not in {"н/зв", "Розділ", "Загальна сумаризація"}
+            for value in (title, overview, methodology, findings, conclusions)
+        ) or has_ideas:
+            return True
+    return False
+
+
 @dataclass
 class ExtractionResult:
     """Результат витягу для одного документа."""
@@ -131,48 +164,56 @@ async def download_pdf(url: str, timeout_s: float = 60.0) -> tuple[Path | None, 
     (None, опис_помилки), якщо завантаження не вдалося.
     """
     settings = get_settings()
-    timeout = httpx.Timeout(timeout_s, connect=10.0, read=30.0, pool=None)
 
     headers = {
         "User-Agent": settings.http.user_agent,
         "Accept": "application/pdf,*/*",
     }
 
+    tmp_path: Path | None = None
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code != 200:
+        client = await get_http_client()
+        chunks: list[bytes] = []
+        total = 0
+        async with client.stream("GET", url, headers=headers, timeout=timeout_s) as resp:
+            if not 200 <= resp.status_code < 300:
                 reason = f"HTTP {resp.status_code}"
                 logger.warning("pdf_download_failed", url=url, status=resp.status_code)
                 return None, reason
 
             content_type = resp.headers.get("content-type", "")
-            if "pdf" not in content_type.lower() and not url.lower().endswith(".pdf"):
-                # Можливо, це HTML-сторінка, а не PDF
-                if "html" in content_type.lower():
-                    reason = f"відповідь не є PDF (content-type={content_type})"
-                    logger.warning("pdf_download_not_pdf", url=url, content_type=content_type)
-                    return None, reason
-
-            data = resp.content
-            if len(data) < 1024:
-                reason = f"файл занадто малий ({len(data)} байт)"
-                logger.warning("pdf_download_too_small", url=url, size=len(data))
+            if "html" in content_type.lower():
+                reason = f"відповідь не є PDF (content-type={content_type})"
+                logger.warning("pdf_download_not_pdf", url=url, content_type=content_type)
                 return None, reason
 
-            # Перевірка magic bytes
-            if data[:4] != b"%PDF":
-                reason = "відсутні %PDF magic bytes"
-                logger.warning("pdf_download_not_pdf_magic", url=url)
-                return None, reason
+            async for chunk in resp.aiter_bytes(chunk_size=65536):
+                total += len(chunk)
+                if total > settings.http.max_pdf_bytes:
+                    return None, f"файл перевищує ліміт {settings.http.max_pdf_bytes} байт"
+                chunks.append(chunk)
 
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-            tmp.write(data)
-            tmp.close()
-            logger.info("pdf_downloaded", url=url, bytes=len(data))
-            return Path(tmp.name), None
+        data = b"".join(chunks)
+        if len(data) < 1024:
+            reason = f"файл занадто малий ({len(data)} байт)"
+            logger.warning("pdf_download_too_small", url=url, size=len(data))
+            return None, reason
+
+        if data[:4] != b"%PDF":
+            reason = "відсутні %PDF magic bytes"
+            logger.warning("pdf_download_not_pdf_magic", url=url)
+            return None, reason
+
+        fd, name = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        tmp_path = Path(name)
+        await asyncio.to_thread(tmp_path.write_bytes, data)
+        logger.info("pdf_downloaded", url=url, bytes=len(data))
+        return tmp_path, None
 
     except Exception as e:
+        if tmp_path is not None:
+            await asyncio.to_thread(tmp_path.unlink, missing_ok=True)
         detail = str(e).strip() or type(e).__name__
         reason = f"{type(e).__name__}: {detail}" if str(e).strip() else type(e).__name__
         logger.error("pdf_download_error", url=url, error=reason)
@@ -185,6 +226,7 @@ async def process_document(job: ExtractionJob) -> ExtractionResult:
     Returns ExtractionResult з результатами.
     """
     tmp_pdf: Path | None = None
+    downloaded_tmp = False
     try:
         # 1. Отримати PDF (локальний або завантажити)
         logger.info("extract_start", document_id=job.document_id, url=job.canonical_url)
@@ -214,6 +256,7 @@ async def process_document(job: ExtractionJob) -> ExtractionResult:
                     success=False,
                     error=error_text,
                 )
+            downloaded_tmp = True
 
         # 2. Парсити PDF (витягнути весь текст, усі сторінки)
         # Максимальна кількість сторінок для витягу
@@ -229,8 +272,7 @@ async def process_document(job: ExtractionJob) -> ExtractionResult:
             )
 
         text = parse_result.text
-        page_count = parse_result.page_count
-        text_pages_extracted = len(text.split("\n")) if text else 0
+        text_pages_extracted = min(parse_result.page_count, max_pages) if text else 0
 
         if not text or len(text.strip()) < 100:
             return ExtractionResult(
@@ -315,9 +357,14 @@ async def process_document(job: ExtractionJob) -> ExtractionResult:
                     "authors_mentioned": authors,
                 }
 
-        # Видалити тимчасовий файл
-        if tmp_pdf and tmp_pdf.exists():
-            tmp_pdf.unlink()
+        if not _has_meaningful_quotations(quotations) and not _has_meaningful_summary(summary):
+            return ExtractionResult(
+                document_id=job.document_id,
+                canonical_url=job.canonical_url,
+                success=False,
+                error="LLM не повернув цитат або сумаризації",
+                text_pages_extracted=text_pages_extracted,
+            )
 
         logger.info(
             "extract_success",
@@ -338,14 +385,15 @@ async def process_document(job: ExtractionJob) -> ExtractionResult:
 
     except Exception as e:
         logger.error("extract_error", document_id=job.document_id, error_msg=str(e))
-        if tmp_pdf and tmp_pdf.exists():
-            tmp_pdf.unlink()
         return ExtractionResult(
             document_id=job.document_id,
             canonical_url=job.canonical_url,
             success=False,
             error=str(e),
         )
+    finally:
+        if downloaded_tmp and tmp_pdf is not None:
+            await asyncio.to_thread(tmp_pdf.unlink, missing_ok=True)
 
 
 async def call_llm_for_extraction(text: str, title: str) -> dict[str, Any] | None:
@@ -355,103 +403,49 @@ async def call_llm_for_extraction(text: str, title: str) -> dict[str, Any] | Non
     або None, якщо виклик не вдалося.
     """
     settings = get_settings()
-    llm_config = settings.llm
-
-    if not llm_config.enabled:
+    if not settings.llm.enabled:
         logger.warning("llm_disabled")
         return None
 
-    # Підготувати контент для відправки
-    content = f"НАЗВА СТАТТІ: {title}\n\nТЕКСТ СТАТТІ:\n{text}"
-
-    messages = [
-        {"role": "system", "content": LLM_SYSTEM_PROMPT},
-        {"role": "user", "content": content},
-    ]
-
-    # Спробувати Gemini (ключі з settings)
-    for api_key in [settings.gemini_api_key, settings.gemini_api_key_2, settings.gemini_api_key_3]:
-        if not api_key:
-            continue
-        try:
-            result = await call_gemini(api_key, llm_config, messages)
-            if result is not None:
-                return result
-        except Exception as e:
-            logger.warning("gemini_try_failed", error_msg=str(e))
-
-    # Спробувати Gemma (ті самі ключі, але gemma_models + стиснення тексту)
-    for api_key in [settings.gemini_api_key, settings.gemini_api_key_2, settings.gemini_api_key_3]:
-        if not api_key:
-            continue
-        for model in llm_config.gemma_models:
-            try:
-                from harvester.classify.llm import rephrase_for_gemma
-
-                truncated_content = f"НАЗВА СТАТТІ: {title}\n\nТЕКСТ СТАТТІ:\n{rephrase_for_gemma(text, llm_config.gemma_max_chars)}"
-                gemma_messages = [
-                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
-                    {"role": "user", "content": truncated_content},
-                ]
-                result = await call_gemini(api_key, llm_config, gemma_messages, model_override=model)
-                if result is not None:
-                    return result
-            except Exception as e:
-                logger.warning("gemma_try_failed", model=model, error_msg=str(e))
-
-    logger.error("llm_all_retries_failed")
-    return None
-
-
-async def call_gemini(api_key: str, config, messages: list[dict], model_override: str | None = None) -> dict[str, Any] | None:
-    """Викликати Google Gemini API для витягу цитат і сумаризації."""
-    import aiohttp
-
-    model = model_override or (config.gemini_models[0] if config.gemini_models else "gemini-2.0-flash")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-
-    payload = {
-        "contents": [
-            {
-                "role": messages[0]["role"],
-                "parts": [{"text": messages[0]["content"]}],
-            },
-            {
-                "role": messages[1]["role"],
-                "parts": [{"text": messages[1]["content"]}],
-            },
-        ],
-        "generationConfig": {
-            "temperature": config.temperature,
-            "maxOutputTokens": config.max_tokens,
-        },
-    }
-
-    timeout = aiohttp.ClientTimeout(total=config.timeout_s)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, json=payload) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                logger.warning("gemini_api_error", status=resp.status, body=text[:500])
-                return None
-            data = await resp.json()
-
-    # Парсити відповідь
+    content = f"{LLM_SYSTEM_PROMPT}\n\nНАЗВА СТАТТІ: {title}\n\nТЕКСТ СТАТТІ:\n{text}"
     try:
-        candidate = data["candidates"][0]
-        content_text = candidate["content"]["parts"][0]["text"]
+        from harvester.classify.llm import LLMClient, LLMUnavailable
 
-        # Видалити markdown-блоки, якщо є
-        if content_text.startswith("```"):
-            content_text = content_text.replace("```json", "").replace("```", "").strip()
-
-        result = json.loads(content_text)
-        # Перевірити, що це dict з quotations і summary
-        if isinstance(result, dict) and "quotations" in result:
-            return result
-        logger.warning("llm_response_invalid_format", response=content_text[:200])
-        return None
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        logger.warning("llm_response_parse_error", error_msg=str(e), response=str(data)[:500])
-        return None
-
+        client = LLMClient(keys=settings.gemini_keys, service="Extract")
+        response = await client.complete(content)
+        raw = response.text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw
+            raw = raw.rsplit("```", 1)[0]
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start < 0 or end <= start:
+            # Логуємо сиру відповідь: без неї «немає JSON» не відрізняє
+            # обрізаний вивід, текст помилки та thinking-бюджет.
+            log_raw_response(logger, "llm_extraction_json_missing", response, title=title[:60])
+            return None
+        try:
+            result = json.loads(raw[start:end])
+        except json.JSONDecodeError as e:
+            log_raw_response(
+                logger, "llm_extraction_json_error", response, title=title[:60], detail=str(e)[:120]
+            )
+            return None
+        if not isinstance(result, dict):
+            # JSON, але не об'єкт (масив/рядок) — теж непарсable результат.
+            log_raw_response(
+                logger,
+                "llm_extraction_not_dict",
+                response,
+                title=title[:60],
+                got_type=type(result).__name__,
+            )
+            return None
+        return result
+    except LLMUnavailable as e:
+        logger.warning("llm_extraction_unavailable", error=str(e)[:300])
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning("llm_extraction_json_error", error=str(e)[:300], error_type=type(e).__name__)
+    except Exception as e:  # noqa: BLE001
+        logger.error("llm_extraction_error", error=str(e)[:300])
+    return None

@@ -50,7 +50,20 @@ async def apply_migrations(db: Database) -> None:
             if migration_version > current_version:
                 logger.info("applying_migration", file=mf.name, version=migration_version)
                 sql = mf.read_text(encoding="utf-8")
-                await db.executescript(sql)
+                try:
+                    await db.executescript(sql)
+                except Exception as e:
+                    # Ідемпотентність: якщо колонка/таблиця вже існує (schema.sql вже містить 004),
+                    # не падаємо — вважаємо міграцію застосованою
+                    msg = str(e).lower()
+                    if "duplicate column" in msg or "already exists" in msg:
+                        logger.warning(
+                            "migration_duplicate_skipped",
+                            file=mf.name,
+                            error=str(e)[:150],
+                        )
+                    else:
+                        raise
                 await set_version(db, migration_version)
                 current_version = migration_version
                 logger.info("applied_migration", version=migration_version)

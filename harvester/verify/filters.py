@@ -1,5 +1,4 @@
 import re
-from datetime import datetime
 
 import structlog
 
@@ -103,8 +102,9 @@ async def apply_all_filters(
     publisher: str | None = None,
     text_sample: str | None = None,
 ) -> tuple[bool, str | None]:
-    from urllib.parse import urlparse
-    host = urlparse(url).netloc.split(":")[0]
+    from harvester.net.guards import extract_domain
+
+    host = extract_domain(url) or ""
 
     blocked, reason = await check_domain_blocked(host)
     if blocked:

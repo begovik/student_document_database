@@ -38,8 +38,6 @@ def match_title(title_hint: str | None, pdf_title: str | None, text_sample: str 
     title_hint_norm = normalize_text(title_hint)
 
     best_score = 0
-    best_method = "none"
-
     if pdf_title:
         pdf_title_norm = normalize_text(pdf_title)
 
@@ -48,8 +46,6 @@ def match_title(title_hint: str | None, pdf_title: str | None, text_sample: str 
         score3 = fuzz.token_sort_ratio(title_hint_norm, pdf_title_norm)
 
         best_score = max(score1, score2, score3)
-        best_method = "pdf_metadata"
-
         logger.debug(
             "title_match_pdf_metadata",
             hint=title_hint[:50],
@@ -70,8 +66,6 @@ def match_title(title_hint: str | None, pdf_title: str | None, text_sample: str 
 
         if text_score > best_score:
             best_score = text_score
-            best_method = "text_sample"
-
             logger.debug(
                 "title_match_text_sample",
                 hint=title_hint[:50],

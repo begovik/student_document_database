@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +43,7 @@ def run(
     dry_run: bool = typer.Option(False, "--dry-run", "-d", help="Не зберігати результати, лише показати що було б зроблено"),
     retry_failed: bool = typer.Option(False, "--retry-failed", "-r", help="Пере процесувати тільки документи з помилками (попередні спроби не вдалися)"),
     skip_extracted: bool = typer.Option(True, "--skip-extracted/--no-skip-extracted", help="Пропускати документи, для яких вже є дані в extractions"),
-    catalog_dir: str | None = typer.Option(None, "--catalog-dir", "-C", help="Шлях до каталогу з resources/ (для використання локальних PDF замість завантаження)"),
+    catalog_dir: str | None = typer.Option(None, "--catalog-dir", "-C", help="Каталог для обмеження списку документів; PDF завантажуються тимчасово (legacy resources/ підтримується)"),
 ):
     """Запустити витяг цитат і сумаризацій для обраного набору документів.
 
@@ -79,10 +78,15 @@ async def main(
 
     try:
         # 1. Отримати список документів для обробки
+        catalog_ids: list[int] | None = None
+        if catalog_dir and not topic and not topic_code and not keyword and not retry_failed:
+            catalog_ids = _catalog_document_ids(catalog_dir)
+
         docs = await get_documents_to_process(
             db, topic=topic, topic_code=topic_code, keyword=keyword,
             limit=limit, retry_failed=retry_failed,
             skip_extracted=skip_extracted,
+            catalog_ids=catalog_ids,
         )
 
         if not docs:
@@ -135,7 +139,7 @@ async def main(
         successful = [r for r in results if r.success]
         failed = [r for r in results if not r.success]
 
-        print(f"\n📊 Статистика:")
+        print("\n📊 Статистика:")
         print(f"  Всього: {len(results)}")
         print(f"  Успішно: {len(successful)}")
         print(f"  Помилки: {len(failed)}")
@@ -176,7 +180,7 @@ async def main(
                                 print(f"        Ідеї: {', '.join(ideas[:3])}")
                     else:
                         # Старий формат (сумісність)
-                        print(f"  Сумаризація:")
+                        print("  Сумаризація:")
                         print(f"    Огляд: {s.get('overview', '')[:150]}")
 
     finally:
@@ -191,8 +195,21 @@ async def get_documents_to_process(
     limit: int = 30,
     retry_failed: bool = False,
     skip_extracted: bool = True,
+    catalog_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Отримати список документів для обробки."""
+    # Якщо задано каталог — обробляти саме його документи
+    if catalog_ids:
+        query = """
+            SELECT d.id, d.title, d.canonical_url, d.authors, d.year, d.udc, d.language, d.doc_type, d.verified_at
+            FROM documents d
+            WHERE d.id IN (%s)
+            ORDER BY d.id
+        """
+        in_clause = ",".join(str(i) for i in catalog_ids)
+        rows = await db.fetchall(query.replace("%s", in_clause))
+        return list(rows)[:limit]
+
     # Якщо вказано keyword — шукаємо по заголовку або title_hint
     if keyword:
         query = """
@@ -291,3 +308,18 @@ async def save_results(
             saved += 1
 
     return saved
+
+
+def _catalog_document_ids(catalog_dir: str) -> list[int]:
+    """Прочитати ID документів із JSON-каталогу (для обробки саме каталогу)."""
+    catalog_dir = Path(catalog_dir)
+    json_files = sorted(catalog_dir.glob("catalog_*.json"))
+    if not json_files:
+        logger.warning("catalog_json_not_found", catalog_dir=str(catalog_dir))
+        return []
+    with json_files[-1].open(encoding="utf-8") as f:
+        data = json.load(f)
+    documents = data.get("documents", data) if isinstance(data, dict) else data
+    ids = [int(doc["id"]) for doc in documents if doc.get("id")]
+    logger.info("catalog_documents_loaded", count=len(ids), path=str(json_files[-1]))
+    return ids

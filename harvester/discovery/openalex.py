@@ -1,14 +1,32 @@
 import asyncio
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 import httpx
 import structlog
 
 from harvester.config import get_settings
 from harvester.discovery.base import Candidate
-from harvester.net.guards import is_url_allowed
+from harvester.net.client import get_http_client
 
 logger = structlog.get_logger()
+
+# Без API-ключа OpenAlex рахує запити проти безкоштовного денного бюджету,
+# спільного для всього IP. Заміряно 02.10.2026 о 22:32 UTC: 429 з тілом
+# "Insufficient budget ... $0.0005 remaining; resets at midnight UTC".
+#
+# Це НЕ наша частотна помилка й не дефект каналу: о 03:00 бюджет буде
+# знову повний. Тому 429 не має проходити загальним шляхом помилки, де
+# кожна задача витрачає спробу з max_attempts і за 5 хвилин ретраїв
+# переходить у failed — тобто 26 задач кампанії померли б до сбросу
+# бюджету, не добравши жодної знахідки.
+class OpenAlexBudgetExhausted(Exception):
+    """Денний безкоштовний бюджет OpenAlex вичерпано; тимчасово."""
+
+    def __init__(self, retry_after_s: int):
+        self.retry_after_s = max(60, retry_after_s)
+        super().__init__(
+            f"OpenAlex daily budget exhausted; retry_after={self.retry_after_s}s"
+        )
 
 
 class OpenAlexChannel:
@@ -22,17 +40,45 @@ class OpenAlexChannel:
         self.base_url = "https://api.openalex.org"
         self.last_next_cursor: str | None = None
         self.last_count: int = 0
+        # Активний пошуковий запит поточного виклику: воркер використовує
+        # його, щоб відрізнити тематичний прохід (finite) від курсорного
+        # сканування (нескінченне, перезапускається раз на добу).
+        self.last_search: str | None = None
+        self._request_lock = asyncio.Lock()
+        self._last_request_at = 0.0
 
     def rate_limit(self) -> float:
-        return 1.0 / self.rps
+        return 1.0 / self.rps if self.rps > 0 else 0.0
+
+    async def _wait_rate_limit(self) -> None:
+        if self.rps <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        async with self._request_lock:
+            now = loop.time()
+            next_request_at = max(now, self._last_request_at + 1.0 / self.rps)
+            self._last_request_at = next_request_at
+        # Не утримувати mutex під час очікування: інші корутини можуть
+        # зарезервувати наступні слоти, не створюючи чергу під lock.
+        await asyncio.sleep(max(0.0, next_request_at - now))
 
     async def discover(self, task: dict) -> AsyncIterator[Candidate]:
         if not self.enabled:
             return
 
-        cursor = task.get("cursor", "*")
-        filters = task.get("filters", {})
+        cursor = str(task.get("cursor") or "*")
+        filters = dict(task.get("filters", {}))
         per_page = task.get("per_page", 200)
+
+        # `search` — окремий query-параметр OpenAlex, а НЕ фільтр.
+        # Раніше `_build_filter` вміла лише language/is_oa/country/type/year,
+        # тож канал міг тільки гортати ВСІ роботи UA курсором (210 902
+        # знахідки), не знаючи про тему. Для тематичної кампанії це
+        # марнотрата: 99% вибірки не належало запиту.
+        #
+        # Правильність: якщо залишити search усередині filter-рядка, API
+        # відповідає 400, тому кожен пошуковий запит падав би з помилкою.
+        search = filters.pop("search", None)
 
         params = {
             "filter": self._build_filter(filters),
@@ -41,34 +87,70 @@ class OpenAlexChannel:
             "mailto": self.email,
             "select": "id,doi,title,display_name,publication_year,language,type,open_access,best_oa_location,locations,primary_topic,authorships",
         }
+        if search:
+            params["search"] = str(search)
 
-        logger.info("openalex_query_start", filters=filters, cursor=cursor[:20])
+        self.last_next_cursor = None
+        self.last_search = search
+        await self._wait_rate_limit()
+        logger.info(
+            "openalex_query_start",
+            filters=filters,
+            search=(search or "")[:60],
+            cursor=cursor[:20],
+        )
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(f"{self.base_url}/works", params=params)
-                response.raise_for_status()
+            client = await get_http_client()
+            response = await client.get(f"{self.base_url}/works", params=params)
+            response.raise_for_status()
 
-                data = response.json()
-                results = data.get("results", [])
-                next_cursor = data.get("meta", {}).get("next_cursor")
-                self.last_next_cursor = next_cursor
-                self.last_count = len(results)
+            data = response.json()
+            results = data.get("results", [])
+            next_cursor = data.get("meta", {}).get("next_cursor")
+            self.last_next_cursor = next_cursor
+            self.last_count = len(results)
 
-                for work in results:
-                    candidate = self._work_to_candidate(work)
-                    if candidate:
-                        yield candidate
+            for work in results:
+                candidate = self._work_to_candidate(work)
+                if candidate:
+                    yield candidate
 
-                if next_cursor:
-                    logger.debug("openalex_has_more", next_cursor=next_cursor[:20])
+            if next_cursor:
+                logger.debug("openalex_has_more", next_cursor=next_cursor[:20])
 
-                logger.info("openalex_query_complete", results=len(results))
+            if search and not results:
+                # Нуль за конкретним запитом — це не збій каналу (бекенд
+                # відповів коректно, meta.count=0), і через загальний
+                # лічильник request-ів його неможливо було відрізнити від
+                # мовчання. Для кампанії це сигнал, що формулювання запиту
+                # порожнє й варто його переписати.
+                logger.info("openalex_search_empty", search=str(search)[:80])
+
+            logger.info(
+                "openalex_query_complete",
+                results=len(results),
+                search=(search or "")[:60],
+                has_more=bool(next_cursor),
+            )
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                # retry-after у секундах; за відсутності — консервативна
+                # година, бо бюджет скидається саме опівночі UTC.
+                try:
+                    retry_after = int(e.response.headers.get("retry-after", "3600"))
+                except ValueError:
+                    retry_after = 3600
+                logger.info(
+                    "openalex_budget_exhausted", retry_after_s=retry_after
+                )
+                raise OpenAlexBudgetExhausted(retry_after) from None
             logger.error("openalex_http_error", status=e.response.status_code, error=str(e))
+            raise
         except Exception as e:
             logger.error("openalex_error", error=str(e), exc_info=True)
+            raise
 
     def _build_filter(self, filters: dict) -> str:
         parts = []
@@ -87,6 +169,26 @@ class OpenAlexChannel:
 
         if filters.get("from_year"):
             parts.append(f"from_publication_date:{filters['from_year']}-01-01")
+
+        # Точна фраза в заголовку/анотації. Це єдиний спосіб отримати
+        # прицільну вибірку для порівняльного права: вільний `search`
+        # не робить AND між словами, тому «capacity of minors contract»
+        # підходило майже до всього корпусу (304 163 роботи).
+        # Заміряно 02.10.2026: у `search` цей фільтр дає 0 (API ігнорує
+        # його там), а як частина `filter` — 161 роботу, якого треба.
+        ta = filters.get("title_and_abstract")
+        if ta:
+            # Кома — роздільник фільтрів OpenAlex, тому її не можна
+            # пропускати в значенні: інакше запит розпадеться на два
+            # і API поверне 400 замість передбачуваного результату.
+            #
+            # Пробіли згортаємо: значення — це точна фраза в лапках, і
+            # подвійний пробіл після заміни коми змінив би саму фразу
+            # (OpenAlex не гарантує нормалізацію), тобто фільтр став би
+            # не тим, що ми задумали.
+            cleaned = " ".join(str(ta).replace(",", " ").split())
+            if cleaned:
+                parts.append(f"title_and_abstract.search:{cleaned}")
 
         return ",".join(parts) if parts else "open_access.is_oa:true"
 

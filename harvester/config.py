@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import yaml
 from pydantic import AliasChoices, BaseModel, Field, field_validator
@@ -14,15 +14,32 @@ class ContactConfig(BaseModel):
 class PathsConfig(BaseModel):
     db_path: str = "data/harvester.db"
     tmp_dir: str = "data/tmp"
-    backup_dir: str = "backups"
+    # Бекапи тимчасово вимкнені: ані код створення, ані самі бекапи не потрібні.
+    # backup_dir: str = "backups"
 
 
 class WorkersConfig(BaseModel):
+    # "full" — повний конвеєр: discovery → verify → classify.
+    # "classify_only" — лише класифікація вже зібраного: без discovery,
+    # verify та verifier. Збір зупинено, а квота LLM звільняється для
+    # класифікаторів, які доганяють накопичений беклог.
+    mode: Literal["full", "classify_only"] = "full"
     verify: int = Field(default=6, ge=1, le=32)
     discovery: int = Field(default=3, ge=1, le=16)
-    scanner: int = Field(default=1, ge=1, le=8)
+    # Окремого сканер-воркера наразі немає, тому не створюємо фальшивий
+    # активний компонент у конфігурації.
+    scanner: int = Field(default=0, ge=0, le=8)
     classify: int = Field(default=1, ge=1, le=4)
+    # Який пул моделей використовує класифікатор: "gemma" — Gemma на
+    # окремих ключах класифікації, "gemini" — Gemini на спільних ключах LLM.
+    # Коли збір зупинено, спільні ключі звільняються, і класифікація на
+    # Gemini швидша (коротша відповідь, менше thinking-токенів).
+    classify_model_pool: Literal["gemma", "gemini"] = "gemma"
     verifier: int = Field(default=1, ge=0, le=4)
+    # Присвоєння дисциплін обмежене TPM Gemma, а не потужністю CPU:
+    # кожен документ — це один послідовний LLM-запит. Тому воркерів
+    # потрібно кілька, щоб заповнити мінутинне вікно токенів.
+    discipline_assign: int = Field(default=1, ge=0, le=48)
 
 
 class HttpConfig(BaseModel):
@@ -42,7 +59,8 @@ class HttpConfig(BaseModel):
 class DDGSChannelConfig(BaseModel):
     enabled: bool = True
     backends: list[str] = Field(
-        default=["duckduckgo", "bing", "brave", "mojeek", "startpage", "yahoo", "wikipedia"]
+        min_length=1,
+        default=["duckduckgo", "brave", "mojeek", "startpage", "yahoo", "wikipedia"]
     )
     query_interval_s: tuple[float, float] = (3.0, 10.0)
 
@@ -109,13 +127,57 @@ class VerifierConfig(BaseModel):
     recheck_days: int = Field(default=7, ge=1, le=365)
     llm_enabled: bool = True
     llm_model: str = "gemini-3.1-flash-lite"
-    llm_max_chars: int = Field(default=15000, ge=1000, le=100000)
+    llm_max_chars: int = Field(default=12000, ge=1000, le=100000)
+    # Фокус на документах, знайдених після цієї відсічки (ISO, UTC).
+    #
+    # Навіщо: селектор віддає перевагу документам, які ніколи не перевірялись,
+    # а серед них усе вирішує `verified_at DESC`. Але періодичний базовий
+    # verify омолоджує verified_at старих документів, тож старі беклог-записи
+    # витісняють нові. Виміряно 26.09→02.10: за 24 год перевірено 1662
+    # старих і лише 29 нових — 98% потужності йшло на беклог, а добовий
+    # приріст нових strict-pass був ~2 замість очікуваних сотень.
+    #
+    # Тематична кампанія: discovery уже сфокусований через priority=100,
+    # тож усі нові документи належать цій темі. Фільтр за датою —
+    # найпростіший спосіб це відобразити: не треба ані join-ів по
+    # document_topics, ані fuzzy-звіряння назв. Зняти значення (null) —
+    # і поведінка повертається до попередньої.
+    focus_first_seen_after: str | None = None
+
+
+class DisciplineAssignConfig(BaseModel):
+    """Цілодобове присвоювання дисциплін каталогу verified-документам."""
+
+    enabled: bool = True
+    # Які пули ключів використовувати: "classify" — окремі ключі класифікації
+    # (4 шт.), "gemini" — спільні ключі LLM (3 шт.). Квота Gemini добові, тож
+    # коли збір зупинено, ці ключі вільні й дають присвоєнню дисциплін
+    # додаткову ємність.
+    key_pools: list[str] = Field(default=["classify", "gemini"])
+    batch_size: int = Field(default=20, ge=1, le=100)
+    interval_s: int = Field(default=60, ge=5, le=3600)
+    recheck_days: int = Field(default=90, ge=1, le=730)
+    # Моделі фази Gemini для присвоєння дисциплін. Ланцюг іде зверху вниз:
+    # перевірені flash-lite першими (RPD 500/день на ключ), нові моделі
+    # далі (RPD лише 20/день — вони вичерпуються за хвилини і пропускаються).
+    # Увага: "Gemini 3 Flash" в API називається gemini-3-flash-preview.
+    models: list[str] = Field(default=[
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-3.6-flash",
+    ])
+    max_disciplines: int = Field(default=3, ge=1, le=10)
+    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    max_text_chars: int = Field(default=15000, ge=1000, le=100000)
 
 
 class RetentionConfig(BaseModel):
     fetch_attempts_days: int = Field(default=90, ge=1, le=3650)
     events_days: int = Field(default=180, ge=1, le=3650)
-    backups_keep: int = Field(default=14, ge=1, le=365)
+    # backups_keep: int = Field(default=14, ge=1, le=365)
 
 
 class LoggingConfig(BaseModel):
@@ -146,16 +208,42 @@ class DatabaseConfig(BaseModel):
         return bool(self.host) or bool(self.dsn)
 
 
+class ModelQuota(BaseModel):
+    """Ліміти однієї моделі (RPM / RPD / TPM)."""
+
+    rpm: int = Field(default=15, ge=1)
+    rpd: int = Field(default=500, ge=1)
+    tpm: int = Field(default=250000, ge=1000)
+
+
 class LLMConfig(BaseModel):
     enabled: bool = True
     gemini_models: list[str] = Field(default=["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"])
-    gemma_models: list[str] = Field(default=["gemma-4-31b-it", "gemma-4-26b-a4b-it"])
+    # Порядок важливий: ланцюг перебирає моделі зверху вниз і зупиняється на
+    # першій, що відповіла. 26b ставимо першим за даними production за
+    # 26.09.2026: за 4 години gemma-4-26b-a4b-it — 1085 успіхів / 3 помилки
+    # (99.7%), тоді як gemma-4-31b-it — 266/89 (74.9%) через деградацію
+    # конкретної моделі на боці Google. Обидві ходять на той самий ендпоінт
+    # з тими самими ключами, тож це не мережа, а саме модель.
+    # Після відновлення 31b-it можна повернути її першою — це лише
+    # один рядок, перезапуск сервісу не потрібен.
+    gemma_models: list[str] = Field(default=["gemma-4-26b-a4b-it", "gemma-4-31b-it"])
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     gemma_max_chars: int = Field(default=15000, ge=5000, le=100000)
     openrouter_model: str = "google/gemini-2.5-flash"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     timeout_s: float = Field(default=60.0, gt=0)
-    max_tokens: int = Field(default=2048, ge=256, le=8192)
+    # Бюджет відповіді має вміщувати thinking-роздуми thinking-моделей
+    # (Gemma-4) ПЛЮС фінальний JSON: емпірично thinking займає 1.5-2.9k
+    # токенів. При 2048 токенах відповіді не залишалося взагалі (finishReason
+    # MAX_TOKENS), тож нижня межа піднята, щоб конфіг не відтворив збій.
+    max_tokens: int = Field(default=4096, ge=4096, le=8192)
+    # Скільки токенів виводу бронювати в TPM-вікні ДО запиту. max_tokens —
+    # це стеля, а не типове значення: фактично Gemma витрачає ~5.4K токенів
+    # на документ, з них ~0.4K — вивід. Бронювання за стелею завищувало
+    # оцінку на ~60% і через це напряму стримувало пропускну здатність
+    # лімітера. Фактична витрата уточнюється після відповіді.
+    reserve_output_tokens: int = Field(default=1024, ge=128, le=8192)
     temperature: float = Field(default=0.1, ge=0.0, le=2.0)
     min_interval_s: float = Field(default=1.5, ge=0.0)
     daily_limit_wait_s: float = Field(default=120.0, gt=0)
@@ -165,6 +253,26 @@ class LLMConfig(BaseModel):
     gemma_rpm: int = Field(default=50, ge=1, description="Gemma: запитів за хвилину")
     gemma_rpd: int = Field(default=14000, ge=1, description="Gemma: запитів за день")
     gemma_tpm: int = Field(default=16000, ge=1000, description="Gemma: токенів за хвилину")
+    gemini_tpm: int = Field(
+        default=250000, ge=1000, description="Gemini: токенів за хвилину"
+    )
+    # Per-модельні ліміти: перекривають фазові (gemini_*/gemma_*) для
+    # зазначених моделей. Ключ — точна назва моделі в API.
+    # Напр. нові flash-моделі мають мізерний RPD (20/день на ключ), тож
+    # без окремого ліміту лімітер дозволяв би 500 запитів і всі зайві
+    # згорали б на справжніх 429 від Google.
+    # Дефолт: RPM 10 / TPM 250K / RPD 20 для нових flash-моделей (заміряно
+    # власником на консолі Google, 27.10.2026). Flash-lite лишаються на
+    # фазових лімітах (15/500/250K).
+    model_quotas: dict[str, ModelQuota] = Field(default_factory=lambda: {
+        name: ModelQuota(rpm=10, rpd=20, tpm=250000)
+        for name in (
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-3.6-flash",
+        )
+    })
     max_text_chars_for_llm: int = Field(default=80000, ge=10000, le=500000)
     max_pages_for_extraction: int = Field(default=100, ge=10, le=1000)
 
@@ -203,6 +311,7 @@ class Settings(BaseSettings):
     reverify: ReverifyConfig = Field(default_factory=ReverifyConfig)
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     verifier: VerifierConfig = Field(default_factory=VerifierConfig)
+    discipline_assign: DisciplineAssignConfig = Field(default_factory=DisciplineAssignConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -224,6 +333,7 @@ class Settings(BaseSettings):
     pg_password: Annotated[str | None, Field(default=None, validation_alias=AliasChoices("HARVESTER_PG_PASSWORD", "PG_PASS"))] = None
     user_email: Annotated[str | None, Field(default=None, validation_alias="USER_EMAIL")] = None
     smtp_password: Annotated[str | None, Field(default=None, validation_alias="HARVESTER_SMTP_PASSWORD")] = None
+    vps: Annotated[bool, Field(default=False, validation_alias=AliasChoices("HARVESTER_VPS", "VPS"))] = False
 
     @property
     def gemini_keys(self) -> list[str]:
@@ -237,8 +347,8 @@ class Settings(BaseSettings):
     @field_validator("contact")
     @classmethod
     def validate_contact(cls, v: ContactConfig) -> ContactConfig:
-        if not v.email or v.email == "you@example.org":
-            pass
+        if not v.email or not v.email.strip():
+            raise ValueError("contact.email не може бути порожнім")
         return v
 
     @property
@@ -249,9 +359,9 @@ class Settings(BaseSettings):
     def tmp_dir(self) -> Path:
         return Path(self.paths.tmp_dir)
 
-    @property
-    def backup_dir(self) -> Path:
-        return Path(self.paths.backup_dir)
+    # @property
+    # def backup_dir(self) -> Path:
+    #     return Path(self.paths.backup_dir)
 
 
 def load_config(config_path: str | Path | None = None) -> Settings:
@@ -267,13 +377,37 @@ def load_config(config_path: str | Path | None = None) -> Settings:
 
     settings = Settings(**data)
 
-    # VPS-режим: якщо в .env VPS=true — примусово remote БД (89.167.68.48)
+    # Один канонічний шлях БД. Старий `paths.db_path` залишаємо для
+    # сумісності конфігів, але синхронізуємо його з database.local_db_path;
+    # явний env для database має вищий пріоритет.
+    database_data = data.get("database") or {}
+    paths_data = data.get("paths") or {}
+    env_db_path = os.getenv("HARVESTER_DATABASE__LOCAL_DB_PATH")
+    env_legacy_db_path = os.getenv("HARVESTER_PATHS__DB_PATH")
+    if env_db_path:
+        canonical_db_path = env_db_path
+    elif env_legacy_db_path:
+        # Підтримуємо стару назву env, але зберігаємо один канонічний параметр.
+        canonical_db_path = env_legacy_db_path
+    elif "local_db_path" in database_data:
+        canonical_db_path = str(settings.database.local_db_path)
+    elif paths_data.get("db_path"):
+        canonical_db_path = str(paths_data["db_path"])
+    else:
+        canonical_db_path = settings.database.local_db_path
+    settings.database.local_db_path = canonical_db_path
+    settings.paths.db_path = canonical_db_path
+
+    # VPS-режим: якщо в .env VPS=true — примусово remote БД
     # Дозволяє тримати config.yaml універсальним (mode: auto, host: "") для локальної розробки,
-    # а на хостингу перемикатися через .env без коміту хоста в репо
-    if os.getenv("VPS", "").lower() == "true":
+    # а на хостингу перемикатися через .env без коміту хоста в репо.
+    # На одному сервері додаток і PG — використовуємо 127.0.0.1 (швидше за 89.167.68.48,
+    # не залежить від зовнішньої мережі/файрволу; pg_hba дозволяє 127.0.0.1/32).
+    is_vps = settings.vps or os.getenv("VPS", "").lower() == "true"
+    if is_vps:
         settings.database.mode = "remote"
         if not settings.database.host:
-            settings.database.host = "89.167.68.48"
+            settings.database.host = "127.0.0.1"
 
     # Заповнити NotifyConfig з user_email та smtp_password
     if settings.user_email:

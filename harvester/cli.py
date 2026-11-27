@@ -1,19 +1,24 @@
 import asyncio
 import csv
 import json
+import logging
+import sqlite3
 import sys
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
 import typer
 from rich import print as rprint
 from rich.console import Console
 from rich.table import Table
 
-from harvester.config import get_settings, load_config
-from harvester.extract.cli import extract_app
-from harvester.curator.cli import curator_app
 from harvester.bibliography.cli import bibliography_app
+from harvester.config import get_settings, load_config
+from harvester.core.llm_report import build_llm_report
+from harvester.curator.cli import curator_app
+from harvester.extract.cli import extract_app
 
 app = typer.Typer(
     name="harvester",
@@ -27,6 +32,81 @@ console = Console()
 app.add_typer(extract_app, name="extract")
 app.add_typer(curator_app, name="curator")
 app.add_typer(bibliography_app, name="bibliography")
+
+
+def _format_bytes(size_bytes: int) -> str:
+    if size_bytes >= 1024**3:
+        return f"{size_bytes / 1024**3:.2f} ГБ"
+    if size_bytes >= 1024**2:
+        return f"{size_bytes / 1024**2:.1f} МБ"
+    return f"{size_bytes / 1024:.1f} КБ"
+
+
+def _open_sqlite(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(path), timeout=0.5, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 500")
+    return conn
+
+
+def _sqlite_fetchall(path: Path, sql: str, params: tuple | None = None) -> list[sqlite3.Row]:
+    if not path.exists():
+        return []
+    conn = _open_sqlite(path)
+    try:
+        cursor = conn.execute(sql, params or ())
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def _sqlite_fetchone(path: Path, sql: str, params: tuple | None = None):
+    rows = _sqlite_fetchall(path, sql, params)
+    return rows[0] if rows else None
+
+
+def _fmt_time(ts: str | None) -> str:
+    """'2026-09-08T09:24:04.253993' -> '09:24'."""
+    if not ts:
+        return "—"
+    return str(ts)[11:16]
+
+
+def _fmt_tokens(tokens: int) -> str:
+    """Форматуємо токени: 18_370 -> '18.4K', 4_000_000 -> '4.0M'."""
+    if not tokens:
+        return "0"
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.1f}M"
+    return f"{tokens / 1000:.1f}K"
+
+
+@contextmanager
+def _quiet_stdout_logs() -> Iterator[None]:
+    """Скеровує консольні лог-записи з stdout у stderr (для чистого JSON-виводу)."""
+    import structlog
+
+    root = logging.getLogger()
+    moved: list[logging.StreamHandler] = []
+    for handler in root.handlers:
+        if isinstance(handler, logging.StreamHandler) and handler.stream is sys.stdout:
+            handler.stream = sys.stderr
+            moved.append(handler)
+    try:
+        if not structlog.is_configured():
+            structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
+        yield
+    finally:
+        for handler in moved:
+            handler.stream = sys.stdout
+        if not structlog.is_configured():
+            structlog.reset_defaults()
+
+
+def _emit_json(payload: dict) -> None:
+    """Друкує JSON у stdout, вимкнувши лог-шум із цього ж потоку."""
+    with _quiet_stdout_logs():
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 @app.command()
@@ -65,7 +145,7 @@ def status():
     async def _status():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
             settings_repo = SettingsRepository(db)
@@ -101,6 +181,8 @@ def status():
             table.add_column("Значення", style="green")
 
             table.add_row("База даних", db_mode)
+            if settings.database.remote_configured and db.remote is not None:
+                table.add_row("Remote налаштовано", "так")
             if pending_outbox:
                 table.add_row("Outbox (очікує злиття)", str(pending_outbox))
             table.add_row("Heartbeat", heartbeat_info)
@@ -109,7 +191,10 @@ def status():
             for st, cnt in sorted(doc_stats.items(), key=lambda x: -x[1]):
                 table.add_row(f"  · {st}", str(cnt))
             if lang_stats:
-                table.add_row("Мови (verified)", ", ".join(f"{k}:{v}" for k, v in sorted(lang_stats.items(), key=lambda x: -x[1])))
+                table.add_row(
+                    "Мови (verified)",
+                    ", ".join(f"{k}:{v}" for k, v in sorted(lang_stats.items(), key=lambda x: -x[1])),
+                )
             table.add_row("Класифікації (всього)", str(classified_total))
             table.add_row("  · унікальних документів", str(classified_docs))
             table.add_row("Завдання (pending)", str(task_stats.get("pending", 0)))
@@ -128,6 +213,220 @@ def status():
 
 
 @app.command()
+def report(
+    days: int = typer.Option(7, "--days", "-d", help="Період динаміки в днях (за замовчуванням 7)"),
+    json_output: bool = typer.Option(False, "--json", help="Вивід у форматі JSON"),
+):
+    """Зведений звіт: використання LLM-моделей і лімітів + динаміка перевірки джерел"""
+    from harvester.db.failover import build_database
+    from harvester.db.repositories import (
+        ChannelStatsRepository,
+        DocumentsRepository,
+        TasksRepository,
+        VerifierRepository,
+    )
+
+    async def _report():
+        settings = get_settings()
+        db = build_database(settings)
+
+        json_ctx = _quiet_stdout_logs() if json_output else nullcontext()
+
+        with json_ctx:
+            try:
+                await db.initialize(sync_mirror=False, read_only=True)
+
+                docs_repo = DocumentsRepository(db)
+                tasks_repo = TasksRepository(db)
+                chan_repo = ChannelStatsRepository(db)
+                verif_repo = VerifierRepository(db)
+
+                doc_stats = await docs_repo.count_by_status()
+                lang_stats = await docs_repo.count_by_language()
+                classified_total, classified_docs = await docs_repo.count_classified()
+                task_stats = await tasks_repo.count_by_status()
+                task_by_type = await tasks_repo.count_by_type()
+                channel_stats = await chan_repo.get_summary(days * 24)
+                verif_daily = await verif_repo.daily_summary(days)
+                verif_total = await verif_repo.overall_summary()
+                verified_total, verified_checked = await verif_repo.coverage()
+
+                db_mode = "local (SQLite)"
+                if db.mode == "remote":
+                    db_mode = "remote (PostgreSQL)"
+
+                # LLM-звіт з логів
+                log_dir = Path(settings.logging.file).parent if settings.logging.file else Path("logs")
+                log_prefix = Path(settings.logging.file).name if settings.logging.file else "harvester.log"
+                llm_report = build_llm_report(log_dir, days=days, log_prefix=log_prefix)
+
+                if json_output:
+                    print(
+                        json.dumps(
+                            {
+                                "generated_at": datetime.utcnow().isoformat(),
+                                "db_mode": db_mode,
+                                "documents_by_status": doc_stats,
+                                "languages": lang_stats,
+                                "classification_total": classified_total,
+                                "classification_docs": classified_docs,
+                                "tasks_by_status": task_stats,
+                                "tasks_by_type": task_by_type,
+                                "channels": channel_stats,
+                                "llm": llm_report,
+                                "verifier": {
+                                    "total": verif_total,
+                                    "coverage": {
+                                        "verified_total": verified_total,
+                                        "verified_checked": verified_checked,
+                                    },
+                                    "daily": verif_daily,
+                                },
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    )
+                    return
+
+                coverage_from = llm_report.get("log_coverage_from")
+                cov_title = (
+                    f"Використання LLM-моделей і лімітів (лог від {coverage_from[5:]})"
+                    if coverage_from
+                    else "Використання LLM-моделей і лімітів"
+                )
+                table1 = Table(title=cov_title)
+                table1.add_column("День", style="cyan", width=5)
+                table1.add_column("Викл.", justify="right")
+                table1.add_column("Токени", justify="right")
+                table1.add_column("Сер.,с", justify="right")
+                table1.add_column("Клас.", justify="right", style="green")
+                table1.add_column("Quota", justify="right", style="red")
+                table1.add_column("Rate", justify="right", style="yellow")
+                table1.add_column("5xx", justify="right", style="red")
+                table1.add_column("Вичерп.", justify="right", style="bright_red")
+                table1.add_column("БезLLM", justify="right")
+
+                for day, stats in llm_report["by_day"].items():
+                    has_data = bool(coverage_from and day >= coverage_from)
+                    if has_data and (stats["ok"] or stats["quota"] or stats["rate"]
+                                     or stats["transient"] or stats["exhausted"] or stats["unavailable"]):
+                        table1.add_row(
+                            str(day)[5:],
+                            str(stats["ok"]),
+                            _fmt_tokens(stats["tokens"]),
+                            f"{stats['avg_duration_ms'] / 1000:.1f}" if stats["avg_duration_ms"] else "—",
+                            str(stats["classified"]),
+                            str(stats["quota"]),
+                            str(stats["rate"]),
+                            str(stats["transient"]),
+                            str(stats["exhausted"]),
+                            str(stats["unavailable"]),
+                        )
+                    else:
+                        table1.add_row(str(day)[5:], "—", "—", "—", "—", "—", "—", "—", "—", "—")
+
+                table1_2 = Table(title="LLM по моделях (підсумок)")
+                table1_2.add_column("Модель", style="cyan")
+                table1_2.add_column("Викл.", justify="right")
+                table1_2.add_column("Токени", justify="right")
+                table1_2.add_column("Сер.,с", justify="right")
+                table1_2.add_column("Quota", justify="right", style="red")
+                table1_2.add_column("Rate", justify="right", style="yellow")
+                table1_2.add_column("5xx", justify="right", style="red")
+
+                for model, stats in llm_report["by_model"].items():
+                    table1_2.add_row(
+                        str(model)[:40],
+                        str(stats["ok"]),
+                        _fmt_tokens(stats["tokens"]),
+                        f"{stats['avg_duration_ms'] / 1000:.1f}" if stats["avg_duration_ms"] else "—",
+                        str(stats["quota"]),
+                        str(stats["rate"]),
+                        str(stats["transient"]),
+                    )
+
+                table1.add_row("", "", "", "", "", "", "", "", "", "")
+                table1.add_row(
+                    "Всього",
+                    str(sum(s["ok"] for s in llm_report["by_day"].values())),
+                    _fmt_tokens(sum(s["tokens"] for s in llm_report["by_day"].values())),
+                    "—",
+                    str(sum(s["classified"] for s in llm_report["by_day"].values())),
+                    str(sum(s["quota"] for s in llm_report["by_day"].values())),
+                    str(sum(s["rate"] for s in llm_report["by_day"].values())),
+                    str(sum(s["transient"] for s in llm_report["by_day"].values())),
+                    str(sum(s["exhausted"] for s in llm_report["by_day"].values())),
+                    str(sum(s["unavailable"] for s in llm_report["by_day"].values())),
+                )
+
+                table2 = Table(title=f"Перевірка джерел (verifier, {days} днів)")
+                table2.add_column("День", style="cyan", width=5)
+                table2.add_column("Перев.", justify="right")
+                table2.add_column("Pass", justify="right", style="green")
+                table2.add_column("Fail", justify="right", style="red")
+                table2.add_column("Err", justify="right")
+                table2.add_column("LLM", justify="right", style="bright_green")
+                table2.add_column("LLM+", justify="right", style="green")
+                table2.add_column("LLM-", justify="right", style="red")
+                table2.add_column("1-й LLM", style="yellow", width=5)
+                table2.add_column("ост.", style="yellow", width=5)
+
+                for r in verif_daily:
+                    table2.add_row(
+                        str(r["day"])[5:],
+                        str(r["checked"] or 0),
+                        str(r["passed"] or 0),
+                        str(r["failed"] or 0),
+                        str(r["errors"] or 0),
+                        str(r["llm_calls"] or 0),
+                        str(r["llm_pass"] or 0),
+                        str(r["llm_fail"] or 0),
+                        _fmt_time(r.get("first_llm")),
+                        _fmt_time(r.get("last_llm")),
+                    )
+
+                table3 = Table(title="Підсумок verifier")
+                table3.add_column("Параметр", style="cyan")
+                table3.add_column("Значення", style="green")
+                table3.add_row("Перевірок (всього)", str(verif_total.get("checked", 0) or 0))
+                table3.add_row("  · pass", str(verif_total.get("passed", 0) or 0))
+                table3.add_row("  · fail", str(verif_total.get("failed", 0) or 0))
+                table3.add_row("  · error", str(verif_total.get("errors", 0) or 0))
+                table3.add_row("LLM-викликів (всього)", str(verif_total.get("llm_calls", 0) or 0))
+                table3.add_row("  · pass", str(verif_total.get("llm_pass", 0) or 0))
+                table3.add_row("  · fail", str(verif_total.get("llm_fail", 0) or 0))
+                coverage_pct = (verified_checked / verified_total * 100) if verified_total else 0.0
+                table3.add_row("Охоплення verified-документів", f"{verified_checked} / {verified_total} ({coverage_pct:.1f}%)")
+
+                console.print(table1)
+                console.print("")
+                if llm_report["by_model"]:
+                    console.print(table1_2)
+                    console.print("")
+                console.print(table3)
+                console.print("")
+                console.print(table2)
+                if channel_stats:
+                    chan_table = Table(title=f"Канали ({days} днів)")
+                    chan_table.add_column("Канал", style="cyan")
+                    chan_table.add_column("Нових", justify="right", style="green")
+                    chan_table.add_column("Помилок", justify="right", style="red")
+                    for s in channel_stats[:8]:
+                        chan_table.add_row(
+                            str(s["channel"])[:40],
+                            str(s.get("items_new", 0) or 0),
+                            str(s.get("errors", 0) or 0),
+                        )
+                    console.print("")
+                    console.print(chan_table)
+            finally:
+                await db.close()
+
+    asyncio.run(_report())
+
+
+@app.command()
 def stats(
     period: str = typer.Option("24h", "--period", "-p", help="Період: 24h, 7d, 30d"),
     json_output: bool = typer.Option(False, "--json", help="Вивід у форматі JSON"),
@@ -139,7 +438,7 @@ def stats(
     async def _stats():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
             stats_repo = ChannelStatsRepository(db)
@@ -165,12 +464,12 @@ def stats(
 
                 for stat in channel_stats:
                     table.add_row(
-                        stat["channel"],
-                        str(stat["requests"]),
-                        str(stat["ok"]),
-                        str(stat["errors"]),
-                        str(stat["items_found"]),
-                        str(stat["items_new"]),
+                        str(stat["channel"]),
+                        str(stat.get("requests", 0) or 0),
+                        str(stat.get("ok", 0) or 0),
+                        str(stat.get("errors", 0) or 0),
+                        str(stat.get("items_found", 0) or 0),
+                        str(stat.get("items_new", 0) or 0),
                     )
 
                 console.print(table)
@@ -193,7 +492,7 @@ def export(
     async def _export():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
             query = "SELECT * FROM documents WHERE status = ?"
@@ -229,13 +528,39 @@ def doctor():
     """Самодіагностика системи"""
     from harvester.db.failover import build_database
     from harvester.db.migrations import get_current_version
+    from harvester.discovery.base import IMPLEMENTED_DISCOVERY_CHANNELS, PLANNED_DISCOVERY_CHANNELS
 
     async def _doctor():
         console.print("[cyan]Перевірка системи...[/cyan]")
 
         settings = get_settings()
+        enabled_channels = {
+            name
+            for name in IMPLEMENTED_DISCOVERY_CHANNELS
+            if getattr(settings.channels, name).enabled
+        }
+        unimplemented_channels = sorted(
+            name
+            for name in PLANNED_DISCOVERY_CHANNELS
+            if getattr(settings.channels, name, None)
+            and getattr(settings.channels, name).enabled
+        )
+        if not enabled_channels:
+            rprint("[red]✗ Не увімкнено жодного реалізованого discovery-каналу[/red]")
+        else:
+            rprint(f"[green]✓ Discovery-канали: {', '.join(sorted(enabled_channels))}[/green]")
+        if unimplemented_channels:
+            rprint(
+                "[yellow]⚠ Увімкнено канали без адаптера: "
+                f"{', '.join(unimplemented_channels)}; вони не запускатимуться[/yellow]"
+            )
+        if settings.workers.scanner:
+            rprint(
+                "[yellow]⚠ workers.scanner > 0, але scanner-воркер ще не реалізований; "
+                "значення буде проігноровано[/yellow]"
+            )
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
             version = await get_current_version(db)
@@ -289,7 +614,7 @@ def db_status():
     async def _db_status():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
             table = Table(title="Стан бази даних")
@@ -342,7 +667,7 @@ def db_size():
     async def _db_size():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
             table = Table(title="Розмір баз даних")
@@ -353,24 +678,19 @@ def db_size():
             db_path = settings.db_path
             if db_path.exists():
                 size_bytes = db_path.stat().st_size
-                if size_bytes >= 1024**3:
-                    size_str = f"{size_bytes / 1024**3:.2f} ГБ"
-                elif size_bytes >= 1024**2:
-                    size_str = f"{size_bytes / 1024**2:.1f} МБ"
-                else:
-                    size_str = f"{size_bytes / 1024:.1f} КБ"
                 table.add_row("Локальна SQLite", str(db_path))
-                table.add_row("  Розмір файлу", size_str)
+                table.add_row("  Розмір файлу", _format_bytes(size_bytes))
 
-                # Розмір по таблицях
                 try:
-                    tables = [row[0] for row in await db.local.fetchall(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                    )]
-                    for tbl in sorted(tables):
+                    tables = _sqlite_fetchall(
+                        db_path,
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                    )
+                    for tbl_row in tables:
+                        tbl = tbl_row["name"]
                         try:
-                            row = await db.local.fetchone(f"SELECT COUNT(*) AS c FROM {tbl}")
-                            count = row["c"] if row else 0
+                            count_row = _sqlite_fetchone(db_path, f"SELECT COUNT(*) AS c FROM {tbl}")
+                            count = count_row["c"] if count_row else 0
                             if count > 0:
                                 table.add_row(f"  · {tbl}", f"{count:,} рядків")
                         except Exception:
@@ -383,22 +703,17 @@ def db_size():
             # Віддалена PostgreSQL
             if db.remote is not None and db.mode == "remote":
                 try:
-                    # Оцінка розміру через pg_database
                     row = await db.remote.fetchone(
                         "SELECT pg_database_size(current_database()) AS size_bytes"
                     )
                     if row and row["size_bytes"]:
                         pg_bytes = row["size_bytes"]
-                        if pg_bytes >= 1024**3:
-                            pg_str = f"{pg_bytes / 1024**3:.2f} ГБ"
-                        elif pg_bytes >= 1024**2:
-                            pg_str = f"{pg_bytes / 1024**2:.1f} МБ"
-                        else:
-                            pg_str = f"{pg_bytes / 1024:.1f} КБ"
-                        table.add_row("Віддалена PostgreSQL", f"{settings.database.host}:{settings.database.port}/{settings.database.name}")
-                        table.add_row("  Розмір БД", pg_str)
+                        table.add_row(
+                            "Віддалена PostgreSQL",
+                            f"{settings.database.host}:{settings.database.port}/{settings.database.name}",
+                        )
+                        table.add_row("  Розмір БД", _format_bytes(pg_bytes))
 
-                    # Розмір по таблицях
                     pg_tables = await db.remote.fetchall(
                         "SELECT relname, n_live_tup FROM pg_stat_user_tables "
                         "WHERE schemaname = 'public' ORDER BY n_live_tup DESC LIMIT 15"
@@ -406,7 +721,7 @@ def db_size():
                     for tbl_row in pg_tables:
                         tbl_name = tbl_row["relname"]
                         count = tbl_row["n_live_tup"]
-                        if count > 0:
+                        if count:
                             table.add_row(f"  · {tbl_name}", f"{count:,} рядків")
                 except Exception as e:
                     table.add_row("Віддалена PostgreSQL", f"[yellow]помилка: {str(e)[:80]}[/yellow]")
@@ -453,7 +768,6 @@ def db_resync():
 def db_seed():
     """Однократно перенести локальну БД у віддалену PostgreSQL"""
     from harvester.db.failover import build_database
-    from harvester.db.postgres import PostgresDatabase
 
     async def _seed():
         settings = get_settings()
@@ -975,22 +1289,21 @@ def find(
     """Знайти літературу в базі даних за тематикою
 
     Пошук документів відбувається в існуючій базі.
-    Фільтрується: мова, тип документу, наявність title.
+    Фільтрується: verified-статус, повний текстовий шар, мінімальна якість,
+    мова, тип документу та наявність title.
     """
+    from harvester.classify.taxonomy import load_disciplines
+    from harvester.config import get_filter_rules
     from harvester.db.failover import build_database
-    from harvester.db.repositories import DocumentsRepository
-    from harvester.classify.taxonomy import load_topics
 
     async def _find():
         settings = get_settings()
         db = build_database(settings)
-        await db.initialize(sync_mirror=False)
+        await db.initialize(sync_mirror=False, read_only=True)
 
         try:
-            docs_repo = DocumentsRepository(db)
-
-            # Спробувати знайти топік по назві
-            topics = await load_topics(db)
+            # Спробувати знайти топік по назві (широкі теми + дисципліни каталогу)
+            topics = await load_disciplines(db)
             topic_code = None
             for t in topics:
                 if topic.lower() in t["name_uk"].lower() or topic.lower() in t["name_en"].lower():
@@ -998,8 +1311,14 @@ def find(
                     rprint(f"[cyan]Знайдено топік: {t['name_uk']} ({t['code']})[/cyan]")
                     break
 
-            where = ""
-            params: list = []
+            rules = get_filter_rules("strict")
+            where = """
+                AND d.status = ?
+                AND d.has_text_layer = 1
+                AND d.page_count >= ?
+                AND LOWER(COALESCE(d.language, '')) NOT IN ('', 'unknown', 'und')
+            """
+            params: list = ["verified", rules.min_page_count]
 
             if doc_type:
                 where += " AND d.doc_type = ?"

@@ -21,12 +21,12 @@ database:
 paths:
   db_path: "data/harvester.db"
   tmp_dir: "data/tmp"
-  backup_dir: "backups"
+  # backup_dir: "backups"
 
 workers:
   verify: 6
   discovery: 3
-  scanner: 1
+  scanner: 0  # окремого scanner-воркера ще немає
   classify: 1
 
 http:
@@ -58,27 +58,27 @@ channels:
     enabled: true
     rps: 5
   crossref:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 5
   unpaywall:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 1
   semanticscholar:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 1
   arxiv:
-    enabled: true
-    interval_s: 3
+    enabled: false  # адаптер ще не реалізований
+    rps: 0.33
   doaj:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 1
   internet_archive:
-    enabled: true
+    enabled: false  # адаптер ще не реалізований
     rps: 1
   core:
     enabled: false
   oai:
-    enabled: true
+    enabled: false  # OAI-сканер ще не реалізований
     per_host_interval_s: 2
 
 filters:
@@ -115,8 +115,14 @@ scanner:
 retention:
   fetch_attempts_days: 90
   events_days: 180
-  backups_keep: 14
+  # backups_keep: 14
 
 logging:
   level: INFO
   file: "logs/harvester.log"
+
+# Порядок LLM-моделей (ланцюг бере першу, що відповіла)
+llm:
+  gemma_models:
+    - gemma-4-26b-a4b-it
+    - gemma-4-31b-it
