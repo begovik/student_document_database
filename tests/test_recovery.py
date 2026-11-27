@@ -462,8 +462,18 @@ def _supervisor_with_mode(mode: str):
 
     base = get_settings()
     supervisor = Supervisor.__new__(Supervisor)
+    # Присвоєння дисциплін у прод-конфігу вимкнено (збір завершено), а тест
+    # перевіряє саме механізм classify_only — тому стан робітника задаємо
+    # явно, не спираючись на config.yaml.
     supervisor.settings = base.model_copy(
-        update={"workers": base.workers.model_copy(update={"mode": mode})}
+        update={
+            "workers": base.workers.model_copy(
+                update={"mode": mode, "discipline_assign": 1}
+            ),
+            "discipline_assign": base.discipline_assign.model_copy(
+                update={"enabled": True}
+            ),
+        }
     )
     supervisor.db = None
     supervisor.scheduler = None

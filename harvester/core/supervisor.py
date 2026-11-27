@@ -408,9 +408,19 @@ class Supervisor:
     async def run_forever(self) -> None:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(
-                sig, lambda s=sig: asyncio.create_task(self._handle_signal(s))
-            )
+            handler = lambda s=sig: asyncio.create_task(self._handle_signal(s))
+            try:
+                loop.add_signal_handler(sig, handler)
+            except (NotImplementedError, RuntimeError, ValueError):
+                # Windows: add_signal_handler не підтримується (кидає
+                # NotImplementedError без тексту, через що сервіс «падав»
+                # з порожньою помилкою). Фолбек — стандартний обробник
+                # сигналів Python; Ctrl+C тоді йде через KeyboardInterrupt,
+                # а finally у run_forever усе одно викликає stop().
+                try:
+                    signal.signal(sig, handler)
+                except (OSError, ValueError, RuntimeError):
+                    pass
 
         await self.start()
 

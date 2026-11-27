@@ -1392,6 +1392,8 @@ def find(
         finally:
             await db.close()
 
+    asyncio.run(_find())
+
 
 if __name__ == "__main__":
     app()

@@ -1,11 +1,14 @@
 # ГОЛОВНА ЦІЛЬ: збирати якісні джерела з повним текстом — інформативні статті/монографії/посібники,
 # придатні для наукових праць (титул, вступ/мета, розділи, висновки, список джерел). Не тези/зміст/анотації.
 contact:
-  email: "you@example.org"
+  email: "begovikua@gmail.com"
 
 database:
   mode: "auto"
-  host: ""
+  # Локальний PostgreSQL у Docker (контейнер harvester-pg, порт 5432).
+  # VPS=true у .env також форсує remote-режим на 127.0.0.1 — значення
+  # нижче лише для прозорості, коли VPS-прапорець вимкнено.
+  host: "127.0.0.1"
   port: 5432
   name: "harvester"
   user: "harvester"
@@ -21,8 +24,10 @@ paths:
   # backup_dir: "backups"
 
 workers:
-  # Збір зупинено: лишаємо тільки класифікацію вже зібраного.
-  # discovery/verify/verifier не запускаються, квота LLM йде класифікаторам.
+  # Збір завершено (~1 млн джерел). Режим обслуговування: сервіс лише
+  # тримає БД і відповідає на пошук/експорт (CLI find/export). Discovery,
+  # verify та verifier не запускаються (classify_only), присвоєння
+  # дисциплін вимкнено — LLM-квоти не витрачаються.
   mode: classify_only
   verify: 6
   discovery: 3
@@ -31,9 +36,8 @@ workers:
   # Класифікатор переведено на Gemini: добова квота спільних ключів
   # звільнилася разом із зупинкою збору, а відповідь Gemini швидша.
   classify_model_pool: gemini
-  # Присвоєння дисциплін — по одному LLM-запиту на документ, тому
-  # воркерів потрібно багато, щоб заповнити мінутинне вікно токенів.
-  discipline_assign: 48
+  # Присвоєння дисциплін вимкнено: збір і класифікація завершені.
+  discipline_assign: 0
 
 http:
   global_concurrency: 32
@@ -46,7 +50,7 @@ http:
   read_timeout_s: 30
   total_timeout_s: 300
   bandwidth_mbps: 2.0
-  user_agent: "Harvester/1.0 (+contact: you@example.org)"
+  user_agent: "Harvester/1.0 (+contact: begovikua@gmail.com)"
 
 channels:
   ddgs:
@@ -134,6 +138,10 @@ reverify:
 # перевірки з виправленим вердиктором.
 verifier:
   focus_first_seen_after: null
+
+# Присвоєння дисциплін повністю вимкнене (збір і класифікація завершені).
+discipline_assign:
+  enabled: false
 
 scanner:
   max_pages_per_source: 300

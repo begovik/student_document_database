@@ -49,3 +49,8 @@ build/
 
 # Catalogs (згенеровані PDF-каталоги, не комітити)
 catalogs/
+
+# Локальні бекапи з VPS та артефакти відновлення БД (8+ ГБ, не для гіту)
+harvester_backup/
+restore_log.txt
+restore_exit.txt
