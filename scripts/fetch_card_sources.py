@@ -2,6 +2,7 @@
 
     venv/bin/python scripts/fetch_card_sources.py
     venv/bin/python scripts/fetch_card_sources.py --dest data/export/dohovirne-pravo
+    venv/bin/python scripts/fetch_card_sources.py --from-catalog catalogs/catalog_20261127_191500/catalog_20261127_191500.json
 
 На відміну від конвеєра верифікації, який PDF лише читає-кидає,
 цей скрипт кладе файли на диск: джерела потрібні власнику курсової
@@ -32,6 +33,7 @@ import argparse
 import asyncio
 import csv
 import hashlib
+import json
 import re
 import sys
 from pathlib import Path
@@ -157,6 +159,36 @@ def parse_rows(raw: str) -> list[dict]:
     return rows[:EXPORT_N]
 
 
+def load_catalog(path: Path) -> tuple[list[dict], dict[str, str]]:
+    """Рядки для завантаження з JSON-каталогу `curator prepare` + хеші з БД.
+
+    Каталог уже містить відібрані документи з canonical_url та SHA-256,
+    обчисленим сервісом під час верифікації, тому psql не потрібен —
+    скрипт працює і там, де sudo/psql немає (Windows, Docker).
+
+    Повертає (рядки у форматі parse_rows, {canonical_url: sha256}).
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rows: list[dict] = []
+    known: dict[str, str] = {}
+    for doc in data.get("documents", []):
+        authors = doc.get("authors") or []
+        if isinstance(authors, str):
+            authors = [authors]
+        url = doc.get("canonical_url") or ""
+        rows.append({
+            "title": doc.get("title") or "(без назви)",
+            "year": str(doc.get("year") or ""),
+            "url": url,
+            "udc": doc.get("udc") or "",
+            "doi": "",
+            "authors_out": "; ".join(a for a in authors if a),
+        })
+        if url and doc.get("sha256"):
+            known[url] = doc["sha256"]
+    return rows, known
+
+
 async def fetch_one(client, row: dict, number: int, dest: Path) -> dict:
     """Завантажити одне джерело. Ніколи не кидає — повертає підсумок."""
     title = row["title"]
@@ -247,12 +279,21 @@ async def fetch_one(client, row: dict, number: int, dest: Path) -> dict:
     return record
 
 
-async def main_async(dest: Path) -> int:
+async def main_async(dest: Path, catalog: Path | None = None) -> int:
     dest.mkdir(parents=True, exist_ok=True)
     client = await get_http_client()
+    catalog_hashes: dict[str, str] | None = None
     try:
-        rows = parse_rows(run_psql(build_sql()))
-        log.info("fetch_start", count=len(rows), dest=str(dest))
+        if catalog is not None:
+            rows, catalog_hashes = load_catalog(catalog)
+        else:
+            rows = parse_rows(run_psql(build_sql()))
+        log.info(
+            "fetch_start",
+            count=len(rows),
+            dest=str(dest),
+            source=str(catalog) if catalog else "psql",
+        )
 
         records = []
         # Послідовно: більшість джерел з одного домену, а там діє
@@ -266,8 +307,9 @@ async def main_async(dest: Path) -> int:
     saved = [r for r in records if r["status"] in ("збережено", "уже є")]
     other = [r for r in records if r["status"] not in ("збережено", "уже є")]
 
-    # Звіряємо завантажене з тим, що бачить верифікатор.
-    known = db_hashes(records)
+    # Звіряємо завантажене з тим, що бачить верифікатор. З каталогу хеші
+    # беруться напряму (SHA-256 уже лежить у JSON), psql не потрібен.
+    known = catalog_hashes if catalog_hashes is not None else db_hashes(records)
     mismatched = 0
     for r in records:
         expected = known.get(r["url"]) or known.get(r["doi"])
@@ -349,8 +391,15 @@ async def main_async(dest: Path) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Завантажити PDF для списку джерел")
     ap.add_argument("--dest", default=DEFAULT_DEST)
+    ap.add_argument(
+        "--from-catalog",
+        metavar="JSON",
+        default=None,
+        help="Список узяти з JSON-каталогу curator prepare замість psql-запиту",
+    )
     args = ap.parse_args()
-    return asyncio.run(main_async(Path(args.dest)))
+    catalog = Path(args.from_catalog) if args.from_catalog else None
+    return asyncio.run(main_async(Path(args.dest), catalog))
 
 
 if __name__ == "__main__":
